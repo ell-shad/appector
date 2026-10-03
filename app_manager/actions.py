@@ -552,9 +552,30 @@ def _run_command_stream(cmd, output_callback=None, timeout=900):
     env["DEBIAN_FRONTEND"] = "noninteractive"
     env["PAGER"] = "cat"
 
+    process = None
+    timer = None
+    timed_out = threading.Event()
+
     try:
+        command = list(cmd)
+        if (
+            timeout
+            and command
+            and Path(command[0]).name == "pkexec"
+        ):
+            timeout_command = shutil.which("timeout")
+            if timeout_command:
+                command = [
+                    command[0],
+                    timeout_command,
+                    "--signal=TERM",
+                    "--kill-after=10s",
+                    str(timeout),
+                    *command[1:],
+                ]
+
         process = subprocess.Popen(
-            cmd,
+            command,
             stdin=subprocess.DEVNULL,  # Prevents scripts from hanging waiting for input
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -565,10 +586,16 @@ def _run_command_stream(cmd, output_callback=None, timeout=900):
             env=env,
         )
 
-        timer = None
-
         if timeout:
-            timer = threading.Timer(timeout, process.kill)
+            def terminate_process():
+                if process.poll() is None:
+                    timed_out.set()
+                    try:
+                        process.kill()
+                    except (PermissionError, ProcessLookupError, OSError):
+                        pass
+
+            timer = threading.Timer(timeout, terminate_process)
             timer.start()
 
         lines = []
@@ -588,11 +615,11 @@ def _run_command_stream(cmd, output_callback=None, timeout=900):
 
         process.wait()
 
-        if timer:
-            timer.cancel()
-
         returncode = process.returncode
         output = "\n".join(lines).strip()
+
+        if timed_out.is_set() or returncode == 124:
+            return False, output if output else "Command timed out."
 
         if returncode == 0:
             return True, output if output else "Command completed successfully."
@@ -601,6 +628,11 @@ def _run_command_stream(cmd, output_callback=None, timeout=900):
 
     except Exception as e:
         return False, str(e)
+    finally:
+        if timer:
+            timer.cancel()
+            if timer.is_alive():
+                timer.join(timeout=1)
         
 def _maybe_delete_source_file(path, delete_source, message):
     if not delete_source:
@@ -958,7 +990,7 @@ def _parse_apt_simulation_removed_packages(output: str):
     removed = []
 
     for line in output.splitlines():
-        if line.startswith("Remv "):
+        if line.startswith(("Remv ", "Purg ")):
             parts = line.split()
 
             if len(parts) >= 2:
@@ -2504,6 +2536,49 @@ def purge_leftover_configs(package_ids, output_callback=None):
             + "\n".join(invalid_packages)
         )
 
+    try:
+        status_result = subprocess.run(
+            [
+                "dpkg-query",
+                "-W",
+                "-f=${db:Status-Abbrev}\t${Package}\n",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, f"Could not verify residual APT configurations: {error}"
+
+    if status_result.returncode != 0:
+        return False, (
+            status_result.stderr.strip()
+            or "Could not verify residual APT configurations."
+        )
+
+    residual_packages = set()
+    for line in status_result.stdout.splitlines():
+        status, separator, package = line.partition("\t")
+        if separator and status[:2] == "rc":
+            residual_packages.add(package.strip())
+
+    packages_to_purge = [
+        package_id
+        for package_id in dict.fromkeys(package_ids)
+        if package_id in residual_packages
+    ]
+    skipped_packages = [
+        package_id
+        for package_id in dict.fromkeys(package_ids)
+        if package_id not in residual_packages
+    ]
+    if not packages_to_purge:
+        return False, (
+            "None of the selected packages are currently in dpkg's "
+            "residual-configuration state. No packages were purged."
+        )
+
     apt_get_command = shutil.which("apt-get") or "/usr/bin/apt-get"
     pkexec_command = shutil.which("pkexec")
 
@@ -2511,7 +2586,7 @@ def purge_leftover_configs(package_ids, output_callback=None):
         apt_get_command,
         "purge",
         "-y",
-    ] + list(package_ids)
+    ] + packages_to_purge
 
     if pkexec_command:
         cmd = [pkexec_command] + cmd
@@ -2525,6 +2600,11 @@ def purge_leftover_configs(package_ids, output_callback=None):
 
     if success:
         _log_action("LEFTOVER_PURGE_SUCCESS")
+        if skipped_packages:
+            message += (
+                "\n\nSkipped packages no longer in residual-configuration state:\n"
+                + "\n".join(skipped_packages)
+            )
     else:
         _log_action(f"LEFTOVER_PURGE_FAILED error={message}")
 

@@ -1,6 +1,7 @@
 import gi
 import shutil
 import json
+import subprocess
 from pathlib import Path
 
 gi.require_version("Gtk", "4.0")
@@ -11,7 +12,7 @@ from gi.repository import Gtk, Adw, Gio, GLib, Gdk, GdkPixbuf, Pango
 
 import threading
 
-from .scanners import scan_all
+from .scanners import scan_all, scan_leftover_configs
 from .models import mark_duplicate_apps
 from .app_item import AppItem
 from .details import DetailsWindow
@@ -118,8 +119,12 @@ class MainWindow(Adw.ApplicationWindow):
         primary_menu_model = Gio.Menu()
 
         maintenance_section = Gio.Menu()
-        maintenance_section.append("Clean orphaned packages", "win.clean-orphans")
-        maintenance_section.append("Clean unused runtimes", "win.clean-runtimes")
+        maintenance_section.append("Clean orphaned APT packages", "win.clean-orphans")
+        maintenance_section.append(
+            "Clean leftover APT configurations",
+            "win.clean-leftover-configs",
+        )
+        maintenance_section.append("Clean unused Flatpak runtimes", "win.clean-runtimes")
         primary_menu_model.append_section("Maintenance", maintenance_section)
 
         misc_section = Gio.Menu()
@@ -410,8 +415,10 @@ class MainWindow(Adw.ApplicationWindow):
             description = "Mark apps to see them here."
 
         elif getattr(self, "show_leftovers", False):
-            title = "No leftovers found"
-            description = "No leftover configuration packages were detected."
+            title = "No leftover APT configurations"
+            description = (
+                "No removed APT packages with remaining configuration files were detected."
+            )
 
         self.empty_page.set_title(title)
         self.empty_page.set_description(description)
@@ -1666,6 +1673,7 @@ class MainWindow(Adw.ApplicationWindow):
         add_window_action("install", "on_install_clicked")
 
         add_window_action("clean-orphans", "on_autoremove_clicked")
+        add_window_action("clean-leftover-configs", "on_leftover_cleanup_clicked")
         add_window_action("clean-runtimes", "on_flatpak_cleanup_clicked")
 
         add_window_action("show-log", "on_show_log_clicked")
@@ -1983,12 +1991,14 @@ class MainWindow(Adw.ApplicationWindow):
         
         # 3. LEFTOVERS
         leftovers_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        leftovers_label = Gtk.Label(label="LEFTOVERS")
+        leftovers_label = Gtk.Label(label="APT RESIDUAL CONFIGURATIONS")
         leftovers_label.add_css_class("sidebar-group-label")
         leftovers_label.set_xalign(0.0)
         leftovers_box.append(leftovers_label)
         
-        self.show_leftovers_toggle = Gtk.ToggleButton(label="Show leftovers")
+        self.show_leftovers_toggle = Gtk.ToggleButton(
+            label="Show leftover APT configurations"
+        )
         self.show_leftovers_toggle.connect("toggled", self.on_show_leftovers_toggled)
         leftovers_box.append(self.show_leftovers_toggle)
         
@@ -1997,11 +2007,15 @@ class MainWindow(Adw.ApplicationWindow):
         leftovers_actions = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         leftovers_actions.set_margin_start(12)
         
-        self.select_all_leftovers_check = Gtk.CheckButton(label="Select all leftovers")
+        self.select_all_leftovers_check = Gtk.CheckButton(
+            label="Select all leftover configurations"
+        )
         self.select_all_leftovers_check.connect("toggled", self.on_select_all_leftovers_toggled)
         leftovers_actions.append(self.select_all_leftovers_check)
         
-        self.purge_leftovers_button = Gtk.Button(label="Purge leftovers")
+        self.purge_leftovers_button = Gtk.Button(
+            label="Purge selected configurations"
+        )
         self.purge_leftovers_button.add_css_class("destructive-action")
         self.purge_leftovers_button.connect("clicked", self.on_purge_leftovers_clicked)
         leftovers_actions.append(self.purge_leftovers_button)
@@ -2091,6 +2105,86 @@ class MainWindow(Adw.ApplicationWindow):
     # ------------------------------------------------------------
     # APT Autoremove
     # ------------------------------------------------------------
+
+    def on_leftover_cleanup_clicked(self, button=None):
+        self.progress_window = ProgressWindow(
+            self,
+            "Checking leftover APT configurations",
+        )
+        self.progress_window.present()
+        self.progress_window.start_indeterminate(
+            "Checking for removed packages with remaining configuration files…"
+        )
+        threading.Thread(
+            target=self.leftover_cleanup_preview_worker,
+            daemon=True,
+        ).start()
+
+    def leftover_cleanup_preview_worker(self):
+        try:
+            leftovers = scan_leftover_configs()
+        except subprocess.CalledProcessError as error:
+            message = error.stderr.strip() or str(error)
+            success, leftovers = False, []
+        except OSError as error:
+            success, leftovers, message = False, [], str(error)
+        except Exception as error:
+            success, leftovers, message = False, [], str(error)
+        else:
+            success, message = True, ""
+
+        GLib.idle_add(
+            self.on_leftover_cleanup_preview_finished,
+            success,
+            leftovers,
+            message,
+        )
+
+    def on_leftover_cleanup_preview_finished(self, success, leftovers, error):
+        if self.progress_window:
+            self.progress_window.close_window()
+            self.progress_window = None
+
+        if not success:
+            self.show_message(
+                "Leftover configuration check failed",
+                error or "Could not check residual APT configurations.",
+                Gtk.MessageType.ERROR,
+            )
+            return False
+
+        if not leftovers:
+            self.show_message(
+                "No leftover APT configurations",
+                "No removed APT packages with remaining configuration files were found.",
+                Gtk.MessageType.INFO,
+            )
+            return False
+
+        package_ids = [app.package_id for app in leftovers]
+        lines = [
+            "These packages are already removed. Only their configuration files remain.",
+            "Purging permanently deletes those configuration files; it does not uninstall "
+            "any installed package.",
+            "",
+            "This is different from orphaned packages (installed APT dependencies) and "
+            "unused Flatpak runtimes.",
+            "",
+            "Configurations that will be purged:",
+            "",
+            *[f"• {package_id}" for package_id in package_ids[:30]],
+        ]
+        if len(package_ids) > 30:
+            lines.append(f"• …and {len(package_ids) - 30} more")
+
+        self._show_confirm_dialog(
+            f"Purge {len(package_ids)} leftover APT configuration(s)?",
+            "\n".join(lines),
+            "Purge",
+            self.start_purge_leftovers,
+            leftovers,
+        )
+        return False
 
     def on_autoremove_clicked(self, button=None):
         if not shutil.which("apt-get"):
@@ -2631,7 +2725,12 @@ class MainWindow(Adw.ApplicationWindow):
 
         lines = []
 
-        lines.append("The following leftover configuration packages will be purged:")
+        lines.append(
+            "These packages are already removed; purging deletes only their remaining "
+            "configuration files."
+        )
+        lines.append("")
+        lines.append("The following APT configurations will be purged:")
         lines.append("")
 
         for package_id in package_ids[:30]:
@@ -3488,14 +3587,12 @@ class MainWindow(Adw.ApplicationWindow):
 
         message = "\n".join(lines)
 
-        title = f"Purge {len(package_ids)} leftover packages?"
+        title = f"Purge {len(package_ids)} leftover APT configuration(s)?"
         
         def do_purge():
             self.start_purge_leftovers(leftovers)
             
         self._show_confirm_dialog(title, message, "Purge", do_purge)
-
-        dialog.present()
 
     def on_purge_leftovers_confirm_response(self, dialog, response, leftovers):
         dialog.close()

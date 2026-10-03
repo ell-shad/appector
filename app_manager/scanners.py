@@ -162,32 +162,19 @@ def get_package_owner(path: str) -> Optional[str]:
 # ------------------------------------------------------------
 
 def scan_leftover_configs() -> List[AppEntry]:
-    """
-    Detects APT packages that were removed but still have configuration files.
-
-    These are packages whose dpkg state starts with:
-
-        rc
-
-    Meaning:
-    - r = removed
-    - c = config files still present
-    """
+    """Find APT packages in dpkg's residual-config state (removed, config remains)."""
 
     apps: List[AppEntry] = []
 
-    try:
-        out = subprocess.check_output(
-            [
-                "dpkg-query",
-                "-W",
-                "-f=${db:Status-Abbrev}\t${Package}\n",
-            ],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        return apps
+    out = subprocess.check_output(
+        [
+            "dpkg-query",
+            "-W",
+            "-f=${db:Status-Abbrev}\t${Package}\n",
+        ],
+        text=True,
+        stderr=subprocess.PIPE,
+    )
 
     for line in out.splitlines():
         parts = line.split("\t", 1)
@@ -198,18 +185,21 @@ def scan_leftover_configs() -> List[AppEntry]:
         status = parts[0].strip()
         package_name = parts[1].strip()
 
-        if status.startswith("rc") and package_name:
+        if status[:2] == "rc" and package_name:
             apps.append(
                 AppEntry(
                     name=package_name,
                     manager="Leftover",
-                    source="APT config",
+                    source="APT residual configuration",
                     package_id=package_name,
                     version="",
                     installed_at=None,
                     category="System",
                     is_gui_app=False,
-                    details="Removed package with remaining configuration files",
+                    details=(
+                        "Package is already removed; only its configuration files remain. "
+                        "Purging deletes those files."
+                    ),
                     icon="",
                 )
             )
