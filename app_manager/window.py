@@ -50,7 +50,7 @@ class MainWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(
             application=app,
-            title="App Manager",
+            title="Appector",
             default_width=1250,
             default_height=760,
         )
@@ -71,6 +71,9 @@ class MainWindow(Adw.ApplicationWindow):
         self.progress_window = None
         self.install_progress_window = None
         self._selection_ui_pending = False
+        self.view_mode = self.load_ui_state().get("view_mode", "table")
+        if self.view_mode not in {"table", "grid"}:
+            self.view_mode = "table"
         
         self._setup_css()
         self._setup_actions()
@@ -80,8 +83,8 @@ class MainWindow(Adw.ApplicationWindow):
         # ------------------------------------------------------------
         header = Adw.HeaderBar()
         self.window_title = Adw.WindowTitle(
-            title="App Manager",
-            subtitle="Unified installed app inventory",
+            title="Appector",
+            subtitle="Linux app manager",
         )
         header.set_title_widget(self.window_title)
 
@@ -111,6 +114,30 @@ class MainWindow(Adw.ApplicationWindow):
         self.install_menu_btn.set_menu_model(install_menu_model)
 
         # Right: Refresh
+        self.table_view_button = Gtk.ToggleButton(
+            icon_name="view-list-symbolic",
+            tooltip_text="Table view",
+        )
+        self.grid_view_button = Gtk.ToggleButton(
+            icon_name="view-grid-symbolic",
+            tooltip_text="Grid view",
+        )
+        self.grid_view_button.set_group(self.table_view_button)
+        self.table_view_button.set_active(self.view_mode == "table")
+        self.grid_view_button.set_active(self.view_mode == "grid")
+        self.table_view_button.connect(
+            "toggled",
+            self.on_view_mode_toggled,
+            "table",
+        )
+        self.grid_view_button.connect(
+            "toggled",
+            self.on_view_mode_toggled,
+            "grid",
+        )
+        header.pack_end(self.grid_view_button)
+        header.pack_end(self.table_view_button)
+
         self.reload_button = Gtk.Button(
             icon_name="view-refresh-symbolic", 
             tooltip_text="Refresh"
@@ -125,18 +152,7 @@ class MainWindow(Adw.ApplicationWindow):
         primary_menu_model = Gio.Menu()
 
         maintenance_section = Gio.Menu()
-        maintenance_section.append(
-            "Remove unused APT dependencies…",
-            "win.clean-orphans",
-        )
-        maintenance_section.append(
-            "Purge leftover APT configurations…",
-            "win.clean-leftover-configs",
-        )
-        maintenance_section.append(
-            "Remove unused Flatpak runtimes…",
-            "win.clean-runtimes",
-        )
+        maintenance_section.append("Cleanup & residuals…", "win.cleanup-residuals")
         primary_menu_model.append_section("Maintenance", maintenance_section)
 
         misc_section = Gio.Menu()
@@ -145,7 +161,7 @@ class MainWindow(Adw.ApplicationWindow):
         misc_section.append("Export installed app list as JSON…", "win.export-app-list-json")
         misc_section.append("Activity Log", "win.show-log")
         misc_section.append("Keyboard Shortcuts", "win.shortcuts")
-        misc_section.append("About App Manager", "win.about")
+        misc_section.append("About Appector", "win.about")
         primary_menu_model.append_section(None, misc_section)
 
         if not hasattr(self, "primary_menu_btn"):
@@ -213,6 +229,32 @@ class MainWindow(Adw.ApplicationWindow):
         scrolled.set_hexpand(True)
         scrolled.set_vexpand(True)
 
+        grid_factory = Gtk.SignalListItemFactory()
+        grid_factory.connect("setup", self.on_setup_grid_item)
+        grid_factory.connect("bind", self.on_bind_grid_item)
+        self.grid_view = Gtk.GridView.new(self.selection, grid_factory)
+        self.grid_view.set_min_columns(1)
+        self.grid_view.set_max_columns(6)
+        self.grid_view.set_single_click_activate(False)
+        self.grid_view.connect("activate", self.on_activate)
+        self.grid_view.set_hexpand(True)
+        self.grid_view.set_vexpand(True)
+
+        grid_scrolled = Gtk.ScrolledWindow()
+        grid_scrolled.set_policy(
+            Gtk.PolicyType.AUTOMATIC,
+            Gtk.PolicyType.AUTOMATIC,
+        )
+        grid_scrolled.set_child(self.grid_view)
+        grid_scrolled.set_hexpand(True)
+        grid_scrolled.set_vexpand(True)
+
+        self.view_stack = Gtk.Stack()
+        self.view_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.view_stack.add_titled(scrolled, "table", "Table")
+        self.view_stack.add_titled(grid_scrolled, "grid", "Grid")
+        self.view_stack.set_visible_child_name(self.view_mode)
+
         self._setup_context_menu()
 
         # Contextual selection action bar
@@ -269,7 +311,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.empty_page.set_title("No apps found")
         self.empty_page.set_description("Try changing your search or filters.")
 
-        self.main_stack.add_named(scrolled, "list")
+        self.main_stack.add_named(self.view_stack, "list")
         self.main_stack.add_named(self.empty_page, "empty")
         self.filter_model.connect("items-changed", self.on_filter_items_changed)
 
@@ -351,6 +393,7 @@ class MainWindow(Adw.ApplicationWindow):
                 ]
             except Exception:
                 pass
+            state["view_mode"] = self.view_mode
 
             self._state_dir().mkdir(parents=True, exist_ok=True)
 
@@ -395,7 +438,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.toast_overlay.add_toast(toast)
         except Exception:
             self.show_message(
-                "App Manager",
+                "Appector",
                 message,
                 Gtk.MessageType.INFO,
             )
@@ -893,7 +936,7 @@ class MainWindow(Adw.ApplicationWindow):
             return
 
         warning = (
-            "AppImages are executable programs and are not sandboxed by App Manager. "
+            "AppImages are executable programs and are not sandboxed by Appector. "
             "Only install files from publishers you trust. The app will copy each "
             "AppImage into your user applications folder and create a launcher; it "
             "will not run the AppImage during installation. Its name is inferred from "
@@ -2036,6 +2079,13 @@ class MainWindow(Adw.ApplicationWindow):
         .manager-appimage { background-color: rgba(38, 162, 105, 0.15); }
         .manager-manual { background-color: rgba(145, 65, 172, 0.15); }
         .manager-leftover { background-color: rgba(119, 118, 123, 0.15); }
+        .app-grid-card {
+            border-radius: 12px;
+            padding: 2px;
+        }
+        .app-grid-card:hover {
+            background-color: alpha(currentColor, 0.04);
+        }
         """
         provider = Gtk.CssProvider()
         try:
@@ -2115,9 +2165,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         add_window_action("install", "on_install_clicked")
 
-        add_window_action("clean-orphans", "on_autoremove_clicked")
-        add_window_action("clean-leftover-configs", "on_leftover_cleanup_clicked")
-        add_window_action("clean-runtimes", "on_flatpak_cleanup_clicked")
+        add_window_action("cleanup-residuals", "on_cleanup_residuals_clicked")
         add_window_action("check-updates", "on_check_updates_clicked")
         add_window_action("export-app-list", "on_export_app_list_clicked")
         add_window_action("export-app-list-json", "on_export_app_list_json_clicked")
@@ -2233,10 +2281,10 @@ class MainWindow(Adw.ApplicationWindow):
         if hasattr(Adw, "AboutWindow"):
             about = Adw.AboutWindow(
                 transient_for=self,
-                application_name="App Manager",
+                application_name="Appector",
                 version="1.0.0",
-                developer_name="App Manager Developers",
-                copyright="© 2024 App Manager Developers",
+                developer_name="Appector contributors",
+                copyright="© 2024 Appector contributors",
             )
             about.present()
         else:
@@ -2244,7 +2292,7 @@ class MainWindow(Adw.ApplicationWindow):
                 transient_for=self,
                 modal=True,
             )
-            about.set_program_name("App Manager")
+            about.set_program_name("Appector")
             about.set_version("1.0.0")
             about.set_comments("Unified installed app inventory")
             about.present()
@@ -2563,7 +2611,7 @@ class MainWindow(Adw.ApplicationWindow):
         size_estimate = get_removal_size_estimate(leftovers)
         lines = [
             "These packages are already removed. Only their configuration files remain.",
-            "Before purging, App Manager makes a private backup of dpkg-registered "
+            "Before purging, Appector makes a private backup of dpkg-registered "
             "configuration files in ~/.local/state/app-manager/purge-backups. If any "
             "file cannot be safely backed up, the purge will not run. Backups are kept "
             "until you remove them; this is a recovery copy, not an automatic restore.",
@@ -2855,6 +2903,199 @@ class MainWindow(Adw.ApplicationWindow):
                 self.install_progress_window.finish_failure(message)
 
         return False
+
+    def on_cleanup_residuals_clicked(self, button=None):
+        dialog = Gtk.Dialog(
+            transient_for=self,
+            modal=True,
+            title="Cleanup & residuals",
+            default_width=560,
+        )
+        dialog.set_resizable(True)
+        dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+
+        content = dialog.get_content_area()
+        content.set_spacing(12)
+        content.set_margin_top(16)
+        content.set_margin_bottom(16)
+        content.set_margin_start(16)
+        content.set_margin_end(16)
+
+        warning = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=12,
+        )
+        warning.add_css_class("card")
+        warning.set_margin_bottom(4)
+        warning_icon = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
+        warning_icon.set_valign(Gtk.Align.START)
+        warning_text = Gtk.Label(
+            label=(
+                "These cleanup tools are experimental and may remove packages, "
+                "runtimes, or configuration files. Apart from limited copies of "
+                "APT purge configuration files, Appector does not yet provide a "
+                "complete backup or one-click restore system. Review every preview "
+                "carefully; proceed only if you understand the changes. You are "
+                "responsible for confirming each cleanup."
+            )
+        )
+        warning_text.set_wrap(True)
+        warning_text.set_xalign(0)
+        warning.append(warning_icon)
+        warning.append(warning_text)
+        content.append(warning)
+
+        actions = (
+            (
+                "Remove unused APT dependencies…",
+                "Preview auto-removable packages and estimated disk space.",
+                self.on_autoremove_clicked,
+            ),
+            (
+                "Purge leftover APT configurations…",
+                "Review removed packages’ configuration files before purging.",
+                self.on_leftover_cleanup_clicked,
+            ),
+            (
+                "Remove unused Flatpak runtimes…",
+                "Review runtimes Flatpak reports as no longer needed.",
+                self.on_flatpak_cleanup_clicked,
+            ),
+        )
+        for title, description, callback in actions:
+            action_button = Gtk.Button()
+            action_button.add_css_class("flat")
+            action_button.set_hexpand(True)
+            row = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL,
+                spacing=4,
+            )
+            row.set_margin_top(8)
+            row.set_margin_bottom(8)
+            row.set_margin_start(8)
+            row.set_margin_end(8)
+            heading = Gtk.Label(label=title)
+            heading.set_xalign(0)
+            heading.add_css_class("heading")
+            detail = Gtk.Label(label=description)
+            detail.set_xalign(0)
+            detail.set_wrap(True)
+            detail.add_css_class("dim-label")
+            row.append(heading)
+            row.append(detail)
+            action_button.set_child(row)
+
+            def choose_action(_button, action_callback=callback):
+                dialog.close()
+                action_callback()
+
+            action_button.connect("clicked", choose_action)
+            content.append(action_button)
+
+        dialog.present()
+        return False
+
+    def on_view_mode_toggled(self, button, mode):
+        if not button.get_active():
+            return
+        self.view_mode = mode
+        if hasattr(self, "view_stack"):
+            self.view_stack.set_visible_child_name(mode)
+        self.save_ui_state()
+
+    def on_setup_grid_item(self, factory, list_item):
+        card = Gtk.Frame()
+        card.add_css_class("app-grid-card")
+
+        content = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=10,
+        )
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+
+        header = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=10,
+        )
+        check = Gtk.CheckButton()
+        check.set_valign(Gtk.Align.START)
+        icon = Gtk.Image()
+        icon.set_pixel_size(40)
+        icon.set_valign(Gtk.Align.START)
+        name = Gtk.Label()
+        name.set_xalign(0)
+        name.set_yalign(0)
+        name.set_wrap(True)
+        name.set_max_width_chars(28)
+        name.set_hexpand(True)
+        name.add_css_class("heading")
+        header.append(check)
+        header.append(icon)
+        header.append(name)
+
+        package_id = Gtk.Label()
+        package_id.set_xalign(0)
+        package_id.set_wrap(True)
+        package_id.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        package_id.set_max_width_chars(40)
+        package_id.set_selectable(True)
+        package_id.add_css_class("caption")
+        package_id.add_css_class("dim-label")
+        origin = Gtk.Label()
+        origin.set_xalign(0)
+        origin.set_ellipsize(Pango.EllipsizeMode.END)
+        origin.set_max_width_chars(40)
+        origin.add_css_class("dim-label")
+
+        content.append(header)
+        content.append(package_id)
+        content.append(origin)
+        card.set_child(content)
+        list_item.set_child(card)
+
+    def on_bind_grid_item(self, factory, list_item):
+        item = list_item.get_item()
+        card = list_item.get_child()
+        if item is None or card is None:
+            return
+
+        content = card.get_child()
+        header = content.get_first_child()
+        check = header.get_first_child()
+        icon = check.get_next_sibling()
+        name = icon.get_next_sibling()
+        package_id = header.get_next_sibling()
+        origin = package_id.get_next_sibling()
+
+        handler_id = getattr(check, "_app_manager_handler_id", None)
+        if handler_id is not None:
+            try:
+                check.handler_disconnect(handler_id)
+            except (TypeError, RuntimeError):
+                pass
+        check.set_active(bool(item.marked))
+        check.set_sensitive(not is_blocked(item))
+        check.set_tooltip_text(
+            "This package is protected from removal."
+            if is_blocked(item)
+            else f"Mark {item.name} for removal"
+        )
+        check._app_manager_handler_id = check.connect(
+            "toggled",
+            self.on_check_toggled,
+            item,
+        )
+
+        name.set_label(item.name or item.package_id)
+        name.set_tooltip_text(item.name or item.package_id)
+        package_id.set_label(item.package_id)
+        package_id.set_tooltip_text(item.package_id)
+        origin.set_label(f"{item.manager} · {item.source}")
+        origin.set_tooltip_text(f"{item.manager} · {item.source}")
+        self.set_image_from_icon(icon, item.icon)
 
     # ------------------------------------------------------------
     # Column helpers
@@ -4357,9 +4598,9 @@ class MainWindow(Adw.ApplicationWindow):
                 label="Purge APT configuration files (private backup first)"
             )
             purge_check.set_tooltip_text(
-                "App Manager backs up dpkg-registered configuration files before "
+                "Appector backs up dpkg-registered configuration files before "
                 "purging. If a file cannot be safely backed up, APT removal will "
-                "not run. The backup is retained in your private App Manager state."
+                "not run. The backup is retained in your private Appector state."
             )
             content_area.append(purge_check)
             purge_note = Gtk.Label(

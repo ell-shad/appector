@@ -8,10 +8,10 @@ from gi.repository import Adw, Gio
 from .window import MainWindow
 
 
-class AppManagerApp(Adw.Application):
+class AppectorApp(Adw.Application):
     def __init__(self):
         super().__init__(
-            application_id="com.example.AppManager",
+            application_id="com.appector.appector",
             flags=Gio.ApplicationFlags.FLAGS_NONE,
         )
 
@@ -25,5 +25,5 @@ class AppManagerApp(Adw.Application):
 
 
 def main():
-    app = AppManagerApp()
+    app = AppectorApp()
     app.run(None)

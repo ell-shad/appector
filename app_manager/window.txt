@@ -40,7 +40,7 @@ class MainWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(
             application=app,
-            title="App Manager",
+            title="Appector",
             default_width=1250,
             default_height=760,
         )
@@ -70,7 +70,7 @@ class MainWindow(Adw.ApplicationWindow):
         header = Adw.HeaderBar()
 
         self.window_title = Adw.WindowTitle(
-            title="App Manager",
+            title="Appector",
             subtitle="Unified installed app inventory",
         )
 
@@ -376,7 +376,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.toast_overlay.add_toast(toast)
         except Exception:
             self.show_message(
-                "App Manager",
+                "Appector",
                 message,
                 Gtk.MessageType.INFO,
             )

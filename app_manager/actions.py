@@ -479,7 +479,7 @@ def get_removal_preview(app) -> str:
     if manager == "AppImage":
         if getattr(app, "removal_paths", None):
             return (
-                "Remove the App Manager launcher and managed AppImage copy:\n"
+                "Remove the Appector launcher and managed AppImage copy:\n"
                 + "\n".join(_manual_removal_paths(app))
             )
         return f"rm \"{package_id}\""
@@ -693,7 +693,7 @@ def _run_command_raw(cmd, timeout=900, env_overrides=None):
     uses_apt = _command_uses_apt(cmd)
     if uses_apt and not APT_COMMAND_LOCK.acquire(blocking=False):
         return 1, (
-            "Another APT/dpkg operation is already running in App Manager. "
+            "Another APT/dpkg operation is already running in Appector. "
             "Wait for it to finish, then try again."
         )
 
@@ -800,7 +800,7 @@ def _run_command_stream(cmd, output_callback=None, timeout=900):
     uses_apt = _command_uses_apt(cmd)
     if uses_apt and not APT_COMMAND_LOCK.acquire(blocking=False):
         return False, (
-            "Another APT/dpkg operation is already running in App Manager. "
+            "Another APT/dpkg operation is already running in Appector. "
             "Wait for it to finish, then try again."
         )
 
@@ -1553,7 +1553,7 @@ def execute_removal(app):
                 "X-AppManager-Installed-AppImage=true" not in desktop_content
                 or f"X-AppManager-AppImage-Path={package_id}" not in desktop_content
             ):
-                message = "The launcher does not identify this as an App Manager installation."
+                message = "The launcher does not identify this as an Appector installation."
                 _log_action(f"REMOVE_BLOCKED {key} manager=AppImage reason=unverified-desktop")
                 return False, message
 
@@ -1904,7 +1904,7 @@ def execute_apt_removal(app, purge=False):
         except OSError as error:
             _log_action(f"APT_REMOVE_BLOCKED {key} reason=purge-backup-failed")
             return False, (
-                "Purge was not started because App Manager could not securely back "
+                "Purge was not started because Appector could not securely back "
                 f"up the affected configuration files.\n\n{error}"
             )
         backup_note = _purge_backup_note(backup_dir, backed_up_count)
@@ -2462,7 +2462,7 @@ def execute_batch_removal(apps, progress_callback=None, purge=False):
                 backup_note = _purge_backup_note(backup_dir, backed_up_count)
             except OSError as error:
                 message = (
-                    "Privileged removal was not started because App Manager could "
+                    "Privileged removal was not started because Appector could "
                     "not securely back up the APT configuration files.\n\n"
                     f"{error}"
                 )
@@ -3596,7 +3596,7 @@ def purge_leftover_configs(package_ids, output_callback=None):
     except OSError as error:
         _log_action(f"LEFTOVER_PURGE_BLOCKED backup_error={error}")
         return False, (
-            "Purge was not started because App Manager could not securely back up "
+            "Purge was not started because Appector could not securely back up "
             f"the remaining configuration files.\n\n{error}"
         )
 
