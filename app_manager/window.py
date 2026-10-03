@@ -26,7 +26,9 @@ from .actions import (
     install_flatpak_source,
     install_deb_batch,
     install_flatpak_ref_batch,
+    install_flatpak_app_id_batch,
     extract_flathub_app_id,
+    parse_flatpak_app_inputs,
     purge_leftover_configs,
     get_apt_autoremove_preview,
     execute_apt_autoremove,
@@ -795,10 +797,51 @@ class MainWindow(Adw.ApplicationWindow):
 
         id_label = Gtk.Label(label="Flatpak app ID or Flathub app page URL:")
         id_label.set_xalign(0.0)
+        dialog.id_label = id_label
 
         dialog.id_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         dialog.id_box.append(id_label)
         dialog.id_box.append(dialog.id_entry)
+
+        dialog.batch_expander = Gtk.Expander(label="Install multiple apps")
+        batch_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        batch_hint = Gtk.Label(
+            label="Paste one Flatpak app ID or Flathub app page URL per line."
+        )
+        batch_hint.set_xalign(0.0)
+        batch_hint.set_wrap(True)
+        batch_hint.add_css_class("dim-label")
+        batch_box.append(batch_hint)
+
+        dialog.batch_text_view = Gtk.TextView()
+        dialog.batch_text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        dialog.batch_text_view.set_monospace(True)
+        dialog.batch_text_view.set_left_margin(8)
+        dialog.batch_text_view.set_right_margin(8)
+        dialog.batch_text_view.set_top_margin(6)
+        dialog.batch_text_view.set_bottom_margin(6)
+
+        batch_scroller = Gtk.ScrolledWindow()
+        batch_scroller.set_policy(
+            Gtk.PolicyType.AUTOMATIC,
+            Gtk.PolicyType.AUTOMATIC,
+        )
+        batch_scroller.set_min_content_height(100)
+        batch_scroller.set_max_content_height(150)
+        batch_scroller.set_child(dialog.batch_text_view)
+
+        batch_frame = Gtk.Frame()
+        batch_frame.set_child(batch_scroller)
+        batch_box.append(batch_frame)
+
+        dialog.batch_status_label = Gtk.Label(label="")
+        dialog.batch_status_label.set_xalign(0.0)
+        dialog.batch_status_label.set_wrap(True)
+        dialog.batch_status_label.add_css_class("dim-label")
+        batch_box.append(dialog.batch_status_label)
+
+        dialog.batch_expander.set_child(batch_box)
+        dialog.id_box.append(dialog.batch_expander)
 
         ref_label = Gtk.Label(label=".flatpakref file, URL, or Flathub app page URL:")
         ref_label.set_xalign(0.0)
@@ -836,6 +879,18 @@ class MainWindow(Adw.ApplicationWindow):
             dialog,
         )
 
+        dialog.batch_text_view.get_buffer().connect(
+            "changed",
+            self.on_flatpak_batch_text_changed,
+            dialog,
+        )
+
+        dialog.batch_expander.connect(
+            "notify::expanded",
+            self.on_flatpak_batch_expander_changed,
+            dialog,
+        )
+
         dialog.file_entry.connect(
             "changed",
             self.on_flatpak_install_state_changed,
@@ -848,6 +903,12 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.present()
 
     def on_flatpak_install_mode_changed(self, button, dialog):
+        self.update_flatpak_install_dialog_state(dialog)
+
+    def on_flatpak_batch_text_changed(self, buffer, dialog):
+        self.update_flatpak_install_dialog_state(dialog)
+
+    def on_flatpak_batch_expander_changed(self, expander, param, dialog):
         self.update_flatpak_install_dialog_state(dialog)
 
     def on_flatpak_install_state_changed(self, widget, dialog):
@@ -876,9 +937,20 @@ class MainWindow(Adw.ApplicationWindow):
         if hasattr(dialog, "delete_source_check"):
             dialog.delete_source_check.set_visible(not mode_id)
 
+        dialog.batch_expander.set_visible(mode_id)
+
         if mode_id:
+            batch_mode = dialog.batch_expander.get_expanded()
+            dialog.id_label.set_visible(not batch_mode)
+            dialog.id_entry.set_visible(not batch_mode)
+
             value = dialog.id_entry.get_text().strip()
             app_id = extract_flathub_app_id(value) or value
+
+            batch_buffer = dialog.batch_text_view.get_buffer()
+            batch_start, batch_end = batch_buffer.get_bounds()
+            batch_text = batch_buffer.get_text(batch_start, batch_end, True)
+            batch_ids, batch_issues = parse_flatpak_app_inputs(batch_text)
 
             try:
                 flathub_exists = flathub_remote_exists(user_install)
@@ -887,28 +959,73 @@ class MainWindow(Adw.ApplicationWindow):
 
             scope_name = "user" if user_install else "system"
 
-            if flathub_exists:
-                status = f"Flathub remote is available in {scope_name} scope."
-                install_enabled = bool(app_id)
-                add_enabled = False
-            else:
-                status = (
-                    f"Flathub remote is not available in {scope_name} scope.\n"
-                    "Click Add Flathub to add it."
+            if batch_mode:
+                invalid_count = sum(
+                    "invalid app ID or Flathub URL" in issue
+                    for issue in batch_issues
                 )
-                install_enabled = False
-                add_enabled = True
+                duplicate_count = len(batch_issues) - invalid_count
+                batch_status = (
+                    f"{len(batch_ids)} app(s) ready."
+                    if batch_ids
+                    else "Paste one or more app IDs or Flathub URLs."
+                )
 
-            if extract_flathub_app_id(value):
-                status = (
-                    f"Flathub app page detected: {app_id}.\n"
-                    f"{status}"
-                )
+                if duplicate_count:
+                    batch_status += f" {duplicate_count} duplicate(s) will be skipped."
+                if invalid_count:
+                    batch_status += f" {invalid_count} invalid line(s) need attention."
+                if batch_issues:
+                    batch_status += "\n" + "\n".join(batch_issues[:8])
+
+                if flathub_exists:
+                    install_enabled = bool(batch_ids) and invalid_count == 0
+                    if not batch_issues:
+                        batch_status = (
+                            f"{len(batch_ids)} app(s) ready for {scope_name} installation."
+                        )
+                    add_enabled = False
+                elif batch_ids:
+                    batch_status += (
+                        f"\nFlathub remote is not available in {scope_name} scope."
+                    )
+                    add_enabled = bool(batch_ids) and invalid_count == 0
+                    install_enabled = False
+                else:
+                    add_enabled = False
+                    install_enabled = False
+
+                dialog.batch_status_label.set_label(batch_status)
+                dialog.batch_status_label.set_visible(True)
+                status = "Review the list above before installing."
+            else:
+                dialog.batch_status_label.set_label("")
+                dialog.batch_status_label.set_visible(False)
+
+                if flathub_exists:
+                    status = f"Flathub remote is available in {scope_name} scope."
+                    install_enabled = bool(app_id)
+                    add_enabled = False
+                else:
+                    status = (
+                        f"Flathub remote is not available in {scope_name} scope.\n"
+                        "Click Add Flathub to add it."
+                    )
+                    install_enabled = False
+                    add_enabled = True
+
+                if extract_flathub_app_id(value):
+                    status = (
+                        f"Flathub app page detected: {app_id}.\n"
+                        f"{status}"
+                    )
 
             if hasattr(dialog, "delete_source_check"):
                 dialog.delete_source_check.set_sensitive(False)
                 dialog.delete_source_check.set_active(False)
         else:
+            dialog.id_label.set_visible(True)
+            dialog.id_entry.set_visible(True)
             paths = getattr(dialog, "flatpakref_paths", []) or []
             value = dialog.file_entry.get_text().strip()
 
@@ -983,6 +1100,22 @@ class MainWindow(Adw.ApplicationWindow):
             user_install = dialog.user_check.get_active()
 
             if mode_id:
+                batch_buffer = dialog.batch_text_view.get_buffer()
+                batch_start, batch_end = batch_buffer.get_bounds()
+                batch_text = batch_buffer.get_text(batch_start, batch_end, True)
+                batch_ids, batch_issues = parse_flatpak_app_inputs(batch_text)
+
+                if dialog.batch_expander.get_expanded():
+                    if batch_issues or not batch_ids:
+                        return
+
+                    dialog.close()
+                    self.start_flatpak_app_id_batch_install(
+                        batch_ids,
+                        user_install,
+                    )
+                    return
+
                 value = dialog.id_entry.get_text().strip()
 
                 if not value:
@@ -1275,11 +1408,71 @@ class MainWindow(Adw.ApplicationWindow):
 
                 self.show_message(
                     "Installation finished",
-                    "Flatpak installation completed successfully.",
+                    (
+                        message
+                        if "installation file" in message.lower()
+                        else "Flatpak installation completed successfully."
+                    ),
                     Gtk.MessageType.INFO,
                 )
             else:
                 self.install_progress_window.finish_failure(message)
+
+        return False
+
+    def start_flatpak_app_id_batch_install(self, app_ids, user_install):
+        self.install_progress_window = InstallProgressWindow(
+            self,
+            "Installing Flatpak apps",
+        )
+        self.install_progress_window.present()
+        self.install_progress_window.start_pulse()
+        self.install_progress_window.set_status(
+            f"Installing {len(app_ids)} Flatpak app(s)…"
+        )
+
+        thread = threading.Thread(
+            target=self.flatpak_app_id_batch_install_worker,
+            args=(app_ids, user_install),
+            daemon=True,
+        )
+        thread.start()
+
+    def flatpak_app_id_batch_install_worker(self, app_ids, user_install):
+        def output_callback(line):
+            if self.install_progress_window:
+                GLib.idle_add(
+                    self.install_progress_window.append_output,
+                    line,
+                )
+
+        success, message, success_count = install_flatpak_app_id_batch(
+            app_ids,
+            user_install,
+            output_callback=output_callback,
+        )
+        GLib.idle_add(
+            self.on_flatpak_app_id_batch_install_finished,
+            success,
+            message,
+            success_count,
+        )
+
+    def on_flatpak_app_id_batch_install_finished(self, success, message, _success_count):
+        if self.install_progress_window:
+            self.install_progress_window.stop_pulse()
+            self.reload()
+
+            if success:
+                self.install_progress_window.close_window()
+                self.install_progress_window = None
+                self.show_message(
+                    "Installation finished",
+                    message,
+                    Gtk.MessageType.INFO,
+                )
+            else:
+                self.install_progress_window.finish_batch_results(message)
 
         return False
         
@@ -1319,7 +1512,7 @@ class MainWindow(Adw.ApplicationWindow):
                     line,
                 )
 
-        success, message = install_flatpak_ref_batch(
+        success, message, success_count = install_flatpak_ref_batch(
             paths,
             user_install,
             output_callback=output_callback,
@@ -1330,9 +1523,10 @@ class MainWindow(Adw.ApplicationWindow):
             self.on_flatpak_ref_batch_install_finished,
             success,
             message,
+            success_count,
         )
 
-    def on_flatpak_ref_batch_install_finished(self, success, message):
+    def on_flatpak_ref_batch_install_finished(self, success, message, _success_count):
         if self.install_progress_window:
             self.install_progress_window.stop_pulse()
 
@@ -1343,11 +1537,12 @@ class MainWindow(Adw.ApplicationWindow):
 
                 self.show_message(
                     "Installation finished",
-                    "Flatpak reference files installed successfully.",
+                    message,
                     Gtk.MessageType.INFO,
                 )
             else:
-                self.install_progress_window.finish_failure(message)
+                self.reload()
+                self.install_progress_window.finish_batch_results(message)
 
         return False
     # ------------------------------------------------------------

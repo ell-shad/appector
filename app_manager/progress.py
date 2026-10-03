@@ -185,6 +185,18 @@ class InstallProgressWindow(Gtk.Window):
 
         self.close_button.set_sensitive(True)
 
+    def finish_batch_results(self, message=None):
+        self.stop_pulse()
+        self.progressbar.set_fraction(1.0)
+        self.set_status("Batch results")
+
+        if message:
+            self.append_output("")
+            self.append_output(message)
+
+        self.expander.set_expanded(True)
+        self.close_button.set_sensitive(True)
+
     def close_window(self):
         self.stop_pulse()
         self.close()

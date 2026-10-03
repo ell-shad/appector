@@ -595,20 +595,22 @@ def _maybe_delete_source_file(path, delete_source, message):
     if not delete_source:
         return message
 
+    source_path = Path(path).expanduser()
+
     try:
-        source_path = Path(path).expanduser()
+        source_path.unlink()
+    except FileNotFoundError:
+        warning = f"Could not delete installation file; it was not found: {source_path}"
+        _log_action(f"INSTALL_SOURCE_DELETE_FAILED path={source_path} reason=not-found")
+        return f"{message}\n\n{warning}" if message else warning
+    except OSError as error:
+        warning = f"Could not delete installation file {source_path}: {error}"
+        _log_action(f"INSTALL_SOURCE_DELETE_FAILED path={source_path} error={error}")
+        return f"{message}\n\n{warning}" if message else warning
 
-        if source_path.is_file():
-            source_path.unlink()
-
-            if message:
-                return message + "\n\nDeleted installation file after successful installation."
-
-            return "Deleted installation file after successful installation."
-    except Exception:
-        pass
-
-    return message
+    _log_action(f"INSTALL_SOURCE_DELETE_SUCCESS path={source_path}")
+    notice = "Deleted installation file after successful installation."
+    return f"{message}\n\n{notice}" if message else notice
 
 # ------------------------------------------------------------
 # Batch .deb installation
@@ -706,14 +708,18 @@ def install_flatpak_ref_batch(
     Returns:
         success: bool
         message: str
+        number of resolved files (installed or already installed): int
     """
 
     if not paths:
-        return True, "No .flatpakref files selected."
+        return True, "Installed (0): none\nAlready installed (0): none\nFailed (0): none", 0
 
     total = len(paths)
-    success_count = 0
+    installed = []
+    already_installed = []
     failures = []
+    success_count = 0
+    source_file_results = []
 
     for index, path in enumerate(paths, start=1):
         p = Path(path).expanduser()
@@ -731,24 +737,34 @@ def install_flatpak_ref_batch(
 
         if success:
             success_count += 1
+            if _flatpak_output_is_already_installed(message):
+                already_installed.append(name)
+                result = "ALREADY INSTALLED"
+            else:
+                installed.append(name)
+                result = "INSTALLED"
+            if delete_source and message:
+                for line in message.splitlines():
+                    if (
+                        "Deleted installation file" in line
+                        or "Could not delete installation file" in line
+                    ):
+                        source_file_results.append(f"{name}: {line}")
+                        break
         else:
             first_line = (message or "").splitlines()[0] if message else "Installation failed"
             failures.append(f"{name}: {first_line}")
+            result = "FAILED"
 
         if output_callback:
-            status = "OK" if success else "FAIL"
-            output_callback(f"[{index}/{total}] {status} {name}")
+            output_callback(f"[{index}/{total}] {result} {name}")
 
-    summary = f"{success_count}/{total} Flatpak reference files installed."
+    summary = _format_flatpak_batch_summary(installed, already_installed, failures)
 
-    if failures:
-        summary += "\n\nFailures:\n"
-        summary += "\n".join(failures[:20])
+    if source_file_results:
+        summary += "\n\nSource file cleanup:\n" + "\n".join(source_file_results[:20])
 
-        if len(failures) > 20:
-            summary += f"\n…and {len(failures) - 20} more"
-
-    return success_count == total, summary
+    return not failures, summary, success_count
 # ------------------------------------------------------------
 # Single non-APT removal
 # ------------------------------------------------------------
@@ -1837,7 +1853,15 @@ def install_flatpak_app_id(app_id: str, user_install: bool = True, output_callba
 
     _log_action(f"FLATPAK_INSTALL_START cmd={shlex.join(cmd)}")
 
-    success, message = _run_command_stream(cmd, output_callback)
+    def filtered_output(line):
+        if output_callback and "already installed" not in line.lower():
+            output_callback(line)
+
+    success, message = _run_command_stream(cmd, filtered_output if output_callback else None)
+
+    if not success and _flatpak_output_is_already_installed(message):
+        _log_action(f"FLATPAK_INSTALL_ALREADY_INSTALLED app_id={app_id}")
+        return True, f"Already installed: {app_id}"
 
     if success:
         _log_action(f"FLATPAK_INSTALL_SUCCESS app_id={app_id}")
@@ -1855,6 +1879,105 @@ def install_flatpak_app_id(app_id: str, user_install: bool = True, output_callba
         _log_action(f"FLATPAK_INSTALL_FAILED app_id={app_id} error={message}")
 
     return success, message
+
+
+def _flatpak_output_is_already_installed(message: str):
+    return "already installed" in (message or "").lower()
+
+
+def parse_flatpak_app_inputs(text: str):
+    """Validate and deduplicate newline-separated Flatpak IDs or Flathub URLs."""
+    app_ids = []
+    issues = []
+    seen = set()
+
+    for line_number, raw_value in enumerate(text.splitlines(), start=1):
+        value = raw_value.strip()
+
+        if not value:
+            continue
+
+        app_id = extract_flathub_app_id(value) or value
+
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", app_id):
+            issues.append(f"Line {line_number}: invalid app ID or Flathub URL.")
+            continue
+
+        if app_id in seen:
+            issues.append(f"Line {line_number}: duplicate app ignored ({app_id}).")
+            continue
+
+        seen.add(app_id)
+        app_ids.append(app_id)
+
+    return app_ids, issues
+
+
+def install_flatpak_app_id_batch(app_ids, user_install: bool = True, output_callback=None):
+    """Install a sequence of validated Flatpak app IDs, continuing after failures."""
+    if not app_ids:
+        return True, "Installed (0): none\nAlready installed (0): none\nFailed (0): none", 0
+
+    installed = []
+    already_installed = []
+    failures = []
+    success_count = 0
+    total = len(app_ids)
+
+    for index, app_id in enumerate(app_ids, start=1):
+        if output_callback:
+            output_callback(f"[{index}/{total}] Installing {app_id}…")
+
+        success, message = install_flatpak_app_id(
+            app_id,
+            user_install,
+            output_callback,
+        )
+
+        if success:
+            success_count += 1
+            if _flatpak_output_is_already_installed(message):
+                already_installed.append(app_id)
+                result = "ALREADY INSTALLED"
+            else:
+                installed.append(app_id)
+                result = "INSTALLED"
+        else:
+            message_lines = (message or "").splitlines()
+            first_line = message_lines[0] if message_lines else "Installation failed"
+            failures.append(f"{app_id}: {first_line}")
+            result = "FAILED"
+
+        if output_callback:
+            output_callback(f"[{index}/{total}] {result} {app_id}")
+
+    summary = _format_flatpak_batch_summary(
+        installed,
+        already_installed,
+        failures,
+    )
+
+    return not failures, summary, success_count
+
+
+def _format_flatpak_batch_summary(installed, already_installed, failures):
+    def format_section(title, entries):
+        if not entries:
+            return f"{title} (0): none"
+        return f"{title} ({len(entries)}):\n" + "\n".join(
+            f"  {entry}" for entry in entries[:20]
+        )
+
+    sections = [
+        format_section("Installed", installed),
+        format_section("Already installed", already_installed),
+        format_section("Failed", failures),
+    ]
+
+    if len(installed) > 20 or len(already_installed) > 20 or len(failures) > 20:
+        sections.append("Lists are limited to the first 20 entries per section.")
+
+    return "\n\n".join(sections)
 
 
 def extract_flathub_app_id(value: str):
@@ -1957,14 +2080,24 @@ def install_flatpak_ref_file(
     if not ref_path.is_file():
         return False, "Selected .flatpakref file not found."
 
+    def filtered_output(line):
+        if output_callback and "already installed" not in line.lower():
+            output_callback(line)
+
     success, message = _install_flatpak_location(
         str(ref_path),
         user_install,
-        output_callback,
+        filtered_output if output_callback else None,
     )
 
     if success:
         message = _maybe_delete_source_file(ref_path, delete_source, message)
+        return True, message
+
+    if _flatpak_output_is_already_installed(message):
+        message = f"Already installed: {ref_path.stem}"
+        message = _maybe_delete_source_file(ref_path, delete_source, message)
+        _log_action(f"FLATPAK_REF_ALREADY_INSTALLED path={ref_path}")
         return True, message
 
     url = _parse_flatpakref_url(ref_path)
@@ -1973,11 +2106,17 @@ def install_flatpak_ref_file(
         url_success, url_message = _install_flatpak_location(
             url,
             user_install,
-            output_callback,
+            filtered_output if output_callback else None,
         )
 
         if url_success:
             url_message = _maybe_delete_source_file(ref_path, delete_source, url_message)
+            return True, url_message
+
+        if _flatpak_output_is_already_installed(url_message):
+            url_message = f"Already installed: {ref_path.stem}"
+            url_message = _maybe_delete_source_file(ref_path, delete_source, url_message)
+            _log_action(f"FLATPAK_REF_ALREADY_INSTALLED path={ref_path}")
             return True, url_message
 
         message += (
