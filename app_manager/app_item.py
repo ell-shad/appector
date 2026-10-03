@@ -41,4 +41,4 @@ class AppItem(GObject.Object):
         self.icon = app.icon or ""
         self.is_gui_app = getattr(app, "is_gui_app", True)
         self.exec_name = getattr(app, "exec_name", "") or ""
-        self.is_duplicate = False
+        self.is_duplicate = getattr(app, "is_duplicate", False)

@@ -12,6 +12,7 @@ from gi.repository import Gtk, Adw, Gio, GLib, Gdk, GdkPixbuf, Pango
 import threading
 
 from .scanners import scan_all
+from .models import mark_duplicate_apps
 from .app_item import AppItem
 from .details import DetailsWindow
 from .progress import ProgressWindow, InstallProgressWindow
@@ -1570,6 +1571,7 @@ class MainWindow(Adw.ApplicationWindow):
         .manager-snap { background-color: rgba(255, 120, 0, 0.15); }
         .manager-flatpak { background-color: rgba(28, 113, 216, 0.15); }
         .manager-appimage { background-color: rgba(38, 162, 105, 0.15); }
+        .manager-manual { background-color: rgba(145, 65, 172, 0.15); }
         .manager-leftover { background-color: rgba(119, 118, 123, 0.15); }
         """
         provider = Gtk.CssProvider()
@@ -1677,6 +1679,7 @@ class MainWindow(Adw.ApplicationWindow):
         if app:
             try:
                 app.set_accels_for_action("win.install-deb", ["<Ctrl>o"])
+                app.set_accels_for_action("win.install-flatpak", ["<Ctrl><Shift>o"])
                 app.set_accels_for_action("win.show-log", ["<Ctrl>l"])
                 app.set_accels_for_action("win.refresh", ["<Ctrl>r"])
                 app.set_accels_for_action("win.mark-all", ["<Ctrl>a"])
@@ -1783,8 +1786,18 @@ class MainWindow(Adw.ApplicationWindow):
 
 
     def _focus_search(self):
+        if hasattr(self, "sidebar_toggle_btn") and not self.sidebar_toggle_btn.get_active():
+            self.sidebar_toggle_btn.set_active(True)
+
+        if hasattr(self, "sidebar_revealer"):
+            self.sidebar_revealer.set_reveal_child(True)
+
+        GLib.idle_add(self._grab_search_focus_idle)
+
+    def _grab_search_focus_idle(self):
         if hasattr(self, "search_entry"):
             self.search_entry.grab_focus()
+        return False
 
     def show_shortcuts_window(self):
         ui = """
@@ -1813,6 +1826,12 @@ class MainWindow(Adw.ApplicationWindow):
                       <object class="GtkShortcutsShortcut">
                         <property name="title">Install .deb</property>
                         <property name="accelerator">&lt;Ctrl&gt;o</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkShortcutsShortcut">
+                        <property name="title">Install Flatpak</property>
+                        <property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;o</property>
                       </object>
                     </child>
                     <child>
@@ -2425,7 +2444,14 @@ class MainWindow(Adw.ApplicationWindow):
         label.set_label(manager)
         
         # Reset classes
-        for cls in ["manager-apt", "manager-snap", "manager-flatpak", "manager-appimage", "manager-leftover"]:
+        for cls in [
+            "manager-apt",
+            "manager-snap",
+            "manager-flatpak",
+            "manager-appimage",
+            "manager-manual",
+            "manager-leftover",
+        ]:
             label.remove_css_class(cls)
             
         # Apply specific tint
@@ -2433,6 +2459,7 @@ class MainWindow(Adw.ApplicationWindow):
         elif manager == "Snap": label.add_css_class("manager-snap")
         elif manager == "Flatpak": label.add_css_class("manager-flatpak")
         elif manager == "AppImage": label.add_css_class("manager-appimage")
+        elif manager == "Manual": label.add_css_class("manager-manual")
         elif manager == "Leftover": label.add_css_class("manager-leftover")
     def on_setup_cell(self, factory, list_item):
         label = Gtk.Label()
@@ -3130,36 +3157,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.update_selection_ui()
 
     def detect_duplicates(self):
-        """
-        Groups apps by their normalized exec_name and flags duplicates.
-        Only considers GUI apps to avoid flagging background libraries.
-        """
-        identity_groups = {}
-        
-        for app in self.current_apps:
-            if not getattr(app, "is_gui_app", True):
-                continue
-                
-            exec_name = getattr(app, "exec_name", "").lower()
-            if not exec_name:
-                continue
-                
-            # Ignore generic wrappers
-            if exec_name in ("python", "python3", "java", "sh", "bash"):
-                continue
-                
-            if exec_name not in identity_groups:
-                identity_groups[exec_name] = []
-            identity_groups[exec_name].append(app)
-            
-        # Flag apps as duplicates if they share an identity and have different managers/paths
-        for exec_name, group in identity_groups.items():
-            if len(group) > 1:
-                # Check if they are actually distinct installations (different managers or package_ids)
-                unique_installations = set((app.manager, app.package_id) for app in group)
-                if len(unique_installations) > 1:
-                    for app in group:
-                        app.is_duplicate = True
+        mark_duplicate_apps(self.current_apps)
 
     # ------------------------------------------------------------
     # Mark persistence

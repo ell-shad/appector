@@ -876,6 +876,156 @@ def scan_appimage() -> List[AppEntry]:
     return apps
 
 
+def scan_manual_apps(
+    desktop_dirs=None,
+    binary_dirs=None,
+) -> List[AppEntry]:
+    """Detect unmanaged desktop launchers and standalone user-installed executables."""
+    home = Path.home()
+    if desktop_dirs is None:
+        desktop_dirs = [
+            home / ".local/share/applications",
+            Path("/usr/local/share/applications"),
+        ]
+    if binary_dirs is None:
+        binary_dirs = [
+            home / ".local/bin",
+            home / "bin",
+            home / ".opencode/bin",
+            home / "Applications",
+            Path("/usr/local/bin"),
+            Path("/opt"),
+        ]
+
+    apps = []
+    manual_exec_names = set()
+    seen_paths = set()
+
+    for directory in desktop_dirs:
+        if not directory.is_dir():
+            continue
+
+        try:
+            desktop_files = directory.glob("*.desktop")
+            for desktop_path in desktop_files:
+                name, categories, no_display, hidden, icon, exec_line = parse_desktop_file(
+                    str(desktop_path)
+                )
+                if no_display or hidden or not name or not exec_line:
+                    continue
+
+                if get_package_owner(str(desktop_path)):
+                    continue
+
+                exec_name = normalize_exec(exec_line)
+                if not exec_name:
+                    continue
+
+                try:
+                    installed_at = datetime.fromtimestamp(
+                        desktop_path.stat().st_mtime
+                    ).date().isoformat()
+                except OSError:
+                    installed_at = None
+
+                manual_exec_names.add(exec_name)
+                try:
+                    seen_paths.add(desktop_path.resolve())
+                except (OSError, RuntimeError):
+                    pass
+                apps.append(
+                    AppEntry(
+                        name=name,
+                        manager="Manual",
+                        source="Manual installation",
+                        package_id=str(desktop_path),
+                        installed_at=installed_at,
+                        category=map_categories(categories),
+                        is_gui_app=True,
+                        details=str(desktop_path),
+                        icon=icon,
+                        exec_name=exec_name,
+                    )
+                )
+        except OSError:
+            continue
+
+    executable_candidates = []
+    for directory in binary_dirs:
+        if not directory.is_dir():
+            continue
+
+        try:
+            for path in directory.iterdir():
+                if path.name.startswith("."):
+                    continue
+
+                if path.is_file():
+                    executable_candidates.append(path)
+                elif directory in {home / "Applications", Path("/opt")} and path.is_dir():
+                    try:
+                        children = [
+                            candidate
+                            for candidate in path.iterdir()
+                            if candidate.is_file() and os.access(candidate, os.X_OK)
+                        ]
+                        matching_name = next(
+                            (
+                                candidate
+                                for candidate in children
+                                if candidate.stem.lower() == path.name.lower()
+                            ),
+                            None,
+                        )
+                        if matching_name:
+                            executable_candidates.append(matching_name)
+                        elif len(children) == 1:
+                            executable_candidates.append(children[0])
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+
+    for path in executable_candidates:
+        if path.suffix.lower() == ".appimage" or not os.access(path, os.X_OK):
+            continue
+
+        try:
+            resolved_path = path.resolve()
+        except (OSError, RuntimeError):
+            continue
+
+        if resolved_path in seen_paths:
+            continue
+
+        exec_name = path.name.lower()
+        if exec_name in manual_exec_names:
+            continue
+
+        try:
+            stat = path.stat()
+            installed_at = datetime.fromtimestamp(stat.st_mtime).date().isoformat()
+        except OSError:
+            installed_at = None
+
+        name = path.stem.replace("_", " ").replace("-", " ").title()
+        apps.append(
+            AppEntry(
+                name=name,
+                manager="Manual",
+                source="User executable",
+                package_id=str(path),
+                installed_at=installed_at,
+                category="Other",
+                is_gui_app=True,
+                details=str(path),
+                exec_name=exec_name,
+            )
+        )
+
+    return apps
+
+
 def scan_all() -> List[AppEntry]:
     apps: List[AppEntry] = []
 
@@ -884,6 +1034,7 @@ def scan_all() -> List[AppEntry]:
         scan_snap,
         scan_flatpak,
         scan_appimage,
+        scan_manual_apps,
         scan_leftover_configs,
     ]
 
