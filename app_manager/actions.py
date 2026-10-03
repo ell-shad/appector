@@ -6,6 +6,7 @@ import subprocess
 import threading
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # ------------------------------------------------------------
 # ANSI escape code stripper
@@ -1856,6 +1857,44 @@ def install_flatpak_app_id(app_id: str, user_install: bool = True, output_callba
     return success, message
 
 
+def extract_flathub_app_id(value: str):
+    """Return the app ID from a Flathub app page URL, if value is one."""
+    try:
+        parsed = urlsplit(value.strip())
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or hostname is None
+        or hostname.lower() not in {"flathub.org", "www.flathub.org"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+    ):
+        return None
+
+    segments = [segment for segment in parsed.path.split("/") if segment]
+
+    if (
+        len(segments) == 3
+        and re.fullmatch(r"[a-z]{2}(?:-[A-Z]{2})?", segments[0])
+        and segments[1] == "apps"
+    ):
+        app_id = segments[2]
+    elif len(segments) == 2 and segments[0] == "apps":
+        app_id = segments[1]
+    else:
+        return None
+
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", app_id):
+        return None
+
+    return app_id
+
+
 def _parse_flatpakref_url(path: Path):
     """
     Parses a .flatpakref file and returns the Url= value if present.
@@ -1969,14 +2008,23 @@ def install_flatpak_source(
     if not value:
         return False, "No Flatpak source provided."
 
+    flathub_app_id = extract_flathub_app_id(value)
+
     if source_type == "id":
         return install_flatpak_app_id(
-            value,
+            flathub_app_id or value,
             user_install,
             output_callback,
         )
 
     if source_type == "ref":
+        if flathub_app_id:
+            return install_flatpak_app_id(
+                flathub_app_id,
+                user_install,
+                output_callback,
+            )
+
         if value.startswith("http://") or value.startswith("https://"):
             return _install_flatpak_location(
                 value,

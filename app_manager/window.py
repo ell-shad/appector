@@ -26,6 +26,7 @@ from .actions import (
     install_flatpak_source,
     install_deb_batch,
     install_flatpak_ref_batch,
+    extract_flathub_app_id,
     purge_leftover_configs,
     get_apt_autoremove_preview,
     execute_apt_autoremove,
@@ -751,7 +752,7 @@ class MainWindow(Adw.ApplicationWindow):
         content.set_margin_end(12)
 
         # Mode selection
-        dialog.mode_id_button = Gtk.CheckButton(label="Flathub app ID")
+        dialog.mode_id_button = Gtk.CheckButton(label="Flathub app ID or URL")
         dialog.mode_ref_button = Gtk.CheckButton(label=".flatpakref file or URL")
 
         dialog.mode_ref_button.set_group(dialog.mode_id_button)
@@ -759,7 +760,9 @@ class MainWindow(Adw.ApplicationWindow):
 
         # App ID entry
         dialog.id_entry = Gtk.Entry()
-        dialog.id_entry.set_placeholder_text("org.gimp.GIMP")
+        dialog.id_entry.set_placeholder_text(
+            "org.gimp.GIMP or https://flathub.org/en/apps/org.gimp.GIMP"
+        )
         dialog.id_entry.set_hexpand(True)
 
         # Flatpakref entry + browse
@@ -790,14 +793,14 @@ class MainWindow(Adw.ApplicationWindow):
         mode_box.append(dialog.mode_id_button)
         mode_box.append(dialog.mode_ref_button)
 
-        id_label = Gtk.Label(label="Flatpak app ID:")
+        id_label = Gtk.Label(label="Flatpak app ID or Flathub app page URL:")
         id_label.set_xalign(0.0)
 
         dialog.id_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         dialog.id_box.append(id_label)
         dialog.id_box.append(dialog.id_entry)
 
-        ref_label = Gtk.Label(label=".flatpakref file or URL:")
+        ref_label = Gtk.Label(label=".flatpakref file, URL, or Flathub app page URL:")
         ref_label.set_xalign(0.0)
 
         ref_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -874,7 +877,8 @@ class MainWindow(Adw.ApplicationWindow):
             dialog.delete_source_check.set_visible(not mode_id)
 
         if mode_id:
-            app_id = dialog.id_entry.get_text().strip()
+            value = dialog.id_entry.get_text().strip()
+            app_id = extract_flathub_app_id(value) or value
 
             try:
                 flathub_exists = flathub_remote_exists(user_install)
@@ -895,6 +899,12 @@ class MainWindow(Adw.ApplicationWindow):
                 install_enabled = False
                 add_enabled = True
 
+            if extract_flathub_app_id(value):
+                status = (
+                    f"Flathub app page detected: {app_id}.\n"
+                    f"{status}"
+                )
+
             if hasattr(dialog, "delete_source_check"):
                 dialog.delete_source_check.set_sensitive(False)
                 dialog.delete_source_check.set_active(False)
@@ -914,17 +924,40 @@ class MainWindow(Adw.ApplicationWindow):
                 if hasattr(dialog, "delete_source_check"):
                     dialog.delete_source_check.set_sensitive(True)
             else:
-                install_enabled = bool(value)
-                add_enabled = False
-                status = "Enter or browse for a .flatpakref file or URL."
+                flathub_app_id = extract_flathub_app_id(value)
+
+                if flathub_app_id:
+                    try:
+                        flathub_exists = flathub_remote_exists(user_install)
+                    except Exception:
+                        flathub_exists = False
+
+                    scope_name = "user" if user_install else "system"
+                    status = f"Flathub app page detected: {flathub_app_id}."
+                    if flathub_exists:
+                        status += f"\nFlathub remote is available in {scope_name} scope."
+                        install_enabled = True
+                    else:
+                        status += (
+                            f"\nFlathub remote is not available in {scope_name} scope.\n"
+                            "Click Add Flathub to add it."
+                        )
+                        add_enabled = True
+                else:
+                    install_enabled = bool(value)
+                    add_enabled = False
+                    status = "Enter or browse for a .flatpakref file or URL."
 
                 if hasattr(dialog, "delete_source_check"):
-                    is_url = value.startswith("http://") or value.startswith("https://")
+                    is_url = (
+                        value.startswith("http://")
+                        or value.startswith("https://")
+                    )
                     is_local_file = bool(value) and not is_url
 
                     dialog.delete_source_check.set_sensitive(is_local_file)
 
-                    if not is_local_file:
+                    if not is_local_file or flathub_app_id:
                         dialog.delete_source_check.set_active(False)
 
         dialog.status_label.set_label(status)
@@ -989,6 +1022,7 @@ class MainWindow(Adw.ApplicationWindow):
             if not value:
                 return
 
+            flathub_app_id = extract_flathub_app_id(value)
             is_url = value.startswith("http://") or value.startswith("https://")
 
             delete_source = (
@@ -1001,7 +1035,7 @@ class MainWindow(Adw.ApplicationWindow):
             dialog.close()
 
             self.start_flatpak_install(
-                "ref",
+                "id" if flathub_app_id else "ref",
                 value,
                 user_install,
                 delete_source,
