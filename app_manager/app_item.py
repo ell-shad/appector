@@ -22,6 +22,7 @@ class AppItem(GObject.Object):
     is_gui_app = GObject.Property(type=bool, default=True)
     exec_name = GObject.Property(type=str, default="")
     is_duplicate = GObject.Property(type=bool, default=False)
+    removal_paths = GObject.Property(type=str, default="")
 
     def __init__(self, app: AppEntry):
         super().__init__()
@@ -42,3 +43,4 @@ class AppItem(GObject.Object):
         self.is_gui_app = getattr(app, "is_gui_app", True)
         self.exec_name = getattr(app, "exec_name", "") or ""
         self.is_duplicate = getattr(app, "is_duplicate", False)
+        self.removal_paths = "\n".join(getattr(app, "removal_paths", []) or [])

@@ -1,6 +1,6 @@
 import re
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 
 @dataclass
@@ -17,6 +17,7 @@ class AppEntry:
     icon: str = ""
     exec_name: str = ""
     is_duplicate: bool = False
+    removal_paths: List[str] = field(default_factory=list)
 
 
 def mark_duplicate_apps(apps):

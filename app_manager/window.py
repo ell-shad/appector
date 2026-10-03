@@ -2256,16 +2256,16 @@ class MainWindow(Adw.ApplicationWindow):
         thread.start()
 
     def flatpak_cleanup_preview_worker(self):
-        success, runtimes, raw_output = get_flatpak_unused_preview()
+        success, preview_text, raw_output = get_flatpak_unused_preview()
 
         GLib.idle_add(
             self.on_flatpak_cleanup_preview_finished,
             success,
-            runtimes,
+            preview_text,
             raw_output,
         )
 
-    def on_flatpak_cleanup_preview_finished(self, success, runtimes, raw_output):
+    def on_flatpak_cleanup_preview_finished(self, success, preview_text, raw_output):
         if self.progress_window:
             self.progress_window.close_window()
             self.progress_window = None
@@ -2278,32 +2278,15 @@ class MainWindow(Adw.ApplicationWindow):
             )
             return False
 
-        if not runtimes:
+        if not preview_text:
             self.show_message(
-                "No Flatpak runtimes found",
-                "No Flatpak runtimes were found on this system.",
+                "No unused runtimes",
+                "No unused Flatpak runtimes were found.",
                 Gtk.MessageType.INFO,
             )
             return False
 
-        # Build confirmation dialog
-        lines = []
-        lines.append(
-            "The following action will remove unused Flatpak runtimes.\n"
-            "Runtimes that are still needed by installed apps will NOT be removed."
-        )
-        lines.append("")
-        lines.append(f"Total Flatpak runtimes currently installed: {len(runtimes)}")
-        lines.append("")
-        lines.append("Installed runtimes:")
-
-        for rt in runtimes[:20]:
-            lines.append(f"• {rt}")
-
-        if len(runtimes) > 20:
-            lines.append(f"• …and {len(runtimes) - 20} more")
-
-        message = "\n".join(lines)
+        message = "Flatpak identified these unused runtimes for removal:\n\n" + preview_text
 
         title = "Remove unused Flatpak runtimes?"
         

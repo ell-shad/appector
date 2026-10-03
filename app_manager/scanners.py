@@ -945,6 +945,7 @@ def scan_manual_apps(
                         details=str(desktop_path),
                         icon=icon,
                         exec_name=exec_name,
+                        removal_paths=[str(desktop_path)],
                     )
                 )
         except OSError:
@@ -986,10 +987,17 @@ def scan_manual_apps(
         except OSError:
             continue
 
-    for path in executable_candidates:
-        if path.suffix.lower() == ".appimage" or not os.access(path, os.X_OK):
-            continue
+    executable_candidates = [
+        path
+        for path in executable_candidates
+        if (
+            path.suffix.lower() != ".appimage"
+            and os.access(path, os.X_OK)
+            and not get_package_owner(str(path))
+        )
+    ]
 
+    for path in executable_candidates:
         try:
             resolved_path = path.resolve()
         except (OSError, RuntimeError):
@@ -1020,7 +1028,19 @@ def scan_manual_apps(
                 is_gui_app=True,
                 details=str(path),
                 exec_name=exec_name,
+                removal_paths=[str(path)],
             )
+        )
+
+    executables_by_name = {}
+    for path in executable_candidates:
+        executables_by_name.setdefault(path.name.lower(), []).append(str(path))
+
+    for app in apps:
+        if app.source != "Manual installation":
+            continue
+        app.removal_paths.extend(
+            executables_by_name.get(app.exec_name.lower(), [])
         )
 
     return apps

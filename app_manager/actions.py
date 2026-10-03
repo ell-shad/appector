@@ -23,6 +23,7 @@ BATCH_REMOVABLE_MANAGERS = {
     "Snap",
     "Flatpak",
     "AppImage",
+    "Manual",
     "APT",
 }
 
@@ -30,6 +31,7 @@ SINGLE_REMOVABLE_MANAGERS = {
     "Snap",
     "Flatpak",
     "AppImage",
+    "Manual",
     "APT",
 }
 
@@ -388,6 +390,9 @@ def get_removal_risk(app):
     if manager == "AppImage":
         return "low", "Removes a standalone AppImage file."
 
+    if manager == "Manual":
+        return "normal", "Removes the detected launcher and executable files only; app data is kept."
+
     if manager == "Flatpak":
         return "low", "Removes a Flatpak application."
 
@@ -438,6 +443,12 @@ def get_removal_preview(app) -> str:
 
     if manager == "AppImage":
         return f"rm \"{package_id}\""
+
+    if manager == "Manual":
+        paths = _manual_removal_paths(app)
+        if not paths:
+            return "No safe launcher or executable files were detected."
+        return "Remove these files only:\n" + "\n".join(paths)
 
     return "Removal preview not available"
 
@@ -817,9 +828,92 @@ def execute_removal(app):
             _log_action(f"REMOVE_FAILED {key} manager=AppImage error={message}")
             return False, message
 
+    if manager == "Manual":
+        paths = _manual_removal_paths(app)
+        if not paths:
+            message = "No safe launcher or executable files were detected."
+            _log_action(f"REMOVE_FAILED {key} manager=Manual reason=no-safe-paths")
+            return False, message
+
+        allowed_roots = [
+            Path.home() / ".local/share/applications",
+            Path("/usr/local/share/applications"),
+            Path.home() / ".local/bin",
+            Path.home() / ".opencode/bin",
+            Path.home() / "bin",
+            Path.home() / "Applications",
+            Path("/usr/local/bin"),
+            Path("/opt"),
+        ]
+        validated_paths = []
+        for value in paths:
+            path = Path(os.path.abspath(Path(value).expanduser()))
+            if not path.is_absolute() or not path.is_file():
+                message = f"Manual app file no longer exists or is not a regular file: {value}"
+                _log_action(f"REMOVE_FAILED {key} manager=Manual reason=invalid-path path={value}")
+                return False, message
+            if not any(path.is_relative_to(root) for root in allowed_roots):
+                message = f"Refusing to remove a file outside known manual-install locations: {value}"
+                _log_action(f"REMOVE_BLOCKED {key} manager=Manual reason=outside-allowed-path")
+                return False, message
+            validated_paths.append(str(path))
+
+        requires_privilege = any(
+            not os.access(str(Path(path).parent), os.W_OK)
+            for path in validated_paths
+        )
+        if requires_privilege:
+            pkexec_command = shutil.which("pkexec")
+            rm_command = shutil.which("rm")
+            if not pkexec_command or not rm_command:
+                message = "Removing this system-wide manual app requires pkexec and rm."
+                _log_action(f"REMOVE_FAILED {key} manager=Manual reason=privilege-unavailable")
+                return False, message
+            cmd = [pkexec_command, rm_command, "--"] + validated_paths
+            success, message = _run_command_stream(cmd)
+            if not success:
+                _log_action(f"REMOVE_FAILED {key} manager=Manual error={message}")
+                return False, message
+        else:
+            removed = []
+            failures = []
+            for value in validated_paths:
+                try:
+                    Path(value).unlink()
+                    removed.append(value)
+                except OSError as error:
+                    failures.append(f"{value}: {error}")
+
+            if failures:
+                message = "Some manual app files could not be removed:\n" + "\n".join(failures)
+                if removed:
+                    message += "\n\nRemoved:\n" + "\n".join(removed)
+                _log_action(f"REMOVE_FAILED {key} manager=Manual error={message}")
+                return False, message
+
+        message = "Removed manual app files:\n" + "\n".join(validated_paths)
+        _log_action(f"REMOVE_SUCCESS {key} manager=Manual")
+        return True, message
+
     message = "Use batch removal for this package type."
     _log_action(f"REMOVE_SKIPPED {key} manager={manager} reason=use-batch")
     return False, message
+
+
+def _manual_removal_paths(app):
+    raw_paths = getattr(app, "removal_paths", None)
+    if isinstance(raw_paths, str):
+        paths = raw_paths.splitlines()
+    elif raw_paths:
+        paths = list(raw_paths)
+    else:
+        paths = [getattr(app, "package_id", "")]
+
+    return list(dict.fromkeys(
+        str(Path(path).expanduser())
+        for path in paths
+        if str(path or "").strip()
+    ))
 
 
 # ------------------------------------------------------------
@@ -1300,6 +1394,7 @@ def execute_batch_removal(apps, progress_callback=None, purge=False):
 
     results_by_key = {}
 
+    manual_apps = []
     appimages = []
     snaps = []
     user_flatpaks = []
@@ -1309,7 +1404,9 @@ def execute_batch_removal(apps, progress_callback=None, purge=False):
     for app in apps:
         manager = getattr(app, "manager", "")
 
-        if manager == "AppImage":
+        if manager == "Manual":
+            manual_apps.append(app)
+        elif manager == "AppImage":
             appimages.append(app)
         elif manager == "Snap":
             snaps.append(app)
@@ -1323,7 +1420,8 @@ def execute_batch_removal(apps, progress_callback=None, purge=False):
             apts.append(app)
 
     total_steps = (
-        len(appimages)
+        len(manual_apps)
+        + len(appimages)
         + (1 if user_flatpaks else 0)
         + (1 if apts else 0)
         + (1 if (snaps or system_flatpaks or apts) else 0)
@@ -1338,6 +1436,12 @@ def execute_batch_removal(apps, progress_callback=None, purge=False):
 
         if progress_callback:
             progress_callback(current_step, total_steps, message)
+
+    for app in manual_apps:
+        name = getattr(app, "name", "Manual app")
+        report(f"Removing {name}…")
+        success, message = execute_removal(app)
+        results_by_key[app_key(app)] = (success, message)
 
     # ------------------------------------------------------------
     # AppImage removals
@@ -2441,46 +2545,33 @@ def get_apt_autoremove_preview():
         space_freed: str
         raw_output: str
     """
-    import re
-    import subprocess
-
     cmd = ["apt-get", "--simulate", "autoremove"]
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
 
     try:
         result = subprocess.run(
             cmd,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=60,
+            env=env,
         )
 
         output = result.stdout + "\n" + result.stderr
+        if result.returncode != 0:
+            return False, [], "", output.strip() or (
+                f"APT autoremove simulation failed with exit code {result.returncode}."
+            )
 
-        # Parse packages to be removed
         packages = []
-        in_removal_section = False
-
         for line in output.splitlines():
-            if "The following packages will be REMOVED" in line:
-                in_removal_section = True
-                continue
-
-            if in_removal_section:
-                stripped = line.strip()
-
-                # End of section: empty line or next section header
-                if not stripped or stripped.startswith("The following") or stripped.startswith("0 upgraded"):
-                    break
-
-                # Package names are space-separated, possibly with trailing commas
-                parts = stripped.split()
-                for part in parts:
-                    pkg = part.strip().rstrip(",")
-                    if pkg and re.match(r"^[a-zA-Z0-9]", pkg):
-                        # Remove architecture suffix if present (e.g., :amd64)
-                        pkg = pkg.split(":")[0]
-                        if pkg not in packages:
-                            packages.append(pkg)
+            match = re.match(r"^\s*Remv\s+([^\s]+)", line)
+            if match:
+                package = match.group(1).split(":", 1)[0]
+                if package not in packages:
+                    packages.append(package)
 
         # Parse disk space freed
         space_freed = ""
@@ -2494,6 +2585,8 @@ def get_apt_autoremove_preview():
 
     except subprocess.TimeoutExpired:
         return False, [], "", "Command timed out."
+    except OSError as e:
+        return False, [], "", f"Could not run APT autoremove simulation: {e}"
     except Exception as e:
         return False, [], "", str(e)
 
@@ -2507,11 +2600,6 @@ def execute_apt_autoremove(output_callback=None):
         success: bool
         message: str
     """
-    import re
-    import shutil
-    import subprocess
-    import threading
-
     apt_get_command = shutil.which("apt-get") or "/usr/bin/apt-get"
     pkexec_command = shutil.which("pkexec")
 
@@ -2520,58 +2608,18 @@ def execute_apt_autoremove(output_callback=None):
     if pkexec_command:
         cmd = [pkexec_command] + cmd
 
-    try:
-        _log_action(f"APT_AUTOREMOVE_START cmd={' '.join(cmd)}")
-    except Exception:
-        pass
+    _log_action(f"APT_AUTOREMOVE_START cmd={shlex.join(cmd)}")
+    success, message = _run_command_stream(
+        cmd,
+        output_callback=output_callback,
+        timeout=900,
+    )
+    if success:
+        _log_action("APT_AUTOREMOVE_SUCCESS")
+        return True, message
 
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-
-        timer = threading.Timer(900, process.kill)
-        timer.start()
-
-        lines = []
-
-        if process.stdout:
-            for line in process.stdout:
-                if output_callback:
-                    try:
-                        output_callback(line.rstrip())
-                    except Exception:
-                        pass
-                lines.append(line)
-
-        process.wait()
-        timer.cancel()
-
-        returncode = process.returncode
-        output = "".join(lines).strip()
-
-        if returncode == 0:
-            try:
-                _log_action("APT_AUTOREMOVE_SUCCESS")
-            except Exception:
-                pass
-            return True, output if output else "Autoremove completed successfully."
-
-        try:
-            _log_action(f"APT_AUTOREMOVE_FAILED error={output}")
-        except Exception:
-            pass
-
-        return False, output if output else f"Autoremove failed with exit code {returncode}."
-
-    except Exception as e:
-        return False, str(e)
+    _log_action(f"APT_AUTOREMOVE_FAILED error={message}")
+    return False, message
 
 
 # ------------------------------------------------------------
@@ -2580,47 +2628,85 @@ def execute_apt_autoremove(output_callback=None):
 
 def get_flatpak_unused_preview():
     """
-    Attempts to detect unused Flatpak runtimes.
+    Asks Flatpak for its unused-removal plan and declines the confirmation.
 
     Returns:
         success: bool
-        runtimes: list[str]
+        preview_text: str
         raw_output: str
     """
-    import subprocess
+    flatpak_command = shutil.which("flatpak")
+    if not flatpak_command:
+        return False, "", "flatpak command not found."
 
-    # flatpak doesn't have a direct "list unused" command,
-    # but we can check what uninstall --unused would do
-    # by running a dry-run style check.
-    # Unfortunately flatpak doesn't support --dry-run well,
-    # so we'll list all runtimes and let the user confirm.
+    outputs = []
+    previews = []
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
 
-    cmd = ["flatpak", "list", "--runtime", "--columns=application,version"]
+    for scope in ("--user", "--system"):
+        cmd = [
+            flatpak_command,
+            "uninstall",
+            scope,
+            "--unused",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                input="n\n",
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "", f"Flatpak unused-runtime check timed out ({scope})."
+        except OSError as error:
+            return False, "", f"Could not check unused Flatpak runtimes ({scope}): {error}"
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
+        output = "\n".join(
+            part.strip()
+            for part in (result.stdout, result.stderr)
+            if part.strip()
         )
+        outputs.append(f"[{scope.removeprefix('--')}]\n{output}".rstrip())
 
-        output = result.stdout.strip()
-        runtimes = []
+        if result.returncode == 0 and "Nothing unused to uninstall" in output:
+            continue
 
-        for line in output.splitlines():
-            line = line.strip()
-            if line:
-                parts = line.split("\t")
-                if parts:
-                    runtimes.append(parts[0])
+        if result.returncode != 0:
+            declined_prompt = (
+                not result.stderr.strip()
+                and (
+                    "[Y/n]" in output
+                    or "[y/N]" in output
+                    or "Proceed with these changes" in output
+                )
+            )
+            if not declined_prompt:
+                error = output or (
+                    f"Flatpak unused-runtime check failed with exit code {result.returncode}."
+                )
+                return False, "", f"{scope}: {error}"
 
-        return True, runtimes, output
+        if output:
+            preview = "\n".join(
+                line
+                for line in output.splitlines()
+                if not any(
+                    prompt in line.lower()
+                    for prompt in (
+                        "proceed with these changes",
+                        "[y/n]",
+                        "[n/y]",
+                    )
+                )
+            ).strip()
+            if preview:
+                previews.append(f"{scope.removeprefix('--').title()} installation:\n{preview}")
 
-    except subprocess.TimeoutExpired:
-        return False, [], "Command timed out."
-    except Exception as e:
-        return False, [], str(e)
+    return True, "\n\n".join(previews), "\n\n".join(outputs)
 
 
 def execute_flatpak_unused_cleanup(output_callback=None):
@@ -2632,66 +2718,32 @@ def execute_flatpak_unused_cleanup(output_callback=None):
         success: bool
         message: str
     """
-    import shutil
-    import subprocess
-    import threading
-
     flatpak_command = shutil.which("flatpak")
 
     if not flatpak_command:
         return False, "flatpak command not found."
 
-    cmd = [flatpak_command, "uninstall", "--unused", "-y"]
-
-    try:
-        _log_action(f"FLATPAK_UNUSED_CLEANUP_START cmd={' '.join(cmd)}")
-    except Exception:
-        pass
-
-    try:
-        process = subprocess.Popen(
+    results = []
+    failures = []
+    for scope in ("--user", "--system"):
+        cmd = [flatpak_command, "uninstall", scope, "--unused", "-y"]
+        _log_action(f"FLATPAK_UNUSED_CLEANUP_START cmd={shlex.join(cmd)}")
+        success, message = _run_command_stream(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
+            output_callback=output_callback,
+            timeout=900,
         )
+        scope_name = scope.removeprefix("--")
+        results.append(f"{scope_name}: {message}")
+        if not success:
+            failures.append(scope_name)
 
-        timer = threading.Timer(900, process.kill)
-        timer.start()
+    combined = "\n\n".join(results)
+    if failures:
+        _log_action(
+            f"FLATPAK_UNUSED_CLEANUP_FAILED scopes={','.join(failures)}"
+        )
+        return False, f"Cleanup failed for: {', '.join(failures)}.\n\n{combined}"
 
-        lines = []
-
-        if process.stdout:
-            for line in process.stdout:
-                if output_callback:
-                    try:
-                        output_callback(line.rstrip())
-                    except Exception:
-                        pass
-                lines.append(line)
-
-        process.wait()
-        timer.cancel()
-
-        returncode = process.returncode
-        output = "".join(lines).strip()
-
-        if returncode == 0:
-            try:
-                _log_action("FLATPAK_UNUSED_CLEANUP_SUCCESS")
-            except Exception:
-                pass
-            return True, output if output else "Flatpak unused cleanup completed successfully."
-
-        try:
-            _log_action(f"FLATPAK_UNUSED_CLEANUP_FAILED error={output}")
-        except Exception:
-            pass
-
-        return False, output if output else f"Cleanup failed with exit code {returncode}."
-
-    except Exception as e:
-        return False, str(e)
+    _log_action("FLATPAK_UNUSED_CLEANUP_SUCCESS")
+    return True, combined
