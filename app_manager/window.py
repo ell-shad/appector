@@ -21,6 +21,7 @@ from .progress import ProgressWindow, InstallProgressWindow
 from .actions import (
     app_key,
     can_remove,
+    is_blocked,
     execute_batch_removal,
     prepare_apt_batch_preview,
     add_flathub_remote,
@@ -124,17 +125,24 @@ class MainWindow(Adw.ApplicationWindow):
         primary_menu_model = Gio.Menu()
 
         maintenance_section = Gio.Menu()
-        maintenance_section.append("Clean orphaned APT packages", "win.clean-orphans")
         maintenance_section.append(
-            "Clean leftover APT configurations",
+            "Remove unused APT dependencies…",
+            "win.clean-orphans",
+        )
+        maintenance_section.append(
+            "Purge leftover APT configurations…",
             "win.clean-leftover-configs",
         )
-        maintenance_section.append("Clean unused Flatpak runtimes", "win.clean-runtimes")
+        maintenance_section.append(
+            "Remove unused Flatpak runtimes…",
+            "win.clean-runtimes",
+        )
         primary_menu_model.append_section("Maintenance", maintenance_section)
 
         misc_section = Gio.Menu()
         misc_section.append("Check for available updates", "win.check-updates")
-        misc_section.append("Export installed app list…", "win.export-app-list")
+        misc_section.append("Export installed app list as CSV…", "win.export-app-list")
+        misc_section.append("Export installed app list as JSON…", "win.export-app-list-json")
         misc_section.append("Activity Log", "win.show-log")
         misc_section.append("Keyboard Shortcuts", "win.shortcuts")
         misc_section.append("About App Manager", "win.about")
@@ -175,17 +183,16 @@ class MainWindow(Adw.ApplicationWindow):
 
         marked_column = self.create_check_column()
         name_column = self.create_name_column()
-        source_column = self.create_column("Source", "source", expand=False, min_width=180, fixed_width=220)
-        installed_column = self.create_column("Installed", "installed_at", expand=False, min_width=130, fixed_width=150)
+        source_column = self.create_column("Origin", "source", expand=False, min_width=160, fixed_width=200)
         manager_column = self.create_manager_column()
         version_column = self.create_column("Version", "version", expand=False, min_width=120, fixed_width=160)
 
-        for column in [marked_column, name_column, source_column, installed_column, manager_column, version_column]:
+        for column in [marked_column, name_column, source_column, manager_column, version_column]:
             self.column_view.append_column(column)
             
         self.column_widgets = {
             "marked": marked_column, "name": name_column, "source": source_column,
-            "installed": installed_column, "manager": manager_column, "version": version_column,
+            "manager": manager_column, "version": version_column,
         }
 
         self.restore_ui_state()
@@ -236,6 +243,22 @@ class MainWindow(Adw.ApplicationWindow):
         self.action_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_UP)
         self.action_revealer.set_reveal_child(False)
 
+        self.remove_action_bar = Gtk.ActionBar()
+        self.remove_marked_summary = Gtk.Label(label="0 marked")
+        self.remove_marked_summary.add_css_class("dim-label")
+        self.remove_marked_button = Gtk.Button(label="Remove marked…")
+        self.remove_marked_button.add_css_class("destructive-action")
+        self.remove_marked_button.set_action_name("win.remove-marked")
+        self.remove_action_bar.pack_start(self.remove_marked_summary)
+        self.remove_action_bar.pack_end(self.remove_marked_button)
+
+        self.remove_action_revealer = Gtk.Revealer()
+        self.remove_action_revealer.set_child(self.remove_action_bar)
+        self.remove_action_revealer.set_transition_type(
+            Gtk.RevealerTransitionType.SLIDE_UP
+        )
+        self.remove_action_revealer.set_reveal_child(False)
+
         # Main Stack for Empty States
         self.main_stack = Gtk.Stack()
         self.main_stack.set_hexpand(True)
@@ -263,6 +286,7 @@ class MainWindow(Adw.ApplicationWindow):
         main_box.set_vexpand(True)
         main_box.append(self.main_stack)
         main_box.append(self.action_revealer)
+        main_box.append(self.remove_action_revealer)
 
         content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         content.set_hexpand(True)
@@ -703,17 +727,26 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def on_export_app_list_clicked(self, button=None):
+        self._show_export_app_list_dialog("csv")
+
+    def on_export_app_list_json_clicked(self, button=None):
+        self._show_export_app_list_dialog("json")
+
+    def _show_export_app_list_dialog(self, file_format):
+        initial_name = f"installed-apps.{file_format}"
         if hasattr(Gtk, "FileDialog"):
             file_dialog = Gtk.FileDialog.new()
-            file_dialog.set_title("Export installed app list")
-            file_dialog.set_initial_name("installed-apps.csv")
+            file_dialog.set_title(
+                f"Export installed app list as {file_format.upper()}"
+            )
+            file_dialog.set_initial_name(initial_name)
 
             def on_saved(dialog, result):
                 try:
                     file = dialog.save_finish(result)
                     path = file.get_path() if file else None
                     if path:
-                        self._export_installed_apps(path)
+                        self._export_installed_apps(path, file_format)
                 except Exception as error:
                     self.show_message(
                         "Export failed",
@@ -725,25 +758,29 @@ class MainWindow(Adw.ApplicationWindow):
             return
 
         chooser = Gtk.FileChooserNative.new(
-            "Export installed app list",
+            f"Export installed app list as {file_format.upper()}",
             self,
             Gtk.FileChooserAction.SAVE,
             "Export",
             "Cancel",
         )
-        chooser.set_current_name("installed-apps.csv")
-        chooser.connect("response", self.on_export_app_list_chooser_response)
+        chooser.set_current_name(initial_name)
+        chooser.connect(
+            "response",
+            self.on_export_app_list_chooser_response,
+            file_format,
+        )
         chooser.show()
 
-    def on_export_app_list_chooser_response(self, chooser, response):
+    def on_export_app_list_chooser_response(self, chooser, response, file_format):
         if response == Gtk.ResponseType.ACCEPT:
             file = chooser.get_file()
             path = file.get_path() if file else None
             if path:
-                self._export_installed_apps(path)
+                self._export_installed_apps(path, file_format)
         chooser.destroy()
 
-    def _export_installed_apps(self, path):
+    def _export_installed_apps(self, path, file_format="csv"):
         fields = (
             "name",
             "manager",
@@ -753,15 +790,27 @@ class MainWindow(Adw.ApplicationWindow):
             "installed_at",
             "category",
         )
+        rows = [
+            {
+                field: getattr(app, field, "") or ""
+                for field in fields
+            }
+            for app in self.current_apps
+        ]
         try:
-            with open(path, "w", encoding="utf-8", newline="") as output:
-                writer = csv.DictWriter(output, fieldnames=fields)
-                writer.writeheader()
-                for app in self.current_apps:
-                    writer.writerow({
-                        field: getattr(app, field, "") or ""
-                        for field in fields
-                    })
+            with open(
+                path,
+                "w",
+                encoding="utf-8",
+                newline="" if file_format == "csv" else None,
+            ) as output:
+                if file_format == "json":
+                    json.dump(rows, output, ensure_ascii=False, indent=2)
+                    output.write("\n")
+                else:
+                    writer = csv.DictWriter(output, fieldnames=fields)
+                    writer.writeheader()
+                    writer.writerows(rows)
         except OSError as error:
             self.show_message(
                 "Export failed",
@@ -772,7 +821,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.show_message(
             "Export complete",
-            f"Exported {len(self.current_apps)} installed app(s) to:\n{path}",
+            f"Exported {len(self.current_apps)} installed app(s) as "
+            f"{file_format.upper()} to:\n{path}",
             Gtk.MessageType.INFO,
         )
 
@@ -852,8 +902,9 @@ class MainWindow(Adw.ApplicationWindow):
         )
         if delete_source:
             warning += (
-                "\n\nThe selected source files will be deleted after successful "
-                "installation; the managed copies will remain."
+                "\n\nAfter successful installation, selected source files will be "
+                "moved to Trash (not permanently deleted); the managed AppImage "
+                "copies will remain."
             )
         self._show_confirm_dialog(
             "Review AppImage installation",
@@ -898,8 +949,9 @@ class MainWindow(Adw.ApplicationWindow):
                     results.append(f"DEB packages installed:\n{installed_names}")
                     cleanup_lines = [
                         line for line in message.splitlines()
-                        if "Deleted installation files:" in line
-                        or "Could not delete installation file" in line
+                        if "Moved installation files to Trash:" in line
+                        or "Source files kept because they could not be moved to Trash:" in line
+                        or "Could not move installation file to Trash" in line
                     ]
                     if cleanup_lines:
                         results.append("\n".join(cleanup_lines))
@@ -1033,7 +1085,11 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.user_check = Gtk.CheckButton(label="Install for current user only")
         dialog.user_check.set_active(True)
         dialog.delete_source_check = Gtk.CheckButton(
-            label="Delete selected source files after successful installation"
+            label="Move selected source files to Trash after successful installation"
+        )
+        dialog.delete_source_check.set_tooltip_text(
+            "Files are moved to your desktop Trash only after a successful install. "
+            "Failed installs leave their source files untouched."
         )
         dialog.delete_source_check.set_sensitive(False)        
         dialog.flatpakref_paths = []
@@ -2064,6 +2120,7 @@ class MainWindow(Adw.ApplicationWindow):
         add_window_action("clean-runtimes", "on_flatpak_cleanup_clicked")
         add_window_action("check-updates", "on_check_updates_clicked")
         add_window_action("export-app-list", "on_export_app_list_clicked")
+        add_window_action("export-app-list-json", "on_export_app_list_json_clicked")
 
         add_window_action("show-log", "on_show_log_clicked")
         add_window_action("refresh", "on_reload_clicked")
@@ -2368,11 +2425,21 @@ class MainWindow(Adw.ApplicationWindow):
         self.duplicates_only_toggle.connect("toggled", self.on_duplicates_only_toggled)
         filter_box.append(self.duplicates_only_toggle)
         
-        self.show_advanced_apps_toggle = Gtk.ToggleButton(label="Show advanced apps")
+        self.show_advanced_apps_toggle = Gtk.ToggleButton(
+            label="Show system items"
+        )
+        self.show_advanced_apps_toggle.set_tooltip_text(
+            "Include runtimes, components, and non-GUI packages"
+        )
         self.show_advanced_apps_toggle.connect("toggled", self.on_show_advanced_apps_toggled)
         filter_box.append(self.show_advanced_apps_toggle)
         
-        self.hide_basic_apps_toggle = Gtk.ToggleButton(label="Hide normal apps")
+        self.hide_basic_apps_toggle = Gtk.ToggleButton(
+            label="System items only"
+        )
+        self.hide_basic_apps_toggle.set_tooltip_text(
+            "Hide normal applications and show advanced system items only"
+        )
         self.hide_basic_apps_toggle.connect("toggled", self.on_hide_basic_apps_toggled)
         filter_box.append(self.hide_basic_apps_toggle)
         
@@ -2388,8 +2455,11 @@ class MainWindow(Adw.ApplicationWindow):
         selection_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         selection_btns.set_homogeneous(True)
         
-        self.mark_all_button = Gtk.Button(label="Mark all")
+        self.mark_all_button = Gtk.Button(label="Mark all visible")
         self.mark_all_button.set_action_name("win.mark-all")
+        self.mark_all_button.set_tooltip_text(
+            "Mark only visible apps that are allowed to be removed"
+        )
         selection_btns.append(self.mark_all_button)
         
         self.clear_all_marks_button = Gtk.Button(label="Clear marks")
@@ -2401,31 +2471,6 @@ class MainWindow(Adw.ApplicationWindow):
         
         scrolled.set_child(content_box)
         sidebar_box.append(scrolled)
-        
-        # 5. Pinned footer
-        footer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        footer_box.set_margin_top(12)
-        footer_box.set_margin_bottom(12)
-        footer_box.set_margin_start(12)
-        footer_box.set_margin_end(12)
-        
-        footer_box.append(Gtk.Separator())
-        
-        self.remove_marked_button = Gtk.Button()
-        self.remove_marked_button.add_css_class("destructive-action")
-        self.remove_marked_button.set_hexpand(True)
-        self.remove_marked_button.set_action_name("win.remove-marked")
-        
-        remove_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        remove_box.set_halign(Gtk.Align.CENTER)
-        remove_icon = Gtk.Image.new_from_icon_name("user-trash-symbolic")
-        self.remove_marked_label = Gtk.Label(label="Remove (0)")
-        remove_box.append(remove_icon)
-        remove_box.append(self.remove_marked_label)
-        self.remove_marked_button.set_child(remove_box)
-        
-        footer_box.append(self.remove_marked_button)
-        sidebar_box.append(footer_box)
         
         revealer = Gtk.Revealer()
         revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
@@ -2518,7 +2563,11 @@ class MainWindow(Adw.ApplicationWindow):
         size_estimate = get_removal_size_estimate(leftovers)
         lines = [
             "These packages are already removed. Only their configuration files remain.",
-            "Purging permanently deletes those configuration files; it does not uninstall "
+            "Before purging, App Manager makes a private backup of dpkg-registered "
+            "configuration files in ~/.local/state/app-manager/purge-backups. If any "
+            "file cannot be safely backed up, the purge will not run. Backups are kept "
+            "until you remove them; this is a recovery copy, not an automatic restore.",
+            "Purging removes the original configuration files; it does not uninstall "
             "any installed package.",
             "",
             "This is different from orphaned packages (installed APT dependencies) and "
@@ -2844,7 +2893,7 @@ class MainWindow(Adw.ApplicationWindow):
         factory.connect("setup", self.on_setup_manager_cell)
         factory.connect("bind", self.on_bind_manager_cell)
 
-        column = Gtk.ColumnViewColumn.new("Manager", factory)
+        column = Gtk.ColumnViewColumn.new("Type", factory)
         expression = Gtk.PropertyExpression.new(AppItem, None, "manager")
         sorter = Gtk.StringSorter.new(expression)
 
@@ -2986,6 +3035,13 @@ class MainWindow(Adw.ApplicationWindow):
                 pass
 
         check.set_active(bool(getattr(item, "marked", False)))
+        blocked = is_blocked(item)
+        check.set_sensitive(not blocked)
+        check.set_tooltip_text(
+            "This package is protected from removal."
+            if blocked
+            else f"Mark {getattr(item, 'name', 'app')} for removal"
+        )
 
         handler_id = check.connect("toggled", self.on_check_toggled, item)
         check._app_manager_handler_id = handler_id
@@ -3178,8 +3234,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.install_progress_window.stop_pulse()
 
             if success:
-                self.install_progress_window.close_window()
-                self.install_progress_window = None
+                self.install_progress_window.finish_batch_results(message)
 
                 for key in getattr(self, "_pending_leftover_keys", []):
                     self.marked_keys.discard(key)
@@ -3188,12 +3243,6 @@ class MainWindow(Adw.ApplicationWindow):
                 self._pending_leftover_keys = []
 
                 self.reload()
-
-                self.show_message(
-                    "Purge finished",
-                    "Leftover configuration packages were purged successfully.",
-                    Gtk.MessageType.INFO,
-                )
             else:
                 self.install_progress_window.finish_failure(message)
 
@@ -3231,13 +3280,30 @@ class MainWindow(Adw.ApplicationWindow):
         image = Gtk.Image()
         image.set_pixel_size(16)
 
-        label = Gtk.Label()
-        label.set_xalign(0.0)
-        label.set_halign(Gtk.Align.START)
-        label.set_ellipsize(Pango.EllipsizeMode.END)
+        labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        name_label = Gtk.Label()
+        name_label.set_xalign(0.0)
+        name_label.set_halign(Gtk.Align.START)
+        name_label.set_hexpand(True)
+        name_label.set_ellipsize(Pango.EllipsizeMode.END)
+        package_label = Gtk.Label()
+        package_label.set_xalign(0.0)
+        package_label.set_halign(Gtk.Align.START)
+        package_label.set_hexpand(True)
+        package_label.set_ellipsize(Pango.EllipsizeMode.END)
+        package_label.set_selectable(True)
+        package_label.add_css_class("caption")
+        package_label.add_css_class("dim-label")
+        labels.set_hexpand(True)
 
         box.append(image)
-        box.append(label)
+        labels.append(name_label)
+        labels.append(package_label)
+        box.append(labels)
+        duplicate_label = Gtk.Label(label="Duplicate")
+        duplicate_label.add_css_class("caption")
+        duplicate_label.add_css_class("dim-label")
+        box.append(duplicate_label)
 
         list_item.set_child(box)
 
@@ -3253,13 +3319,26 @@ class MainWindow(Adw.ApplicationWindow):
         if image is None:
             return
 
-        label = image.get_next_sibling()
+        labels = image.get_next_sibling()
 
-        if label is None:
+        if labels is None:
             return
 
-        label.set_label(getattr(item, "name", "") or "-")
-        label.set_tooltip_text(getattr(item, "name", "") or "") # <--- ADD THIS
+        name_label = labels.get_first_child()
+        package_label = name_label.get_next_sibling() if name_label else None
+        if name_label is None or package_label is None:
+            return
+
+        name = getattr(item, "name", "") or "-"
+        package_id = getattr(item, "package_id", "") or ""
+        name_label.set_label(name)
+        name_label.set_tooltip_text(name)
+        package_label.set_label(package_id)
+        package_label.set_tooltip_text(package_id)
+        package_label.set_visible(bool(package_id))
+        duplicate_label = labels.get_next_sibling()
+        if duplicate_label:
+            duplicate_label.set_visible(bool(getattr(item, "is_duplicate", False)))
 
         self.set_image_from_icon(image, getattr(item, "icon", ""))
 
@@ -3630,20 +3709,29 @@ class MainWindow(Adw.ApplicationWindow):
         marked_entries = self.get_marked_entries()
         removable_marked = [app for app in marked_entries if can_remove(app)]
         self.removable_marked_count = len(removable_marked)
-        marked_available = len(self.marked_keys) > 0  # <--- ADD THIS LINE
+        marked_available = len(self.marked_keys) > 0
 
-        if hasattr(self, "remove_marked_label"):
-            self.remove_marked_label.set_label(f"Remove ({self.removable_marked_count})")
-            
+        if hasattr(self, "remove_marked_summary"):
+            count = self.removable_marked_count
+            noun = "app" if count == 1 else "apps"
+            self.remove_marked_summary.set_label(
+                f"{count} removable {noun} marked"
+            )
+
         if hasattr(self, "action_remove_marked"):
             self.action_remove_marked.set_enabled(self.removable_marked_count > 0)
 
 
         if hasattr(self, "remove_marked_button"):
             self.remove_marked_button.set_tooltip_text(
-                f"Remove marked apps ({self.removable_marked_count})"
+                f"Preview removal of {self.removable_marked_count} marked app(s)"
             )
             self.remove_marked_button.set_sensitive(
+                self.removable_marked_count > 0
+            )
+
+        if hasattr(self, "remove_action_revealer"):
+            self.remove_action_revealer.set_reveal_child(
                 self.removable_marked_count > 0
             )
 
@@ -3676,8 +3764,13 @@ class MainWindow(Adw.ApplicationWindow):
         
     def mark_items(self, items):
         changed = False
+        skipped_protected = 0
 
         for item in items:
+            if is_blocked(item):
+                skipped_protected += 1
+                continue
+
             key = app_key(item)
 
             if key and key not in self.marked_keys:
@@ -3687,6 +3780,10 @@ class MainWindow(Adw.ApplicationWindow):
         if changed:
             self.save_marked_keys()
             self.rebuild_list()
+        if skipped_protected:
+            self.show_toast(
+                f"Skipped {skipped_protected} protected package(s)"
+            )
 
     def unmark_items(self, items):
         changed = False
@@ -3750,9 +3847,13 @@ class MainWindow(Adw.ApplicationWindow):
         self.clear_all_marks()
 
     def mark_all_visible(self):
-        visible_items = self.get_visible_items()
+        visible_items = [
+            item for item in self.get_visible_items()
+            if can_remove(item)
+        ]
 
         changed = False
+        marked_count = 0
 
         for item in visible_items:
             key = app_key(item)
@@ -3760,10 +3861,17 @@ class MainWindow(Adw.ApplicationWindow):
             if key and key not in self.marked_keys:
                 self.marked_keys.add(key)
                 changed = True
+                marked_count += 1
 
         if changed:
             self.save_marked_keys()
             self.rebuild_list()
+            noun = "app" if marked_count == 1 else "apps"
+            self.show_toast(
+                f"Marked {marked_count} visible removable {noun}"
+            )
+        else:
+            self.show_toast("No unmarked removable apps are visible")
 
     def clear_all_marks(self):
         if not self.marked_keys:
@@ -4008,8 +4116,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.install_progress_window.stop_pulse()
 
             if success:
-                self.install_progress_window.close_window()
-                self.install_progress_window = None
+                self.install_progress_window.finish_batch_results(message)
 
                 for key in getattr(self, "_pending_leftover_keys", []):
                     self.marked_keys.discard(key)
@@ -4018,12 +4125,6 @@ class MainWindow(Adw.ApplicationWindow):
                 self._pending_leftover_keys = []
 
                 self.reload()
-
-                self.show_message(
-                    "Purge finished",
-                    "Leftover configuration packages were purged successfully.",
-                    Gtk.MessageType.INFO,
-                )
             else:
                 self.install_progress_window.finish_failure(message)
 
@@ -4252,9 +4353,27 @@ class MainWindow(Adw.ApplicationWindow):
         has_apt = any(getattr(app, "manager", "") == "APT" for app in removable)
         if has_apt:
             content_area = dialog.get_content_area()
-            purge_check = Gtk.CheckButton(label="Purge configuration files (APT packages)")
-            purge_check.set_tooltip_text("When enabled, APT packages will be purged instead of removed.")
+            purge_check = Gtk.CheckButton(
+                label="Purge APT configuration files (private backup first)"
+            )
+            purge_check.set_tooltip_text(
+                "App Manager backs up dpkg-registered configuration files before "
+                "purging. If a file cannot be safely backed up, APT removal will "
+                "not run. The backup is retained in your private App Manager state."
+            )
             content_area.append(purge_check)
+            purge_note = Gtk.Label(
+                label=(
+                    "A private copy is kept in "
+                    "~/.local/state/app-manager/purge-backups. If any affected "
+                    "configuration file cannot be safely copied, the purge is "
+                    "cancelled. This backup does not automatically restore files."
+                )
+            )
+            purge_note.set_xalign(0)
+            purge_note.set_wrap(True)
+            purge_note.add_css_class("dim-label")
+            content_area.append(purge_note)
             dialog.purge_check = purge_check
 
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)

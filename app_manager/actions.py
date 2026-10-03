@@ -1,12 +1,15 @@
 import hashlib
+import json
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import threading
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 from urllib.parse import urlsplit
 
 # ------------------------------------------------------------
@@ -891,20 +894,43 @@ def _maybe_delete_source_file(path, delete_source, message):
         return message
 
     source_path = Path(path).expanduser()
+    gio_command = shutil.which("gio")
+    if not gio_command:
+        warning = (
+            "Could not move installation file to Trash because the gio command "
+            "is unavailable; the source file was kept."
+        )
+        _log_action(f"INSTALL_SOURCE_TRASH_FAILED path={source_path} reason=gio-unavailable")
+        return f"{message}\n\n{warning}" if message else warning
 
     try:
-        source_path.unlink()
-    except FileNotFoundError:
-        warning = f"Could not delete installation file; it was not found: {source_path}"
-        _log_action(f"INSTALL_SOURCE_DELETE_FAILED path={source_path} reason=not-found")
-        return f"{message}\n\n{warning}" if message else warning
-    except OSError as error:
-        warning = f"Could not delete installation file {source_path}: {error}"
-        _log_action(f"INSTALL_SOURCE_DELETE_FAILED path={source_path} error={error}")
+        result = subprocess.run(
+            [gio_command, "trash", str(source_path.absolute())],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        warning = (
+            f"Could not move installation file to Trash {source_path}; "
+            f"the source file was kept: {error}"
+        )
+        _log_action(f"INSTALL_SOURCE_TRASH_FAILED path={source_path} error={error}")
         return f"{message}\n\n{warning}" if message else warning
 
-    _log_action(f"INSTALL_SOURCE_DELETE_SUCCESS path={source_path}")
-    notice = "Deleted installation file after successful installation."
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "gio trash failed."
+        warning = (
+            f"Could not move installation file to Trash {source_path}; "
+            f"the source file was kept: {detail}"
+        )
+        _log_action(f"INSTALL_SOURCE_TRASH_FAILED path={source_path} error={detail}")
+        return f"{message}\n\n{warning}" if message else warning
+
+    _log_action(f"INSTALL_SOURCE_TRASH_SUCCESS path={source_path}")
+    notice = "Moved installation file to Trash after successful installation."
     return f"{message}\n\n{notice}" if message else notice
 
 
@@ -1044,8 +1070,8 @@ def install_appimage_batch(paths, output_callback=None, delete_source=False):
             if delete_source:
                 for line in message.splitlines():
                     if (
-                        "Deleted installation file" in line
-                        or "Could not delete installation file" in line
+                        "Moved installation file to Trash" in line
+                        or "Could not move installation file to Trash" in line
                     ):
                         source_file_results.append(f"{name}: {line}")
                         break
@@ -1353,18 +1379,22 @@ def install_deb_batch(paths, output_callback=None, delete_source=False):
 
     if success:
         if delete_source:
-            deleted = []
+            moved = []
+            cleanup_failures = []
 
             for p in deb_paths:
-                try:
-                    p.unlink()
-                    deleted.append(p.name)
-                except Exception:
-                    continue
+                result = _maybe_delete_source_file(p, True, "")
+                if "Moved installation file to Trash" in result:
+                    moved.append(p.name)
+                elif "Could not move installation file to Trash" in result:
+                    cleanup_failures.append(f"{p.name}: {result.splitlines()[-1]}")
 
-            if deleted:
-                message += "\n\nDeleted installation files:\n"
-                message += "\n".join(f"• {name}" for name in deleted)
+            if moved:
+                message += "\n\nMoved installation files to Trash:\n"
+                message += "\n".join(f"• {name}" for name in moved)
+            if cleanup_failures:
+                message += "\n\nSource files kept because they could not be moved to Trash:\n"
+                message += "\n".join(f"• {failure}" for failure in cleanup_failures)
 
         _log_action(f"DEB_BATCH_INSTALL_SUCCESS count={len(deb_paths)}")
     else:
@@ -1427,8 +1457,8 @@ def install_flatpak_ref_batch(
             if delete_source and message:
                 for line in message.splitlines():
                     if (
-                        "Deleted installation file" in line
-                        or "Could not delete installation file" in line
+                        "Moved installation file to Trash" in line
+                        or "Could not move installation file to Trash" in line
                     ):
                         source_file_results.append(f"{name}: {line}")
                         break
@@ -1865,6 +1895,19 @@ def execute_apt_removal(app, purge=False):
 
     apt_get_command = shutil.which("apt-get") or "/usr/bin/apt-get"
     pkexec_command = shutil.which("pkexec")
+    backup_note = ""
+    if purge:
+        try:
+            backup_dir, backed_up_count = _backup_residual_conffiles(
+                removed_packages
+            )
+        except OSError as error:
+            _log_action(f"APT_REMOVE_BLOCKED {key} reason=purge-backup-failed")
+            return False, (
+                "Purge was not started because App Manager could not securely back "
+                f"up the affected configuration files.\n\n{error}"
+            )
+        backup_note = _purge_backup_note(backup_dir, backed_up_count)
 
     apt_action = "purge" if purge else "remove"
 
@@ -1890,8 +1933,12 @@ def execute_apt_removal(app, purge=False):
 
     if success:
         _log_action(f"APT_REMOVE_SUCCESS {key}")
+        if backup_note:
+            message = f"{message}\n\n{backup_note}"
     else:
         _log_action(f"APT_REMOVE_FAILED {key} error={message}")
+        if backup_note:
+            message = f"{message}\n\n{backup_note}"
 
     return success, message
 
@@ -2406,6 +2453,27 @@ def execute_batch_removal(apps, progress_callback=None, purge=False):
     if snap_ids or system_flatpak_ids or apt_ids:
         report("Removing apps with administrator privileges…")
 
+        backup_note = ""
+        if purge and apt_ids:
+            try:
+                backup_dir, backed_up_count = _backup_residual_conffiles(
+                    removed_packages
+                )
+                backup_note = _purge_backup_note(backup_dir, backed_up_count)
+            except OSError as error:
+                message = (
+                    "Privileged removal was not started because App Manager could "
+                    "not securely back up the APT configuration files.\n\n"
+                    f"{error}"
+                )
+                for app in privileged_apps:
+                    results_by_key[app_key(app)] = (False, message)
+                privileged_apps = []
+                privileged_expected = []
+                apt_ids = []
+                snap_ids = []
+                system_flatpak_ids = []
+
         script = _build_privileged_script(
             snap_exe,
             snap_ids,
@@ -2438,6 +2506,8 @@ def execute_batch_removal(apps, progress_callback=None, purge=False):
                     key,
                     (False, output if output else "Privileged removal failed."),
                 )
+                if backup_note:
+                    message = f"{message}\n\n{backup_note}"
 
                 results_by_key[app_key(app)] = (success, message)
 
@@ -3220,6 +3290,232 @@ def _format_package_list(packages, limit=50):
 
     return "\n".join(lines)
 
+
+def _write_json_private(path, data):
+    encoded = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(encoded)
+            output.write(b"\n")
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+
+
+def _backup_residual_conffiles(package_ids):
+    """Securely copy dpkg-authoritative conffiles before irreversible purge."""
+    state_dir = Path.home() / ".local" / "state" / "app-manager"
+    backup_root = state_dir / "purge-backups"
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    home_dir = Path.home().resolve()
+    if (
+        state_dir.is_symlink()
+        or not state_dir.resolve().is_relative_to(home_dir)
+    ):
+        raise OSError(f"Backup state directory is outside the home directory: {state_dir}")
+    backup_root.mkdir(mode=0o700, exist_ok=True)
+    if backup_root.is_symlink() or not backup_root.resolve().is_relative_to(home_dir):
+        raise OSError(f"Backup directory is outside the home directory: {backup_root}")
+    os.chmod(state_dir, 0o700)
+    os.chmod(backup_root, 0o700)
+
+    backup_dir = backup_root / (
+        datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + uuid4().hex
+    )
+    backup_dir.mkdir(mode=0o700)
+    files_dir = backup_dir / "files"
+    files_dir.mkdir(mode=0o700)
+    manifest = {
+        "created_at": datetime.now().astimezone().isoformat(),
+        "status": "incomplete",
+        "packages": list(package_ids),
+        "files": [],
+    }
+    manifest_path = backup_dir / "manifest.json"
+    _write_json_private(manifest_path, manifest)
+    records_by_path = {}
+
+    try:
+        for package_id in package_ids:
+            result = subprocess.run(
+                ["dpkg-query", "-W", "-f=${Conffiles}\\n", package_id],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                raise OSError(
+                    result.stderr.strip()
+                    or f"Could not list configuration files for {package_id}."
+                )
+
+            for line in result.stdout.splitlines():
+                match = re.match(r"^\s*(/\S+)\s+([0-9a-f]{32})(?:\s+.*)?$", line)
+                if not match:
+                    if line.lstrip().startswith("/"):
+                        raise OSError(
+                            f"Could not safely parse dpkg conffile entry for "
+                            f"{package_id}: {line}"
+                        )
+                    continue
+                source_value = match.group(1)
+                source_path = Path(source_value)
+                if (
+                    not source_path.is_absolute()
+                    or ".." in source_path.parts
+                    or os.path.normpath(source_value) != source_value
+                    or source_path == Path("/")
+                ):
+                    raise OSError(
+                        f"Refusing unsafe dpkg conffile path: {source_value}"
+                    )
+                if source_value in records_by_path:
+                    if package_id not in records_by_path[source_value]["packages"]:
+                        records_by_path[source_value]["packages"].append(package_id)
+                    continue
+
+                try:
+                    source_stat = source_path.lstat()
+                except FileNotFoundError:
+                    manifest["files"].append({
+                        "package": package_id,
+                        "packages": [package_id],
+                        "path": source_value,
+                        "status": "missing",
+                    })
+                    records_by_path[source_value] = manifest["files"][-1]
+                    continue
+
+                destination = files_dir / source_value.lstrip("/")
+                destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                record = {
+                    "package": package_id,
+                    "packages": [package_id],
+                    "path": source_value,
+                    "mode": stat.S_IMODE(source_stat.st_mode),
+                    "uid": source_stat.st_uid,
+                    "gid": source_stat.st_gid,
+                    "mtime_ns": source_stat.st_mtime_ns,
+                    "size": source_stat.st_size,
+                }
+
+                if stat.S_ISLNK(source_stat.st_mode):
+                    link_target = os.readlink(source_path)
+                    current_stat = source_path.lstat()
+                    if (
+                        current_stat.st_ino != source_stat.st_ino
+                        or current_stat.st_dev != source_stat.st_dev
+                        or not stat.S_ISLNK(current_stat.st_mode)
+                    ):
+                        raise OSError(
+                            f"Configuration symlink changed during backup: {source_path}"
+                        )
+                    os.symlink(link_target, destination)
+                    record.update(type="symlink", link_target=link_target)
+                elif stat.S_ISREG(source_stat.st_mode):
+                    flags = os.O_RDONLY
+                    if hasattr(os, "O_NOFOLLOW"):
+                        flags |= os.O_NOFOLLOW
+                    source_fd = os.open(source_path, flags)
+                    destination_fd = None
+                    try:
+                        opened_stat = os.fstat(source_fd)
+                        if (
+                            not stat.S_ISREG(opened_stat.st_mode)
+                            or opened_stat.st_ino != source_stat.st_ino
+                            or opened_stat.st_dev != source_stat.st_dev
+                        ):
+                            raise OSError(
+                                f"Configuration file changed during backup: {source_path}"
+                            )
+                        destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                        if hasattr(os, "O_NOFOLLOW"):
+                            destination_flags |= os.O_NOFOLLOW
+                        destination_fd = os.open(
+                            destination,
+                            destination_flags,
+                            0o600,
+                        )
+                        digest = hashlib.sha256()
+                        with os.fdopen(source_fd, "rb") as source:
+                            source_fd = -1
+                            with os.fdopen(destination_fd, "wb") as output:
+                                destination_fd = None
+                                while True:
+                                    chunk = source.read(1024 * 1024)
+                                    if not chunk:
+                                        break
+                                    digest.update(chunk)
+                                    output.write(chunk)
+                        final_stat = os.stat(source_path, follow_symlinks=False)
+                        if (
+                            final_stat.st_ino != opened_stat.st_ino
+                            or final_stat.st_dev != opened_stat.st_dev
+                            or final_stat.st_size != opened_stat.st_size
+                            or final_stat.st_mtime_ns != opened_stat.st_mtime_ns
+                        ):
+                            raise OSError(
+                                f"Configuration file changed during backup: {source_path}"
+                            )
+                        record.update(
+                            type="file",
+                            sha256=digest.hexdigest(),
+                            backup=str(destination.relative_to(backup_dir)),
+                        )
+                    finally:
+                        if source_fd >= 0:
+                            os.close(source_fd)
+                        if destination_fd is not None:
+                            os.close(destination_fd)
+                else:
+                    raise OSError(
+                        f"Refusing to purge unsupported configuration file type: "
+                        f"{source_path}"
+                    )
+                manifest["files"].append(record)
+                _write_json_private_update(manifest_path, manifest)
+
+        manifest["status"] = "complete"
+        _write_json_private_update(manifest_path, manifest)
+    except Exception as error:
+        manifest["error"] = str(error)
+        try:
+            _write_json_private_update(manifest_path, manifest)
+        except OSError:
+            pass
+        raise OSError(
+            f"Configuration backup is incomplete at {backup_dir}; purge was not run. "
+            f"{error}"
+        ) from error
+
+    return backup_dir, sum(
+        1 for record in manifest["files"] if record.get("type") in {"file", "symlink"}
+    )
+
+
+def _write_json_private_update(path, data):
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    _write_json_private(temporary, data)
+    os.replace(temporary, path)
+    os.chmod(path, 0o600)
+
+
+def _purge_backup_note(backup_dir, file_count):
+    noun = "file" if file_count == 1 else "files"
+    return (
+        f"Pre-purge configuration backup retained at {backup_dir} "
+        f"({file_count} existing {noun})."
+    )
+
+
 def purge_leftover_configs(package_ids, output_callback=None):
     """
     Purges leftover APT configuration packages.
@@ -3295,6 +3591,15 @@ def purge_leftover_configs(package_ids, output_callback=None):
     apt_get_command = shutil.which("apt-get") or "/usr/bin/apt-get"
     pkexec_command = shutil.which("pkexec")
 
+    try:
+        backup_dir, backed_up_count = _backup_residual_conffiles(packages_to_purge)
+    except OSError as error:
+        _log_action(f"LEFTOVER_PURGE_BLOCKED backup_error={error}")
+        return False, (
+            "Purge was not started because App Manager could not securely back up "
+            f"the remaining configuration files.\n\n{error}"
+        )
+
     cmd = [
         apt_get_command,
         "purge",
@@ -3313,13 +3618,17 @@ def purge_leftover_configs(package_ids, output_callback=None):
 
     if success:
         _log_action("LEFTOVER_PURGE_SUCCESS")
+        message += f"\n\n{_purge_backup_note(backup_dir, backed_up_count)}"
         if skipped_packages:
             message += (
                 "\n\nSkipped packages no longer in residual-configuration state:\n"
                 + "\n".join(skipped_packages)
             )
     else:
-        _log_action(f"LEFTOVER_PURGE_FAILED error={message}")
+        _log_action(f"LEFTOVER_PURGE_FAILED backup={backup_dir} error={message}")
+        message += (
+            f"\n\n{_purge_backup_note(backup_dir, backed_up_count)}"
+        )
 
     return success, message
     

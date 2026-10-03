@@ -660,6 +660,7 @@ def scan_snap() -> List[AppEntry]:
         version = parts[1]
         revision = parts[2] if len(parts) > 2 else ""
         notes = " ".join(parts[5:]) if len(parts) > 5 else ""
+        normalized_name = name.lower()
 
         if name in skip_names:
             continue
@@ -668,6 +669,12 @@ def scan_snap() -> List[AppEntry]:
             continue
 
         revisions[name] = revision
+        component_snap = (
+            "content" in notes.lower()
+            or "daemon" in notes.lower()
+            or normalized_name.startswith(("gnome-", "gtk-"))
+            or normalized_name.endswith(("-ffmpeg", "-platform"))
+        )
 
         icon = find_snap_icon(name)
 
@@ -679,9 +686,13 @@ def scan_snap() -> List[AppEntry]:
                 package_id=name,
                 version=version,
                 installed_at=None,
-                category="Apps",
-                is_gui_app=True,
-                details="Detected from snap list",
+                category="Component" if component_snap else "Apps",
+                is_gui_app=not component_snap,
+                details=(
+                    f"Snap component; notes: {notes or 'none'}"
+                    if component_snap
+                    else "Detected from snap list"
+                ),
                 icon=icon,
                 exec_name=name.lower(),
             )
