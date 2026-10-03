@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 import shlex
@@ -12,6 +13,35 @@ from urllib.parse import urlsplit
 # ANSI escape code stripper
 # ------------------------------------------------------------
 ANSI_ESCAPE_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+APT_COMMAND_LOCK = threading.Lock()
+APT_COMMAND_NAMES = {"apt", "apt-get", "dpkg"}
+
+
+def _command_uses_apt(cmd) -> bool:
+    for argument in map(str, cmd):
+        if Path(argument).name in APT_COMMAND_NAMES:
+            return True
+        if re.search(r"(?<![\w.-])(?:apt-get|dpkg)(?=\s)", argument):
+            return True
+    return False
+
+
+def _format_apt_lock_error(output: str) -> str:
+    lowered = output.lower()
+    lock_messages = (
+        "could not get lock",
+        "unable to acquire",
+        "is locked by another process",
+        "dpkg frontend lock",
+        "dpkg is locked",
+    )
+    if any(message in lowered for message in lock_messages):
+        return (
+            "Another package-management operation is using APT/dpkg. "
+            "Wait for it to finish, then try again.\n\n"
+            f"{output}"
+        )
+    return output
 
 def _strip_ansi(text: str) -> str:
     """Removes terminal color and cursor control codes from text."""
@@ -388,6 +418,8 @@ def get_removal_risk(app):
         return "low", "Leftover configuration cleanup."
 
     if manager == "AppImage":
+        if getattr(app, "removal_paths", None):
+            return "low", "Removes the launcher and managed AppImage copy; app data is kept."
         return "low", "Removes a standalone AppImage file."
 
     if manager == "Manual":
@@ -442,6 +474,11 @@ def get_removal_preview(app) -> str:
         return f"sudo apt-get remove {package_id}"
 
     if manager == "AppImage":
+        if getattr(app, "removal_paths", None):
+            return (
+                "Remove the App Manager launcher and managed AppImage copy:\n"
+                + "\n".join(_manual_removal_paths(app))
+            )
         return f"rm \"{package_id}\""
 
     if manager == "Manual":
@@ -453,14 +490,215 @@ def get_removal_preview(app) -> str:
     return "Removal preview not available"
 
 
+def _format_size(byte_count):
+    value = float(byte_count)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+
+
+def _parse_human_size(value):
+    match = re.search(
+        r"([0-9]+(?:[.,][0-9]+)?)\s*(B|bytes?|KiB|MiB|GiB|TiB|KB|MB|GB|TB)",
+        value,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    number = float(match.group(1).replace(",", "."))
+    unit = match.group(2).lower()
+    power = 1000 if unit in {"kb", "mb", "gb", "tb"} else 1024
+    exponent = {
+        "b": 0, "byte": 0, "bytes": 0,
+        "kb": 1, "kib": 1,
+        "mb": 2, "mib": 2,
+        "gb": 3, "gib": 3,
+        "tb": 4, "tib": 4,
+    }[unit]
+    return int(number * power ** exponent)
+
+
+def _regular_file_sizes(paths):
+    total = 0
+    found = False
+    for value in paths:
+        try:
+            path = Path(value).expanduser()
+            if path.is_file() and not path.is_symlink():
+                total += path.stat().st_size
+                found = True
+        except OSError:
+            continue
+    return total if found else None
+
+
+def get_removal_size_estimate(
+    apps,
+    apt_package_ids=None,
+    flatpak_refs_by_scope=None,
+):
+    """Return a qualified space estimate from package metadata or managed files."""
+    apps = list(apps or [])
+    total_bytes = 0
+    measured = False
+    apt_ids = list(dict.fromkeys(apt_package_ids or []))
+    residual_conf_files = []
+
+    for app in apps:
+        manager = getattr(app, "manager", "")
+        package_id = str(getattr(app, "package_id", "") or "")
+        if manager == "APT":
+            apt_ids.append(package_id)
+        elif manager == "Leftover":
+            try:
+                result = subprocess.run(
+                    [
+                        "dpkg-query",
+                        "-W",
+                        "-f=${Conffiles}\n",
+                        package_id,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                if result.returncode == 0:
+                    residual_conf_files.extend(
+                        match.group(1)
+                        for match in re.finditer(
+                            r"(?m)^\s*(/\S+)\s+[0-9a-f]{32}\s*$",
+                            result.stdout,
+                        )
+                    )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        elif manager == "Flatpak":
+            details = str(getattr(app, "details", "") or "").lower()
+            scope = "--user" if "user" in details else "--system"
+            try:
+                result = subprocess.run(
+                    ["flatpak", "info", "--show-size", scope, package_id],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                size = _parse_human_size(result.stdout) if result.returncode == 0 else None
+                if size is not None:
+                    total_bytes += size
+                    measured = True
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        elif manager == "Snap":
+            snap_dir = Path("/var/lib/snapd/snaps")
+            snap_sizes = _regular_file_sizes(snap_dir.glob(f"{package_id}_*.snap"))
+            if snap_sizes is not None:
+                total_bytes += snap_sizes
+                measured = True
+        elif manager in {"AppImage", "Manual"}:
+            raw_paths = getattr(app, "removal_paths", None)
+            if isinstance(raw_paths, str):
+                paths = raw_paths.splitlines()
+            elif raw_paths:
+                paths = list(raw_paths)
+            else:
+                paths = [package_id]
+            size = _regular_file_sizes(paths)
+            if size is not None:
+                total_bytes += size
+                measured = True
+
+    apt_ids = list(dict.fromkeys(package_id for package_id in apt_ids if package_id))
+    if apt_ids:
+        command = [
+            "dpkg-query",
+            "-W",
+            "-f=${binary:Package}\t${Installed-Size}\n",
+            *apt_ids,
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0 or result.stdout:
+                for line in result.stdout.splitlines():
+                    _, separator, size_kib = line.partition("\t")
+                    if separator and size_kib.isdigit():
+                        total_bytes += int(size_kib) * 1024
+                        measured = True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    flatpak_command = shutil.which("flatpak")
+    if flatpak_command:
+        for scope, refs in (flatpak_refs_by_scope or {}).items():
+            for ref in dict.fromkeys(refs):
+                try:
+                    result = subprocess.run(
+                        [
+                            flatpak_command,
+                            "info",
+                            "--show-size",
+                            scope,
+                            ref,
+                        ],
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    size = (
+                        _parse_human_size(result.stdout)
+                        if result.returncode == 0
+                        else None
+                    )
+                    if size is not None:
+                        total_bytes += size
+                        measured = True
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
+
+    config_size = _regular_file_sizes(residual_conf_files)
+    if config_size is not None:
+        total_bytes += config_size
+        measured = True
+
+    if not measured:
+        return "Estimated space to be freed: unavailable for these items."
+
+    note = (
+        "Approximate estimate; shared dependencies, retained app data/configuration, "
+        "compression, and filesystem behavior affect actual space reclaimed."
+    )
+    return (
+        f"Estimated space that may be freed: approximately {_format_size(total_bytes)}.\n"
+        f"{note}"
+    )
+
+
 # ------------------------------------------------------------
 # Basic command execution helpers
 # ------------------------------------------------------------
 
-def _run_command_raw(cmd, timeout=900):
+def _run_command_raw(cmd, timeout=900, env_overrides=None):
+    uses_apt = _command_uses_apt(cmd)
+    if uses_apt and not APT_COMMAND_LOCK.acquire(blocking=False):
+        return 1, (
+            "Another APT/dpkg operation is already running in App Manager. "
+            "Wait for it to finish, then try again."
+        )
+
     env = os.environ.copy()
     env["DEBIAN_FRONTEND"] = "noninteractive"
     env["PAGER"] = "cat"
+    if env_overrides:
+        env.update(env_overrides)
 
     try:
         result = subprocess.run(
@@ -480,11 +718,16 @@ def _run_command_raw(cmd, timeout=900):
         else:
             output = stdout if stdout else stderr
 
+        if result.returncode:
+            output = _format_apt_lock_error(output)
         return result.returncode, output
     except subprocess.TimeoutExpired:
         return 124, "Command timed out."
     except Exception as e:
         return 1, str(e)
+    finally:
+        if uses_apt:
+            APT_COMMAND_LOCK.release()
 
 def install_deb(path, output_callback=None, delete_source=False):
     """
@@ -551,6 +794,12 @@ def _run_command_stream(cmd, output_callback=None, timeout=900):
     env = os.environ.copy()
     env["DEBIAN_FRONTEND"] = "noninteractive"
     env["PAGER"] = "cat"
+    uses_apt = _command_uses_apt(cmd)
+    if uses_apt and not APT_COMMAND_LOCK.acquire(blocking=False):
+        return False, (
+            "Another APT/dpkg operation is already running in App Manager. "
+            "Wait for it to finish, then try again."
+        )
 
     process = None
     timer = None
@@ -624,7 +873,8 @@ def _run_command_stream(cmd, output_callback=None, timeout=900):
         if returncode == 0:
             return True, output if output else "Command completed successfully."
 
-        return False, output if output else f"Command failed with exit code {returncode}."
+        output = output or f"Command failed with exit code {returncode}."
+        return False, _format_apt_lock_error(output)
 
     except Exception as e:
         return False, str(e)
@@ -633,6 +883,8 @@ def _run_command_stream(cmd, output_callback=None, timeout=900):
             timer.cancel()
             if timer.is_alive():
                 timer.join(timeout=1)
+        if uses_apt:
+            APT_COMMAND_LOCK.release()
         
 def _maybe_delete_source_file(path, delete_source, message):
     if not delete_source:
@@ -654,6 +906,392 @@ def _maybe_delete_source_file(path, delete_source, message):
     _log_action(f"INSTALL_SOURCE_DELETE_SUCCESS path={source_path}")
     notice = "Deleted installation file after successful installation."
     return f"{message}\n\n{notice}" if message else notice
+
+
+def _desktop_entry_value(value):
+    escaped = (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("`", "\\`")
+        .replace("$", "\\$")
+        .replace("%", "%%")
+    )
+    return f'"{escaped}"'
+
+
+def install_appimage(path, delete_source=False):
+    """Copy an AppImage into the per-user app directory and add a launcher."""
+    source = Path(path).expanduser()
+    if source.suffix.lower() != ".appimage":
+        return False, f"Not an AppImage file: {source}"
+    if not source.is_file():
+        return False, f"AppImage file not found: {source}"
+
+    try:
+        with source.open("rb") as appimage_file:
+            if appimage_file.read(4) != b"\x7fELF":
+                return False, f"File is not a valid ELF AppImage: {source.name}"
+    except OSError as error:
+        return False, f"Could not read AppImage {source}: {error}"
+
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", source.stem).strip("-") or "appimage"
+    app_dir = Path.home() / ".local/share/app-manager/appimages"
+    desktop_dir = Path.home() / ".local/share/applications"
+    try:
+        resolved_source = source.resolve(strict=True)
+        if resolved_source.is_relative_to(app_dir.resolve()):
+            for existing_desktop in desktop_dir.glob("app-manager-appimage-*.desktop"):
+                try:
+                    existing_content = existing_desktop.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                if (
+                    "X-AppManager-Installed-AppImage=true" in existing_content
+                    and f"X-AppManager-AppImage-Path={resolved_source}" in existing_content
+                ):
+                    return True, f"Already installed: {source.stem}"
+    except OSError as error:
+        return False, f"Could not resolve AppImage file {source}: {error}"
+
+    if "\n" in str(app_dir) or "\n" in str(desktop_dir):
+        return False, "AppImage installation paths cannot contain newline characters."
+
+    digest = hashlib.sha256(str(resolved_source).encode("utf-8")).hexdigest()[:10]
+    installed_image = app_dir / f"{slug}-{digest}.AppImage"
+    desktop_file = desktop_dir / f"app-manager-appimage-{slug}-{digest}.desktop"
+
+    if desktop_file.exists() or installed_image.exists():
+        try:
+            content = desktop_file.read_text(encoding="utf-8")
+        except OSError as error:
+            return False, f"An AppImage installation already exists but could not be read: {error}"
+        if (
+            "X-AppManager-Installed-AppImage=true" in content
+            and f"X-AppManager-AppImage-Path={installed_image}" in content
+            and installed_image.is_file()
+        ):
+            return True, f"Already installed: {source.stem}"
+        return False, f"An AppImage installation already exists at {installed_image}."
+
+    try:
+        app_dir.mkdir(parents=True, exist_ok=True)
+        desktop_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, installed_image)
+        installed_image.chmod(0o755)
+
+        display_name = "".join(
+            character
+            for character in source.stem.replace("_", " ").replace("-", " ").strip()
+            if character >= " " and character != "\x7f"
+        )
+        display_name = display_name or "AppImage"
+        desktop_content = "\n".join(
+            [
+                "[Desktop Entry]",
+                "Type=Application",
+                f"Name={display_name}",
+                f"Exec={_desktop_entry_value(str(installed_image))}",
+                "Icon=application-x-executable",
+                "Terminal=false",
+                "Categories=Utility;",
+                "X-AppManager-Installed-AppImage=true",
+                f"X-AppManager-AppImage-Path={installed_image}",
+                f"X-AppManager-Source-URI={resolved_source.as_uri()}",
+                "",
+            ]
+        )
+        desktop_file.write_text(desktop_content, encoding="utf-8")
+        desktop_file.chmod(0o644)
+    except OSError as error:
+        try:
+            installed_image.unlink(missing_ok=True)
+            desktop_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, f"Could not install AppImage {source.name}: {error}"
+
+    message = (
+        f"Installed {display_name} for the current user.\n"
+        f"AppImage copy: {installed_image}\n"
+        f"Launcher: {desktop_file}\n"
+        "The launcher uses a generic icon and a name derived from the file name."
+    )
+    _log_action(f"APPIMAGE_INSTALL_SUCCESS source={source} installed={installed_image}")
+    if delete_source:
+        message = _maybe_delete_source_file(source, True, message)
+    return True, message
+
+
+def install_appimage_batch(paths, output_callback=None, delete_source=False):
+    """Install multiple AppImages one at a time and report each result."""
+    installed = []
+    already_installed = []
+    failures = []
+    source_file_results = []
+
+    for index, path in enumerate(paths, start=1):
+        name = Path(path).name
+        if output_callback:
+            output_callback(f"[{index}/{len(paths)}] Installing {name}…")
+        success, message = install_appimage(path, delete_source=delete_source)
+        if success and message.startswith("Already installed:"):
+            already_installed.append(name)
+            status = "ALREADY INSTALLED"
+        elif success:
+            installed.append(name)
+            status = "INSTALLED"
+            if delete_source:
+                for line in message.splitlines():
+                    if (
+                        "Deleted installation file" in line
+                        or "Could not delete installation file" in line
+                    ):
+                        source_file_results.append(f"{name}: {line}")
+                        break
+        else:
+            first_line = message.splitlines()[0] if message else "Installation failed"
+            failures.append(f"{name}: {first_line}")
+            status = "FAILED"
+        if output_callback:
+            output_callback(f"[{index}/{len(paths)}] {status} {name}")
+
+    lines = [
+        f"Installed ({len(installed)}): " + (", ".join(installed) if installed else "none"),
+        "Already installed ({}): ".format(len(already_installed))
+        + (", ".join(already_installed) if already_installed else "none"),
+        f"Failed ({len(failures)}): " + ("; ".join(failures) if failures else "none"),
+    ]
+    summary = "\n".join(lines)
+    if source_file_results:
+        summary += "\n\nSource file cleanup:\n" + "\n".join(source_file_results[:20])
+    return not failures, summary, len(installed) + len(already_installed)
+
+
+def check_available_updates():
+    """Return structured update listings from APT, Flatpak, and Snap."""
+    updates = []
+    errors = []
+    notes = []
+    checks = []
+    successful_checks = 0
+
+    apt_command = shutil.which("apt")
+    if apt_command:
+        returncode, output = _run_command_raw(
+            [apt_command, "list", "--upgradable"],
+            timeout=90,
+            env_overrides={"LC_ALL": "C"},
+        )
+        if returncode == 0:
+            successful_checks += 1
+            before_count = len(updates)
+            for line in output.splitlines():
+                match = re.match(
+                    r"^\s*([^/\s]+)/\S+\s+(\S+)\s+\S+\s+"
+                    r"\[upgradable from:\s*([^\]]+)\]",
+                    line,
+                )
+                if match:
+                    package_id, new_version, old_version = match.groups()
+                    updates.append({
+                        "manager": "APT",
+                        "scope": None,
+                        "id": package_id,
+                        "detail": f"{old_version} → {new_version}",
+                    })
+            count = len(updates) - before_count
+            checks.append(("APT", count))
+        else:
+            errors.append(f"APT: {output or 'Update check failed.'}")
+    else:
+        notes.append("APT is not available on this system.")
+
+    flatpak_command = shutil.which("flatpak")
+    if flatpak_command:
+        for scope in ("--user", "--system"):
+            try:
+                result = subprocess.run(
+                    [
+                        flatpak_command,
+                        "remote-ls",
+                        "--updates",
+                        scope,
+                        "--columns=application,version,branch,origin",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    env={**os.environ, "LC_ALL": "C"},
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                errors.append(f"Flatpak ({scope.removeprefix('--')}): {error}")
+                continue
+            if result.returncode:
+                output = "\n".join(
+                    item.strip()
+                    for item in (result.stdout, result.stderr)
+                    if item.strip()
+                )
+                errors.append(
+                    f"Flatpak ({scope.removeprefix('--')}): "
+                    f"{output or 'Update check failed.'}"
+                )
+            else:
+                successful_checks += 1
+                before_count = len(updates)
+                for line in result.stdout.splitlines():
+                    columns = line.split()
+                    if not columns or columns[0].lower() in {
+                        "application", "name", "id",
+                    }:
+                        continue
+                    updates.append({
+                        "manager": "Flatpak",
+                        "scope": scope.removeprefix("--"),
+                        "id": columns[0],
+                        "detail": " · ".join(columns[1:]),
+                    })
+                checks.append(
+                    (f"Flatpak ({scope.removeprefix('--')})", len(updates) - before_count)
+                )
+    else:
+        notes.append("Flatpak is not available on this system.")
+
+    snap_command = shutil.which("snap")
+    if snap_command:
+        try:
+            result = subprocess.run(
+                [snap_command, "refresh", "--list"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env={**os.environ, "LC_ALL": "C"},
+            )
+            if result.returncode:
+                output = "\n".join(
+                    item.strip()
+                    for item in (result.stdout, result.stderr)
+                    if item.strip()
+                )
+                errors.append(f"Snap: {output or 'Update check failed.'}")
+            else:
+                successful_checks += 1
+                before_count = len(updates)
+                for line in result.stdout.splitlines():
+                    columns = line.split()
+                    if not columns or columns[0].lower() in {
+                        "name", "all", "no",
+                    }:
+                        continue
+                    updates.append({
+                        "manager": "Snap",
+                        "scope": None,
+                        "id": columns[0],
+                        "detail": " ".join(columns[1:]),
+                    })
+                checks.append(("Snap", len(updates) - before_count))
+        except (OSError, subprocess.TimeoutExpired) as error:
+            errors.append(f"Snap: {error}")
+    else:
+        notes.append("Snap is not available on this system.")
+
+    notes.extend((
+        "APT results use the package lists currently cached on this system.",
+        "AppImages and manual installations are not checked; they do not share a "
+        "standard update source or command.",
+    ))
+    return successful_checks > 0, {
+        "updates": updates,
+        "checks": checks,
+        "errors": errors,
+        "notes": notes,
+    }
+
+
+def execute_available_updates(updates, output_callback=None):
+    """Install selected updates using each package manager's native updater."""
+    grouped = {}
+    for update in updates or []:
+        manager = update.get("manager")
+        scope = update.get("scope")
+        package_id = str(update.get("id", ""))
+        if manager == "APT" and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+.:_-]*", package_id):
+            group = ("APT", None)
+        elif manager == "Flatpak" and scope in {"user", "system"} and re.fullmatch(
+            r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+",
+            package_id,
+        ):
+            group = ("Flatpak", scope)
+        elif manager == "Snap" and re.fullmatch(r"[a-z0-9][a-z0-9-]*", package_id):
+            group = ("Snap", None)
+        else:
+            continue
+        grouped.setdefault(group, set()).add(package_id)
+
+    if not grouped:
+        return False, "No valid updates were selected."
+
+    results = []
+    failures = []
+    manager_order = {"APT": 0, "Flatpak": 1, "Snap": 2}
+    scope_order = {None: 0, "user": 0, "system": 1}
+    for (manager, scope), package_ids in sorted(
+        grouped.items(),
+        key=lambda item: (
+            manager_order.get(item[0][0], 99),
+            scope_order.get(item[0][1], 99),
+        ),
+    ):
+        package_ids = sorted(package_ids)
+        if manager == "APT":
+            command = shutil.which("apt-get")
+            if not command:
+                failures.append("APT: apt-get is not available.")
+                continue
+            cmd = [command, "install", "--only-upgrade", "-y", *package_ids]
+        elif manager == "Flatpak":
+            command = shutil.which("flatpak")
+            if not command:
+                failures.append("Flatpak: flatpak is not available.")
+                continue
+            cmd = [
+                command,
+                "update",
+                f"--{scope}",
+                "--noninteractive",
+                *package_ids,
+            ]
+        else:
+            command = shutil.which("snap")
+            if not command:
+                failures.append("Snap: snap is not available.")
+                continue
+            cmd = [command, "refresh", *package_ids]
+
+        if (manager == "APT" or manager == "Snap" or scope == "system") and os.geteuid() != 0:
+            pkexec_command = shutil.which("pkexec")
+            if not pkexec_command:
+                failures.append(
+                    f"{manager}: pkexec is required to update system packages."
+                )
+                continue
+            cmd.insert(0, pkexec_command)
+
+        title = f"{manager}{f' ({scope})' if scope else ''}"
+        if output_callback:
+            output_callback(f"Updating {title}: {', '.join(package_ids)}")
+        success, output = _run_command_stream(cmd, output_callback)
+        if success:
+            results.append(f"{title}: updated {len(package_ids)} item(s).")
+        else:
+            failures.append(f"{title}: {output or 'Update failed.'}")
+
+    summary = "\n".join(results + failures)
+    return not failures, summary or "No selected updates could be run."
+
 
 # ------------------------------------------------------------
 # Batch .deb installation
@@ -840,6 +1478,80 @@ def execute_removal(app):
     # AppImage removal
     # ------------------------------------------------------------
     if manager == "AppImage":
+        raw_removal_paths = getattr(app, "removal_paths", None)
+        if raw_removal_paths:
+            if isinstance(raw_removal_paths, str):
+                removal_paths = raw_removal_paths.splitlines()
+            else:
+                removal_paths = list(raw_removal_paths)
+            allowed_roots = [
+                Path.home() / ".local/share/app-manager/appimages",
+                Path.home() / ".local/share/applications",
+            ]
+            validated_paths = []
+            for raw_path in removal_paths:
+                path = Path(os.path.abspath(Path(raw_path).expanduser()))
+                if (
+                    not path.is_file()
+                    or not any(path.is_relative_to(root) for root in allowed_roots)
+                ):
+                    message = f"Refusing to remove an invalid AppImage installation file: {raw_path}"
+                    _log_action(f"REMOVE_BLOCKED {key} manager=AppImage reason=invalid-managed-path")
+                    return False, message
+                if path.parent == allowed_roots[1] and (
+                    not path.name.startswith("app-manager-appimage-")
+                    or path.suffix != ".desktop"
+                ):
+                    message = f"Refusing to remove an unowned desktop entry: {raw_path}"
+                    _log_action(f"REMOVE_BLOCKED {key} manager=AppImage reason=unowned-desktop-file")
+                    return False, message
+                validated_paths.append(path)
+
+            desktop_files = [
+                path for path in validated_paths
+                if path.parent == allowed_roots[1]
+            ]
+            if len(desktop_files) != 1:
+                message = "The integrated AppImage launcher is missing or ambiguous."
+                _log_action(f"REMOVE_BLOCKED {key} manager=AppImage reason=invalid-desktop-count")
+                return False, message
+            try:
+                desktop_content = desktop_files[0].read_text(encoding="utf-8")
+            except OSError as error:
+                return False, f"Could not verify the AppImage launcher: {error}"
+            if (
+                "X-AppManager-Installed-AppImage=true" not in desktop_content
+                or f"X-AppManager-AppImage-Path={package_id}" not in desktop_content
+            ):
+                message = "The launcher does not identify this as an App Manager installation."
+                _log_action(f"REMOVE_BLOCKED {key} manager=AppImage reason=unverified-desktop")
+                return False, message
+
+            if not any(
+                path.parent == allowed_roots[0] and path == Path(package_id)
+                for path in validated_paths
+            ):
+                message = "The installed AppImage copy was not included in its removal record."
+                _log_action(f"REMOVE_BLOCKED {key} manager=AppImage reason=missing-installed-image")
+                return False, message
+
+            removed = []
+            try:
+                for path in validated_paths:
+                    path.unlink()
+                    removed.append(str(path))
+            except OSError as error:
+                message = (
+                    f"Could not remove the integrated AppImage: {error}\n\n"
+                    "Removed files:\n" + "\n".join(removed)
+                )
+                _log_action(f"REMOVE_FAILED {key} manager=AppImage error={error}")
+                return False, message
+
+            message = "Removed AppImage launcher and installed copy:\n" + "\n".join(removed)
+            _log_action(f"REMOVE_SUCCESS {key} manager=AppImage integrated=true")
+            return True, message
+
         path = Path(package_id)
 
         if not path.is_file():
@@ -1085,7 +1797,8 @@ def prepare_apt_removal(app, purge=False):
         "APT simulation preview:\n\n"
         "The following packages will be removed:\n\n"
         f"{_format_package_list(removed_packages)}\n\n"
-        f"Total packages to remove: {len(removed_packages)}"
+        f"Total packages to remove: {len(removed_packages)}\n\n"
+        f"{get_removal_size_estimate([], apt_package_ids=removed_packages)}"
     )
 
     return True, message, removed_packages, "\n".join(warnings)
@@ -2626,23 +3339,15 @@ def get_apt_autoremove_preview():
         raw_output: str
     """
     cmd = ["apt-get", "--simulate", "autoremove"]
-    env = os.environ.copy()
-    env["LC_ALL"] = "C"
-
     try:
-        result = subprocess.run(
+        returncode, output = _run_command_raw(
             cmd,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
             timeout=60,
-            env=env,
+            env_overrides={"LC_ALL": "C"},
         )
-
-        output = result.stdout + "\n" + result.stderr
-        if result.returncode != 0:
-            return False, [], "", output.strip() or (
-                f"APT autoremove simulation failed with exit code {result.returncode}."
+        if returncode != 0:
+            return False, [], "", output or (
+                f"APT autoremove simulation failed with exit code {returncode}."
             )
 
         packages = []
@@ -2663,10 +3368,6 @@ def get_apt_autoremove_preview():
 
         return True, packages, space_freed, output
 
-    except subprocess.TimeoutExpired:
-        return False, [], "", "Command timed out."
-    except OSError as e:
-        return False, [], "", f"Could not run APT autoremove simulation: {e}"
     except Exception as e:
         return False, [], "", str(e)
 
@@ -2721,6 +3422,7 @@ def get_flatpak_unused_preview():
 
     outputs = []
     previews = []
+    refs_by_scope = {}
     env = os.environ.copy()
     env["LC_ALL"] = "C"
 
@@ -2771,6 +3473,12 @@ def get_flatpak_unused_preview():
                 return False, "", f"{scope}: {error}"
 
         if output:
+            refs = list(dict.fromkeys(re.findall(
+                r"\b((?:[A-Za-z0-9_-]+\.)+[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+)\b",
+                output,
+            )))
+            if refs:
+                refs_by_scope[scope] = refs
             preview = "\n".join(
                 line
                 for line in output.splitlines()
@@ -2785,6 +3493,13 @@ def get_flatpak_unused_preview():
             ).strip()
             if preview:
                 previews.append(f"{scope.removeprefix('--').title()} installation:\n{preview}")
+
+    if refs_by_scope:
+        size_estimate = get_removal_size_estimate(
+            [],
+            flatpak_refs_by_scope=refs_by_scope,
+        )
+        previews.append(size_estimate)
 
     return True, "\n\n".join(previews), "\n\n".join(outputs)
 

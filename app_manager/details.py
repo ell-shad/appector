@@ -12,6 +12,7 @@ from .actions import (
     execute_removal,
     prepare_apt_removal,
     execute_apt_removal,
+    get_removal_size_estimate,
 )
 
 
@@ -136,6 +137,7 @@ class DetailsWindow(Gtk.Window):
     def show_non_apt_confirm(self):
         name = getattr(self.app, "name", "this app")
         preview = get_removal_preview(self.app)
+        preview += "\n\n" + get_removal_size_estimate([self.app])
 
         dialog = Gtk.MessageDialog(
             transient_for=self,

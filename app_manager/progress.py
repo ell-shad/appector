@@ -197,6 +197,20 @@ class InstallProgressWindow(Gtk.Window):
         self.expander.set_expanded(True)
         self.close_button.set_sensitive(True)
 
+    def finish_update_results(self, message, success):
+        self.stop_pulse()
+        self.progressbar.set_fraction(1.0 if success else 0.0)
+        self.set_status(
+            "Selected updates installed."
+            if success
+            else "Some selected updates could not be installed."
+        )
+        if message:
+            self.append_output("")
+            self.append_output(message)
+        self.expander.set_expanded(True)
+        self.close_button.set_sensitive(True)
+
     def close_window(self):
         self.stop_pulse()
         self.close()

@@ -2,6 +2,7 @@ import gi
 import shutil
 import json
 import subprocess
+import csv
 from pathlib import Path
 
 gi.require_version("Gtk", "4.0")
@@ -26,6 +27,7 @@ from .actions import (
     flathub_remote_exists,
     install_flatpak_source,
     install_deb_batch,
+    install_appimage_batch,
     install_flatpak_ref_batch,
     install_flatpak_app_id_batch,
     extract_flathub_app_id,
@@ -35,7 +37,10 @@ from .actions import (
     execute_apt_autoremove,
     get_flatpak_unused_preview,
     execute_flatpak_unused_cleanup,
+    check_available_updates,
+    execute_available_updates,
     get_removal_risk,
+    get_removal_size_estimate,
 
 )
 
@@ -98,7 +103,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.install_menu_btn = Gtk.MenuButton()
             self.install_menu_btn.set_icon_name("list-add-symbolic")
             self.install_menu_btn.set_tooltip_text(
-                "Install apps or drop .deb/.flatpakref files"
+                "Install apps or drop .deb/.flatpakref/.AppImage files"
             )
             header.pack_start(self.install_menu_btn)
 
@@ -128,6 +133,8 @@ class MainWindow(Adw.ApplicationWindow):
         primary_menu_model.append_section("Maintenance", maintenance_section)
 
         misc_section = Gio.Menu()
+        misc_section.append("Check for available updates", "win.check-updates")
+        misc_section.append("Export installed app list…", "win.export-app-list")
         misc_section.append("Activity Log", "win.show-log")
         misc_section.append("Keyboard Shortcuts", "win.shortcuts")
         misc_section.append("About App Manager", "win.about")
@@ -479,6 +486,296 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.connect("response", lambda d, response: d.close())
         dialog.present()
 
+    def on_check_updates_clicked(self, button=None):
+        self.progress_window = ProgressWindow(self, "Checking for updates")
+        self.progress_window.present()
+        self.progress_window.start_indeterminate(
+            "Checking available APT, Flatpak, and Snap updates…"
+        )
+        threading.Thread(
+            target=self.check_updates_worker,
+            daemon=True,
+        ).start()
+
+    def check_updates_worker(self):
+        success, message = check_available_updates()
+        GLib.idle_add(self.on_check_updates_finished, success, message)
+
+    def on_check_updates_finished(self, success, message):
+        if self.progress_window:
+            self.progress_window.close_window()
+            self.progress_window = None
+        update_items = message.get("updates", [])
+        dialog = Gtk.Dialog(
+            transient_for=self,
+            modal=True,
+            title="Available updates" if update_items else (
+                "Update check results" if success else "Update check failed"
+            ),
+            default_width=700,
+            default_height=620,
+        )
+        dialog.set_resizable(True)
+
+        content = dialog.get_content_area()
+        content.set_spacing(12)
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_min_content_width(540)
+        scrolled.set_min_content_height(440)
+        scrolled.set_vexpand(True)
+        scrolled.set_hexpand(True)
+
+        results_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=14,
+        )
+        results_box.set_margin_top(8)
+        results_box.set_margin_bottom(8)
+        results_box.set_margin_start(8)
+        results_box.set_margin_end(8)
+        scrolled.set_child(results_box)
+
+        manager_names = {
+            "APT": "APT",
+            "Flatpak": "Flatpak",
+            "Snap": "Snap",
+        }
+        selections = []
+        groups = {}
+        for item in update_items:
+            key = (item["manager"], item.get("scope"))
+            groups.setdefault(key, []).append(item)
+
+        for manager, count in message.get("checks", []):
+            header = Gtk.Label(
+                label=f"{manager}  ·  {count} update{'s' if count != 1 else ''}",
+            )
+            header.set_xalign(0)
+            header.add_css_class("heading")
+            results_box.append(header)
+
+            key = (
+                "Flatpak",
+                manager.removeprefix("Flatpak (").removesuffix(")")
+                if manager.startswith("Flatpak (")
+                else None,
+            )
+            for item in groups.pop(key, []):
+                row = Gtk.CheckButton()
+                row.set_active(True)
+                label = Gtk.Label(
+                    label=item["id"] + (
+                        f"   {item['detail']}" if item.get("detail") else ""
+                    ),
+                )
+                label.set_xalign(0)
+                label.set_wrap(True)
+                label.set_selectable(True)
+                row.set_child(label)
+                row.set_hexpand(True)
+                results_box.append(row)
+                selections.append((row, item))
+
+            if count == 0:
+                empty = Gtk.Label(label="No updates available.")
+                empty.set_xalign(0)
+                empty.add_css_class("dim-label")
+                results_box.append(empty)
+
+        for (manager, scope), items in groups.items():
+            label = manager_names.get(manager, manager)
+            if scope:
+                label += f" ({scope})"
+            heading = Gtk.Label(
+                label=f"{label}  ·  {len(items)} update{'s' if len(items) != 1 else ''}",
+            )
+            heading.set_xalign(0)
+            heading.add_css_class("heading")
+            results_box.append(heading)
+            for item in items:
+                row = Gtk.CheckButton()
+                row.set_active(True)
+                text = item["id"] + (
+                    f"   {item['detail']}" if item.get("detail") else ""
+                )
+                row_label = Gtk.Label(label=text)
+                row_label.set_xalign(0)
+                row_label.set_wrap(True)
+                row_label.set_selectable(True)
+                row.set_child(row_label)
+                row.set_hexpand(True)
+                results_box.append(row)
+                selections.append((row, item))
+
+        for error in message.get("errors", []):
+            error_label = Gtk.Label(label=error)
+            error_label.set_xalign(0)
+            error_label.set_wrap(True)
+            error_label.add_css_class("error")
+            results_box.append(error_label)
+
+        for note in message.get("notes", []):
+            note_label = Gtk.Label(label=note)
+            note_label.set_xalign(0)
+            note_label.set_wrap(True)
+            note_label.add_css_class("dim-label")
+            results_box.append(note_label)
+
+        content.append(scrolled)
+
+        update_button = dialog.add_button(
+            "Update selected",
+            Gtk.ResponseType.APPLY,
+        )
+        update_button.set_sensitive(bool(selections))
+        close_button = dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+        dialog.set_default_widget(update_button if selections else close_button)
+
+        def update_selection_state(*_args):
+            selected_count = sum(button.get_active() for button, _item in selections)
+            update_button.set_label(
+                f"Update selected ({selected_count})"
+            )
+            update_button.set_sensitive(selected_count > 0)
+
+        for check_button, _item in selections:
+            check_button.connect("toggled", update_selection_state)
+        update_selection_state()
+
+        def on_update_results_response(current_dialog, response):
+            if response == Gtk.ResponseType.APPLY:
+                selected = [
+                    item for check_button, item in selections
+                    if check_button.get_active()
+                ]
+                current_dialog.close()
+                self.start_available_updates(selected)
+            else:
+                current_dialog.close()
+
+        dialog.connect("response", on_update_results_response)
+        dialog.present()
+        return False
+
+    def start_available_updates(self, updates):
+        self.install_progress_window = InstallProgressWindow(
+            self,
+            "Updating apps",
+        )
+        self.install_progress_window.present()
+        self.install_progress_window.start_pulse()
+        self.install_progress_window.set_status(
+            f"Installing {len(updates)} selected update(s)…"
+        )
+        threading.Thread(
+            target=self.available_updates_worker,
+            args=(updates,),
+            daemon=True,
+        ).start()
+
+    def available_updates_worker(self, updates):
+        progress_window = self.install_progress_window
+
+        def output_callback(line):
+            if progress_window:
+                GLib.idle_add(progress_window.append_output, line)
+
+        success, message = execute_available_updates(
+            updates,
+            output_callback=output_callback,
+        )
+        GLib.idle_add(
+            self.on_available_updates_finished,
+            success,
+            message,
+            progress_window,
+        )
+
+    def on_available_updates_finished(self, success, message, progress_window):
+        if progress_window:
+            progress_window.finish_update_results(message, success)
+        self.reload()
+        return False
+
+    def on_export_app_list_clicked(self, button=None):
+        if hasattr(Gtk, "FileDialog"):
+            file_dialog = Gtk.FileDialog.new()
+            file_dialog.set_title("Export installed app list")
+            file_dialog.set_initial_name("installed-apps.csv")
+
+            def on_saved(dialog, result):
+                try:
+                    file = dialog.save_finish(result)
+                    path = file.get_path() if file else None
+                    if path:
+                        self._export_installed_apps(path)
+                except Exception as error:
+                    self.show_message(
+                        "Export failed",
+                        str(error),
+                        Gtk.MessageType.ERROR,
+                    )
+
+            file_dialog.save(self, None, on_saved)
+            return
+
+        chooser = Gtk.FileChooserNative.new(
+            "Export installed app list",
+            self,
+            Gtk.FileChooserAction.SAVE,
+            "Export",
+            "Cancel",
+        )
+        chooser.set_current_name("installed-apps.csv")
+        chooser.connect("response", self.on_export_app_list_chooser_response)
+        chooser.show()
+
+    def on_export_app_list_chooser_response(self, chooser, response):
+        if response == Gtk.ResponseType.ACCEPT:
+            file = chooser.get_file()
+            path = file.get_path() if file else None
+            if path:
+                self._export_installed_apps(path)
+        chooser.destroy()
+
+    def _export_installed_apps(self, path):
+        fields = (
+            "name",
+            "manager",
+            "package_id",
+            "version",
+            "source",
+            "installed_at",
+            "category",
+        )
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as output:
+                writer = csv.DictWriter(output, fieldnames=fields)
+                writer.writeheader()
+                for app in self.current_apps:
+                    writer.writerow({
+                        field: getattr(app, field, "") or ""
+                        for field in fields
+                    })
+        except OSError as error:
+            self.show_message(
+                "Export failed",
+                f"Could not save the installed app list:\n{error}",
+                Gtk.MessageType.ERROR,
+            )
+            return
+
+        self.show_message(
+            "Export complete",
+            f"Exported {len(self.current_apps)} installed app(s) to:\n{path}",
+            Gtk.MessageType.INFO,
+        )
+
     # ------------------------------------------------------------
     # .deb installation
     # ------------------------------------------------------------
@@ -495,10 +792,12 @@ class MainWindow(Adw.ApplicationWindow):
         self,
         deb_paths,
         flatpakref_paths,
+        appimage_paths=None,
         user_install=True,
         delete_source=False,
     ):
-        file_count = len(deb_paths) + len(flatpakref_paths)
+        appimage_paths = appimage_paths or []
+        file_count = len(deb_paths) + len(flatpakref_paths) + len(appimage_paths)
         self.install_progress_window = InstallProgressWindow(
             self,
             "Installing apps",
@@ -511,15 +810,63 @@ class MainWindow(Adw.ApplicationWindow):
 
         thread = threading.Thread(
             target=self.install_files_batch_worker,
-            args=(deb_paths, flatpakref_paths, user_install, delete_source),
+            args=(
+                deb_paths,
+                flatpakref_paths,
+                appimage_paths,
+                user_install,
+                delete_source,
+            ),
             daemon=True,
         )
         thread.start()
+
+    def _confirm_appimage_install(
+        self,
+        deb_paths,
+        flatpakref_paths,
+        appimage_paths,
+        user_install,
+        delete_source,
+    ):
+        def start_install():
+            self.start_install_files_batch(
+                deb_paths,
+                flatpakref_paths,
+                appimage_paths,
+                user_install,
+                delete_source,
+            )
+
+        if not appimage_paths:
+            start_install()
+            return
+
+        warning = (
+            "AppImages are executable programs and are not sandboxed by App Manager. "
+            "Only install files from publishers you trust. The app will copy each "
+            "AppImage into your user applications folder and create a launcher; it "
+            "will not run the AppImage during installation. Its name is inferred from "
+            "the file name and it will use a generic icon. Some AppImages require "
+            "FUSE support to launch."
+        )
+        if delete_source:
+            warning += (
+                "\n\nThe selected source files will be deleted after successful "
+                "installation; the managed copies will remain."
+            )
+        self._show_confirm_dialog(
+            "Review AppImage installation",
+            warning,
+            "Continue",
+            start_install,
+        )
 
     def install_files_batch_worker(
         self,
         deb_paths,
         flatpakref_paths,
+        appimage_paths,
         user_install,
         delete_source,
     ):
@@ -532,7 +879,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         results = []
         success_count = 0
-        total_count = len(deb_paths) + len(flatpakref_paths)
+        total_count = len(deb_paths) + len(flatpakref_paths) + len(appimage_paths)
 
         if deb_paths:
             if not shutil.which("apt-get"):
@@ -571,6 +918,15 @@ class MainWindow(Adw.ApplicationWindow):
                 )
                 results.append(f"Flatpak references:\n{message}")
                 success_count += resolved_count
+
+        if appimage_paths:
+            success, message, resolved_count = install_appimage_batch(
+                appimage_paths,
+                output_callback=output_callback,
+                delete_source=delete_source,
+            )
+            results.append(f"AppImages:\n{message}")
+            success_count += resolved_count
 
         success = success_count == total_count
         GLib.idle_add(
@@ -649,7 +1005,9 @@ class MainWindow(Adw.ApplicationWindow):
 
         # Mode selection
         dialog.mode_id_button = Gtk.CheckButton(label="Flathub app ID or URL")
-        dialog.mode_ref_button = Gtk.CheckButton(label="Files (.deb / .flatpakref)")
+        dialog.mode_ref_button = Gtk.CheckButton(
+            label="Install files (.deb / .flatpakref / .AppImage)"
+        )
 
         dialog.mode_ref_button.set_group(dialog.mode_id_button)
         dialog.mode_ref_button.set_active(True)
@@ -664,7 +1022,7 @@ class MainWindow(Adw.ApplicationWindow):
         # Flatpakref entry + browse
         dialog.file_entry = Gtk.Entry()
         dialog.file_entry.set_placeholder_text(
-            "/path/to/package.deb or /path/to/app.flatpakref"
+            "/path/to/package.deb, .flatpakref, or .AppImage"
         )
         dialog.file_entry.set_hexpand(True)
 
@@ -675,7 +1033,7 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.user_check = Gtk.CheckButton(label="Install for current user only")
         dialog.user_check.set_active(True)
         dialog.delete_source_check = Gtk.CheckButton(
-            label="Delete installation files after successful installation"
+            label="Delete selected source files after successful installation"
         )
         dialog.delete_source_check.set_sensitive(False)        
         dialog.flatpakref_paths = []
@@ -745,7 +1103,10 @@ class MainWindow(Adw.ApplicationWindow):
 
         dialog.ref_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         file_hint = Gtk.Label(
-            label="Select or drop .deb packages and/or .flatpakref files."
+            label=(
+                "Select or drop .deb, .flatpakref, and/or .AppImage files. "
+                "AppImages are copied into your user applications folder."
+            )
         )
         file_hint.set_xalign(0.0)
         file_hint.add_css_class("dim-label")
@@ -830,6 +1191,7 @@ class MainWindow(Adw.ApplicationWindow):
     def _classify_install_paths(paths):
         deb_paths = []
         flatpakref_paths = []
+        appimage_paths = []
         unsupported = []
 
         for path in paths:
@@ -838,26 +1200,30 @@ class MainWindow(Adw.ApplicationWindow):
                 deb_paths.append(path)
             elif suffix == ".flatpakref":
                 flatpakref_paths.append(path)
+            elif suffix == ".appimage":
+                appimage_paths.append(path)
             else:
                 unsupported.append(path)
 
-        return deb_paths, flatpakref_paths, unsupported
+        return deb_paths, flatpakref_paths, appimage_paths, unsupported
 
     def on_main_files_dropped(self, target, file_list, x, y):
         paths = self._paths_from_file_list(file_list)
         if not paths:
             return False
 
-        deb_paths, flatpakref_paths, unsupported = self._classify_install_paths(paths)
+        deb_paths, flatpakref_paths, appimage_paths, unsupported = self._classify_install_paths(paths)
         if unsupported:
             self.show_message(
                 "Unsupported dropped files",
-                "Drop .deb packages and/or .flatpakref files.",
+                "Drop .deb packages, .flatpakref files, and/or .AppImage files.",
                 Gtk.MessageType.WARNING,
             )
             return False
 
-        self.on_install_clicked(initial_paths=deb_paths + flatpakref_paths)
+        self.on_install_clicked(
+            initial_paths=deb_paths + flatpakref_paths + appimage_paths
+        )
         return True
 
     def on_installer_files_dropped(self, target, file_list, x, y, dialog):
@@ -865,14 +1231,17 @@ class MainWindow(Adw.ApplicationWindow):
         if not paths:
             return False
 
-        deb_paths, flatpakref_paths, unsupported = self._classify_install_paths(paths)
+        deb_paths, flatpakref_paths, appimage_paths, unsupported = self._classify_install_paths(paths)
         if unsupported:
             dialog.status_label.set_label(
-                "Only .deb and .flatpakref files can be dropped here."
+                "Drop only .deb, .flatpakref, or .AppImage files."
             )
             return False
 
-        self._set_installer_dialog_paths(dialog, deb_paths + flatpakref_paths)
+        self._set_installer_dialog_paths(
+            dialog,
+            deb_paths + flatpakref_paths + appimage_paths,
+        )
         dialog.mode_ref_button.set_active(True)
         return True
 
@@ -1030,15 +1399,21 @@ class MainWindow(Adw.ApplicationWindow):
                 install_enabled = True
                 add_enabled = False
 
-                deb_paths, flatpakref_paths, unsupported = self._classify_install_paths(paths)
+                deb_paths, flatpakref_paths, appimage_paths, unsupported = self._classify_install_paths(paths)
                 if unsupported:
                     install_enabled = False
-                    status = "Only .deb and .flatpakref files can be installed here."
+                    status = "Only .deb, .flatpakref, or .AppImage files can be installed here."
                 else:
                     status = (
                         f"{len(deb_paths)} .deb and "
-                        f"{len(flatpakref_paths)} .flatpakref file(s) selected."
+                        f"{len(flatpakref_paths)} .flatpakref and "
+                        f"{len(appimage_paths)} .AppImage file(s) selected."
                     )
+                    if appimage_paths:
+                        status += (
+                            "\nAppImages will be copied into your user applications "
+                            "folder and launched without sandboxing."
+                        )
 
                 if hasattr(dialog, "delete_source_check"):
                     dialog.delete_source_check.set_sensitive(not unsupported)
@@ -1068,10 +1443,14 @@ class MainWindow(Adw.ApplicationWindow):
                     if value and not (
                         value.startswith("http://")
                         or value.startswith("https://")
-                        or Path(value).suffix.lower() in {".deb", ".flatpakref"}
+                        or Path(value).suffix.lower()
+                        in {".deb", ".flatpakref", ".appimage"}
                     ):
                         install_enabled = False
-                        status = "Choose a .deb or .flatpakref file, or paste a Flatpak URL."
+                        status = (
+                            "Choose a .deb, .flatpakref, or .AppImage file, "
+                            "or paste a Flatpak URL."
+                        )
                     else:
                         status = "Choose or drop install files, or paste a Flatpak URL."
 
@@ -1151,18 +1530,18 @@ class MainWindow(Adw.ApplicationWindow):
                     and dialog.delete_source_check.get_active()
                 )
 
-                deb_paths, flatpakref_paths, unsupported = self._classify_install_paths(paths)
+                deb_paths, flatpakref_paths, appimage_paths, unsupported = self._classify_install_paths(paths)
                 if unsupported:
                     dialog.status_label.set_label(
-                        "Only .deb and .flatpakref files can be installed here."
+                        "Only .deb, .flatpakref, or .AppImage files can be installed here."
                     )
                     return
 
                 dialog.close()
-
-                self.start_install_files_batch(
+                self._confirm_appimage_install(
                     deb_paths,
                     flatpakref_paths,
+                    appimage_paths,
                     user_install,
                     delete_source,
                 )
@@ -1177,21 +1556,21 @@ class MainWindow(Adw.ApplicationWindow):
             flathub_app_id = extract_flathub_app_id(value)
             is_url = value.startswith("http://") or value.startswith("https://")
 
-            if not is_url and Path(value).suffix.lower() == ".deb":
-                dialog.close()
-                self.start_install_files_batch(
-                    [value],
-                    [],
-                    user_install,
-                    dialog.delete_source_check.get_active(),
+            if not is_url and Path(value).suffix.lower() in {
+                ".deb",
+                ".flatpakref",
+                ".appimage",
+            }:
+                deb_paths, flatpakref_paths, appimage_paths, unsupported = (
+                    self._classify_install_paths([value])
                 )
-                return
-
-            if not is_url and Path(value).suffix.lower() == ".flatpakref":
+                if unsupported:
+                    return
                 dialog.close()
-                self.start_install_files_batch(
-                    [],
-                    [value],
+                self._confirm_appimage_install(
+                    deb_paths,
+                    flatpakref_paths,
+                    appimage_paths,
                     user_install,
                     dialog.delete_source_check.get_active(),
                 )
@@ -1274,9 +1653,13 @@ class MainWindow(Adw.ApplicationWindow):
             file_dialog.set_title("Select installation files")
 
             installer_filter = Gtk.FileFilter()
-            installer_filter.set_name("Installable files (*.deb, *.flatpakref)")
+            installer_filter.set_name(
+                "Installable files (*.deb, *.flatpakref, *.AppImage)"
+            )
             installer_filter.add_pattern("*.deb")
             installer_filter.add_pattern("*.flatpakref")
+            installer_filter.add_pattern("*.AppImage")
+            installer_filter.add_pattern("*.appimage")
 
             all_filter = Gtk.FileFilter()
             all_filter.set_name("All files")
@@ -1329,9 +1712,13 @@ class MainWindow(Adw.ApplicationWindow):
         chooser.add_button("Open", Gtk.ResponseType.OK)
 
         installer_filter = Gtk.FileFilter()
-        installer_filter.set_name("Installable files (*.deb, *.flatpakref)")
+        installer_filter.set_name(
+            "Installable files (*.deb, *.flatpakref, *.AppImage)"
+        )
         installer_filter.add_pattern("*.deb")
         installer_filter.add_pattern("*.flatpakref")
+        installer_filter.add_pattern("*.AppImage")
+        installer_filter.add_pattern("*.appimage")
 
         chooser.add_filter(installer_filter)
 
@@ -1675,6 +2062,8 @@ class MainWindow(Adw.ApplicationWindow):
         add_window_action("clean-orphans", "on_autoremove_clicked")
         add_window_action("clean-leftover-configs", "on_leftover_cleanup_clicked")
         add_window_action("clean-runtimes", "on_flatpak_cleanup_clicked")
+        add_window_action("check-updates", "on_check_updates_clicked")
+        add_window_action("export-app-list", "on_export_app_list_clicked")
 
         add_window_action("show-log", "on_show_log_clicked")
         add_window_action("refresh", "on_reload_clicked")
@@ -1989,42 +2378,6 @@ class MainWindow(Adw.ApplicationWindow):
         
         content_box.append(filter_box)
         
-        # 3. LEFTOVERS
-        leftovers_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        leftovers_label = Gtk.Label(label="APT RESIDUAL CONFIGURATIONS")
-        leftovers_label.add_css_class("sidebar-group-label")
-        leftovers_label.set_xalign(0.0)
-        leftovers_box.append(leftovers_label)
-        
-        self.show_leftovers_toggle = Gtk.ToggleButton(
-            label="Show leftover APT configurations"
-        )
-        self.show_leftovers_toggle.connect("toggled", self.on_show_leftovers_toggled)
-        leftovers_box.append(self.show_leftovers_toggle)
-        
-        self.leftovers_revealer = Gtk.Revealer()
-        self.leftovers_revealer.set_reveal_child(self.show_leftovers)
-        leftovers_actions = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        leftovers_actions.set_margin_start(12)
-        
-        self.select_all_leftovers_check = Gtk.CheckButton(
-            label="Select all leftover configurations"
-        )
-        self.select_all_leftovers_check.connect("toggled", self.on_select_all_leftovers_toggled)
-        leftovers_actions.append(self.select_all_leftovers_check)
-        
-        self.purge_leftovers_button = Gtk.Button(
-            label="Purge selected configurations"
-        )
-        self.purge_leftovers_button.add_css_class("destructive-action")
-        self.purge_leftovers_button.connect("clicked", self.on_purge_leftovers_clicked)
-        leftovers_actions.append(self.purge_leftovers_button)
-        
-        self.leftovers_revealer.set_child(leftovers_actions)
-        leftovers_box.append(self.leftovers_revealer)
-        
-        content_box.append(leftovers_box)
-        
         # 4. SELECTION
         selection_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         selection_label = Gtk.Label(label="SELECTION")
@@ -2162,6 +2515,7 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         package_ids = [app.package_id for app in leftovers]
+        size_estimate = get_removal_size_estimate(leftovers)
         lines = [
             "These packages are already removed. Only their configuration files remain.",
             "Purging permanently deletes those configuration files; it does not uninstall "
@@ -2171,6 +2525,8 @@ class MainWindow(Adw.ApplicationWindow):
             "unused Flatpak runtimes.",
             "",
             "Configurations that will be purged:",
+            "",
+            size_estimate,
             "",
             *[f"• {package_id}" for package_id in package_ids[:30]],
         ]
@@ -3870,6 +4226,15 @@ class MainWindow(Adw.ApplicationWindow):
                   "Safety reminder: For APT changes, consider creating a Timeshift "
                 "or system snapshot before continuing."
              )
+        apt_package_ids = (
+            apt_preview.get("removed_packages", [])
+            if apt_preview
+            else []
+        )
+        lines.append("")
+        lines.append(
+            get_removal_size_estimate(removable, apt_package_ids=apt_package_ids)
+        )
         message = "\n".join(lines)
         
         

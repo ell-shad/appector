@@ -5,6 +5,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
+from urllib.parse import unquote, urlsplit
 
 from .models import AppEntry
 
@@ -822,10 +823,72 @@ def scan_flatpak() -> List[AppEntry]:
 
 def scan_appimage() -> List[AppEntry]:
     apps = []
+    home = Path.home()
+    integrated_sources = set()
+
+    desktop_dir = home / ".local/share/applications"
+    for desktop_path in desktop_dir.glob("app-manager-appimage-*.desktop"):
+        try:
+            content = desktop_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        if "X-AppManager-Installed-AppImage=true" not in content:
+            continue
+
+        appimage_path = next(
+            (
+                line.partition("=")[2].strip()
+                for line in content.splitlines()
+                if line.startswith("X-AppManager-AppImage-Path=")
+            ),
+            "",
+        )
+        if not appimage_path:
+            continue
+        appimage = Path(appimage_path)
+        if not appimage.is_file() or not appimage_path.startswith(
+            str(home / ".local/share/app-manager/appimages") + "/"
+        ):
+            continue
+        source_uri = next(
+            (
+                line.partition("=")[2].strip()
+                for line in content.splitlines()
+                if line.startswith("X-AppManager-Source-URI=")
+            ),
+            "",
+        )
+        parsed_source_uri = urlsplit(source_uri)
+        if parsed_source_uri.scheme == "file":
+            integrated_sources.add(unquote(parsed_source_uri.path))
+
+        name, _, _, _, icon, _ = parse_desktop_file(str(desktop_path))
+        try:
+            installed_at = datetime.fromtimestamp(
+                appimage.stat().st_mtime
+            ).date().isoformat()
+        except OSError:
+            installed_at = None
+        apps.append(
+            AppEntry(
+                name=name or appimage.stem,
+                manager="AppImage",
+                source="Integrated AppImage",
+                package_id=str(appimage),
+                installed_at=installed_at,
+                category="Other",
+                is_gui_app=True,
+                details=str(appimage),
+                icon=icon,
+                exec_name=appimage.stem.lower(),
+                removal_paths=[str(desktop_path), str(appimage)],
+            )
+        )
 
     search_dirs = [
-        Path.home() / "Applications",
-        Path.home() / "Downloads",
+        home / "Applications",
+        home / "Downloads",
         Path("/opt"),
         Path("/usr/local/bin"),
     ]
@@ -835,12 +898,22 @@ def scan_appimage() -> List[AppEntry]:
             continue
 
         try:
-            for path in directory.glob("*.AppImage"):
+            for path in directory.iterdir():
+                if not path.is_file() or path.suffix.lower() != ".appimage":
+                    continue
+                try:
+                    if str(path.resolve()) in integrated_sources:
+                        continue
+                except OSError:
+                    pass
                 try:
                     st = path.stat()
                     installed_at = datetime.fromtimestamp(st.st_mtime).date().isoformat()
                 except Exception:
                     installed_at = None
+
+                if any(app.package_id == str(path) for app in apps):
+                    continue
 
                 name = path.stem.replace("_", " ").replace("-", " ").title()
                 exec_name = path.stem.lower()
@@ -901,6 +974,15 @@ def scan_manual_apps(
                 name, categories, no_display, hidden, icon, exec_line = parse_desktop_file(
                     str(desktop_path)
                 )
+                try:
+                    with desktop_path.open("r", encoding="utf-8", errors="replace") as desktop_file:
+                        if any(
+                            line.strip() == "X-AppManager-Installed-AppImage=true"
+                            for line in desktop_file
+                        ):
+                            continue
+                except OSError:
+                    continue
                 if no_display or hidden or not name or not exec_line:
                     continue
 
@@ -1045,7 +1127,6 @@ def scan_all() -> List[AppEntry]:
         scan_flatpak,
         scan_appimage,
         scan_manual_apps,
-        scan_leftover_configs,
     ]
 
     for scanner in scanners:
