@@ -61,115 +61,125 @@ class MainWindow(Adw.ApplicationWindow):
         self.progress_window = None
         self.install_progress_window = None
         self._selection_ui_pending = False
-        
-        self._setup_css()
+
         self._setup_actions()
 
         # ------------------------------------------------------------
-        # Header Bar (Redesigned)
+        # Header
         # ------------------------------------------------------------
         header = Adw.HeaderBar()
+
         self.window_title = Adw.WindowTitle(
             title="App Manager",
             subtitle="Unified installed app inventory",
         )
+
         header.set_title_widget(self.window_title)
 
-        # Left: Sidebar toggle
-        self.sidebar_toggle_btn = Gtk.ToggleButton(
-            icon_name="sidebar-show-symbolic", 
-            tooltip_text="Toggle Sidebar"
-        )
-        self.sidebar_toggle_btn.set_active(True)
-        self.sidebar_toggle_btn.connect("toggled", self.on_sidebar_toggle_btn_toggled)
-        header.pack_start(self.sidebar_toggle_btn)
+        self.log_button = Gtk.Button(label="Log")
+        self.log_button.set_tooltip_text("Show recent action log")
+        self.log_button.add_css_class("flat")
+        self.log_button.connect("clicked", self.on_show_log_clicked)
+        header.pack_end(self.log_button)
 
-        # ------------------------------------------------------------
-        # Install menu (+)
-        # ------------------------------------------------------------
-        install_menu_model = Gio.Menu()
-        install_menu_model.append("Install .deb…", "win.install-deb")
-        install_menu_model.append("Install Flatpak…", "win.install-flatpak")
-
-        if not hasattr(self, "install_menu_btn"):
-            self.install_menu_btn = Gtk.MenuButton()
-            self.install_menu_btn.set_icon_name("list-add-symbolic")
-            self.install_menu_btn.set_tooltip_text("Install")
-            header.pack_start(self.install_menu_btn)
-
-        self.install_menu_btn.set_menu_model(install_menu_model)
-
-        # Right: Refresh
-        self.reload_button = Gtk.Button(
-            icon_name="view-refresh-symbolic", 
-            tooltip_text="Refresh"
-        )
+        self.reload_button = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
+        self.reload_button.set_tooltip_text("Refresh")
         self.reload_button.add_css_class("flat")
-        self.reload_button.set_action_name("win.refresh")
+        self.reload_button.connect("clicked", self.on_reload_clicked)
+
+        try:
+            self.reload_button.add_css_class("circular")
+        except Exception:
+            pass
+
         header.pack_end(self.reload_button)
 
         # ------------------------------------------------------------
-        # Primary menu
-        # ------------------------------------------------------------
-        primary_menu_model = Gio.Menu()
-
-        maintenance_section = Gio.Menu()
-        maintenance_section.append("Clean orphaned packages", "win.clean-orphans")
-        maintenance_section.append("Clean unused runtimes", "win.clean-runtimes")
-        primary_menu_model.append_section("Maintenance", maintenance_section)
-
-        misc_section = Gio.Menu()
-        misc_section.append("Activity Log", "win.show-log")
-        misc_section.append("Keyboard Shortcuts", "win.shortcuts")
-        misc_section.append("About App Manager", "win.about")
-        primary_menu_model.append_section(None, misc_section)
-
-        if not hasattr(self, "primary_menu_btn"):
-            self.primary_menu_btn = Gtk.MenuButton()
-            self.primary_menu_btn.set_icon_name("open-menu-symbolic")
-            self.primary_menu_btn.set_tooltip_text("Main Menu")
-            header.pack_end(self.primary_menu_btn)
-
-        self.primary_menu_btn.set_menu_model(primary_menu_model)
-
-        # ------------------------------------------------------------
-        # Data model & Column View (Unchanged)
+        # Data model
         # ------------------------------------------------------------
         self.list_store = Gio.ListStore(item_type=AppItem)
+
         self.custom_filter = Gtk.CustomFilter.new(self.filter_func)
         self.filter_model = Gtk.FilterListModel.new(self.list_store, self.custom_filter)
+
         self.sort_model = Gtk.SortListModel.new(self.filter_model)
+
         self.selection = Gtk.MultiSelection.new(self.sort_model)
         self.selection.connect("selection-changed", self.on_selection_changed)
 
+        # ------------------------------------------------------------
+        # Column view
+        # ------------------------------------------------------------
         self.column_view = Gtk.ColumnView(model=self.selection)
         self.column_view.set_show_column_separators(True)
+
         try:
             self.column_view.set_show_row_separators(True)
         except AttributeError:
             pass
+
         try:
             self.column_view.set_reorderable(False)
         except AttributeError:
             pass
+
         self.column_view.connect("activate", self.on_activate)
         self.column_view.connect("notify::sorter", self.on_sorter_changed)
+
         self.column_view.set_hexpand(True)
         self.column_view.set_vexpand(True)
 
         marked_column = self.create_check_column()
         name_column = self.create_name_column()
-        source_column = self.create_column("Source", "source", expand=False, min_width=180, fixed_width=220)
-        installed_column = self.create_column("Installed", "installed_at", expand=False, min_width=130, fixed_width=150)
-        manager_column = self.create_manager_column()
-        version_column = self.create_column("Version", "version", expand=False, min_width=120, fixed_width=160)
 
-        for column in [marked_column, name_column, source_column, installed_column, manager_column, version_column]:
+        source_column = self.create_column(
+            "Source",
+            "source",
+            expand=False,
+            min_width=180,
+            fixed_width=220,
+        )
+
+        installed_column = self.create_column(
+            "Installed",
+            "installed_at",
+            expand=False,
+            min_width=130,
+            fixed_width=150,
+        )
+
+        manager_column = self.create_column(
+            "Manager",
+            "manager",
+            expand=False,
+            min_width=110,
+            fixed_width=120,
+        )
+
+        version_column = self.create_column(
+            "Version",
+            "version",
+            expand=False,
+            min_width=120,
+            fixed_width=160,
+        )
+
+        for column in [
+            marked_column,
+            name_column,
+            source_column,
+            installed_column,
+            manager_column,
+            version_column,
+        ]:
             self.column_view.append_column(column)
-            
         self.column_widgets = {
-            "marked": marked_column, "name": name_column, "source": source_column,
-            "installed": installed_column, "manager": manager_column, "version": version_column,
+            "marked": marked_column,
+            "name": name_column,
+            "source": source_column,
+            "installed": installed_column,
+            "manager": manager_column,
+            "version": version_column,
         }
 
         self.restore_ui_state()
@@ -179,7 +189,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.column_view.sort_by_column(name_column, Gtk.SortType.ASCENDING)
         except AttributeError:
             self.sort_model.set_sorter(name_column.get_sorter())
-            
+
         sorter = self.column_view.get_sorter()
         if sorter:
             self.sort_model.set_sorter(sorter)
@@ -187,24 +197,44 @@ class MainWindow(Adw.ApplicationWindow):
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         scrolled.set_child(self.column_view)
+
         scrolled.set_hexpand(True)
         scrolled.set_vexpand(True)
+        self.main_stack = Gtk.Stack()
+        self.main_stack.set_hexpand(True)
+        self.main_stack.set_vexpand(True)
 
+        self.empty_page = Adw.StatusPage()
+        self.empty_page.set_icon_name("edit-find-symbolic")
+        self.empty_page.set_title("No apps found")
+        self.empty_page.set_description("Try changing your search or filters.")
+
+        self.main_stack.add_named(scrolled, "list")
+        self.main_stack.add_named(self.empty_page, "empty")
+
+        self.filter_model.connect("items-changed", self.on_filter_items_changed)
+
+        # ------------------------------------------------------------
+        # Context menu
+        # ------------------------------------------------------------
         self._setup_context_menu()
 
+        # ------------------------------------------------------------
         # Contextual selection action bar
+        # ------------------------------------------------------------
         self.action_bar = Gtk.ActionBar()
+
         self.selection_label = Gtk.Label(label="0 selected")
         self.selection_label.add_css_class("dim-label")
         self.selection_label.set_margin_end(12)
-        
+
         self.mark_button = Gtk.Button(label="Mark")
         self.mark_button.set_tooltip_text("Mark selected apps for removal")
         self.mark_button.add_css_class("suggested-action")
         self.mark_button.add_css_class("pill")
         self.mark_button.set_sensitive(False)
         self.mark_button.connect("clicked", self.on_mark_clicked)
-        
+
         self.unmark_button = Gtk.Button(label="Unmark")
         self.unmark_button.set_tooltip_text("Unmark selected apps")
         self.unmark_button.add_css_class("pill")
@@ -220,38 +250,33 @@ class MainWindow(Adw.ApplicationWindow):
         self.action_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_UP)
         self.action_revealer.set_reveal_child(False)
 
-        # Main Stack for Empty States
-        self.main_stack = Gtk.Stack()
-        self.main_stack.set_hexpand(True)
-        self.main_stack.set_vexpand(True)
-
-        self.empty_page = Adw.StatusPage()
-        self.empty_page.set_icon_name("edit-find-symbolic")
-        self.empty_page.set_title("No apps found")
-        self.empty_page.set_description("Try changing your search or filters.")
-
-        self.main_stack.add_named(scrolled, "list")
-        self.main_stack.add_named(self.empty_page, "empty")
-        self.filter_model.connect("items-changed", self.on_filter_items_changed)
-
+        # ------------------------------------------------------------
         # Sidebar
-        self.sidebar_revealer = self._build_sidebar()
-        sidebar_wrap = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        sidebar_wrap.set_hexpand(False)
-        sidebar_wrap.append(self.sidebar_revealer)
-        sidebar_wrap.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        # ------------------------------------------------------------
+        self.sidebar_expanded = True
+        self.sidebar = self._build_sidebar()
 
-        # Main content assembly
+        self.sidebar_wrap = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.sidebar_wrap.set_hexpand(False)
+
+        self.sidebar_wrap.append(self.sidebar)
+        self.sidebar_wrap.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+
+        # ------------------------------------------------------------
+        # Main content
+        # ------------------------------------------------------------
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         main_box.set_hexpand(True)
         main_box.set_vexpand(True)
+
         main_box.append(self.main_stack)
         main_box.append(self.action_revealer)
 
         content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         content.set_hexpand(True)
         content.set_vexpand(True)
-        content.append(sidebar_wrap)
+
+        content.append(self.sidebar_wrap)
         content.append(main_box)
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -263,9 +288,6 @@ class MainWindow(Adw.ApplicationWindow):
         self.toast_overlay = Adw.ToastOverlay()
         self.toast_overlay.set_child(outer)
         self.set_content(self.toast_overlay)
-
-        # Initial scan
-        self.on_reload_clicked(self.reload_button)
 
         # Initial scan
         self.on_reload_clicked(self.reload_button)
@@ -1320,148 +1342,45 @@ class MainWindow(Adw.ApplicationWindow):
     # Actions for context menu
     # ------------------------------------------------------------
 
-    def _setup_css(self):
-        css = """
-        .sidebar-group-label {
-            font-size: 0.75em;
-            font-weight: bold;
-            text-transform: uppercase;
-            opacity: 0.6;
-            margin-bottom: 4px;
-            margin-top: 8px;
-        }
-        .manager-badge {
-            font-size: 0.85em;
-            font-weight: bold;
-            border-radius: 6px;
-            padding: 2px 8px;
-        }
-        /* Subtle tinted backgrounds that work in both light and dark themes */
-        .manager-apt { background-color: rgba(224, 27, 36, 0.15); }
-        .manager-snap { background-color: rgba(255, 120, 0, 0.15); }
-        .manager-flatpak { background-color: rgba(28, 113, 216, 0.15); }
-        .manager-appimage { background-color: rgba(38, 162, 105, 0.15); }
-        .manager-leftover { background-color: rgba(119, 118, 123, 0.15); }
-        """
-        provider = Gtk.CssProvider()
-        try:
-            provider.load_from_string(css)
-        except AttributeError:
-            provider.load_from_data(css.encode(), len(css.encode()))
-            
-        Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(),
-            provider,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-        )
-
     def _setup_actions(self):
-        # Remove previous win group if this method is re-run during development
-        try:
-            self.insert_action_group("win", None)
-        except Exception:
-            pass
+        self.action_details = Gio.SimpleAction.new("details", None)
+        self.action_details.connect("activate", self.on_action_details)
+        self.action_details.set_enabled(False)
+
+        self.action_mark_selected = Gio.SimpleAction.new("mark-selected", None)
+        self.action_mark_selected.connect("activate", self.on_action_mark_selected)
+        self.action_mark_selected.set_enabled(False)
+
+        self.action_unmark_selected = Gio.SimpleAction.new("unmark-selected", None)
+        self.action_unmark_selected.connect("activate", self.on_action_unmark_selected)
+        self.action_unmark_selected.set_enabled(False)
+
+        self.action_remove_marked = Gio.SimpleAction.new("remove-marked", None)
+        self.action_remove_marked.connect("activate", self.on_action_remove_marked)
+        self.action_remove_marked.set_enabled(False)
+
+        self.action_mark_all_visible = Gio.SimpleAction.new("mark-all-visible", None)
+        self.action_mark_all_visible.connect("activate", self.on_action_mark_all_visible)
+        self.action_mark_all_visible.set_enabled(True)
+
+        self.action_unmark_all_visible = Gio.SimpleAction.new("unmark-all-visible", None)
+        self.action_unmark_all_visible.set_enabled(True)
+
+        self.action_clear_all_marks = Gio.SimpleAction.new("clear-all-marks", None)
+        self.action_clear_all_marks.connect("activate", self.on_action_clear_all_marks)
+        self.action_clear_all_marks.set_enabled(False)
 
         self.action_group = Gio.SimpleActionGroup.new()
 
-        # ------------------------------------------------------------
-        # Context menu / selection actions
-        # ------------------------------------------------------------
-        def add_context_action(action_name, method_name, enabled=False):
-            action = Gio.SimpleAction.new(action_name, None)
-            callback = getattr(self, method_name, None)
+        self.action_group.add_action(self.action_details)
+        self.action_group.add_action(self.action_mark_selected)
+        self.action_group.add_action(self.action_unmark_selected)
+        self.action_group.add_action(self.action_remove_marked)
+        self.action_group.add_action(self.action_mark_all_visible)
+        self.action_group.add_action(self.action_unmark_all_visible)
+        self.action_group.add_action(self.action_clear_all_marks)
 
-            if callback:
-                action.connect("activate", callback)
-            else:
-                action.connect(
-                    "activate",
-                    lambda a, p, n=method_name: self.show_message(
-                        "Not available",
-                        f"{n} is not implemented yet.",
-                        Gtk.MessageType.WARNING,
-                    ),
-                )
-
-            action.set_enabled(enabled)
-            self.action_group.add_action(action)
-            setattr(self, f"action_{action_name.replace('-', '_')}", action)
-
-        add_context_action("details", "on_action_details", False)
-        add_context_action("mark-selected", "on_action_mark_selected", False)
-        add_context_action("unmark-selected", "on_action_unmark_selected", False)
-        add_context_action("remove-marked", "on_action_remove_marked", False)
-        add_context_action("mark-all-visible", "on_action_mark_all_visible", True)
-        add_context_action("unmark-all-visible", "on_action_unmark_all_visible", True)
-        add_context_action("clear-all-marks", "on_action_clear_all_marks", False)
-
-        # ------------------------------------------------------------
-        # Header / main-menu actions
-        # ------------------------------------------------------------
-        def add_window_action(action_name, method_name):
-            action = Gio.SimpleAction.new(action_name, None)
-            callback = getattr(self, method_name, None)
-
-            if callback:
-                # Most window actions accept no arguments.
-                action.connect("activate", lambda a, p, cb=callback: cb())
-            else:
-                action.connect(
-                    "activate",
-                    lambda a, p, n=method_name: self.show_message(
-                        "Not available",
-                        f"{n} is not implemented yet.",
-                        Gtk.MessageType.WARNING,
-                    ),
-                )
-
-            action.set_enabled(True)
-            self.action_group.add_action(action)
-            setattr(self, f"action_{action_name.replace('-', '_')}", action)
-
-        add_window_action("install-deb", "on_install_deb_clicked")
-        add_window_action("install-flatpak", "on_install_flatpak_clicked")
-
-        add_window_action("clean-orphans", "on_autoremove_clicked")
-        add_window_action("clean-runtimes", "on_flatpak_cleanup_clicked")
-
-        add_window_action("show-log", "on_show_log_clicked")
-        add_window_action("refresh", "on_reload_clicked")
-
-        add_window_action("mark-all", "mark_all_visible")
-        add_window_action("clear-marks", "clear_all_marks")
-
-        add_window_action("toggle-search", "_focus_search")
-        add_window_action("shortcuts", "show_shortcuts_window")
-        add_window_action("about", "show_about_dialog")
-
-        # ------------------------------------------------------------
-        # Insert action group
-        # ------------------------------------------------------------
         self.insert_action_group("win", self.action_group)
-
-        # ------------------------------------------------------------
-        # Keyboard shortcuts
-        # ------------------------------------------------------------
-        app = self.get_application()
-
-        if app:
-            try:
-                app.set_accels_for_action("win.install-deb", ["<Ctrl>o"])
-                app.set_accels_for_action("win.show-log", ["<Ctrl>l"])
-                app.set_accels_for_action("win.refresh", ["<Ctrl>r"])
-                app.set_accels_for_action("win.mark-all", ["<Ctrl>a"])
-                app.set_accels_for_action("win.clear-marks", ["<Ctrl><Shift>a"])
-                app.set_accels_for_action("win.toggle-search", ["<Ctrl>f"])
-                app.set_accels_for_action("win.remove-marked", ["Delete"])
-            except Exception:
-                pass
-
-
-        
-    def on_sidebar_toggle_btn_toggled(self, button):
-        if hasattr(self, "sidebar_revealer"):
-            self.sidebar_revealer.set_reveal_child(button.get_active())
 
     def _setup_context_menu(self):
         empty_model = Gio.Menu()
@@ -1531,105 +1450,6 @@ class MainWindow(Adw.ApplicationWindow):
         self.action_unmark_selected.set_enabled(unmark_enabled)
         self.action_remove_marked.set_enabled(remove_marked_enabled)
 
-
-    def show_about_dialog(self):
-        if hasattr(Adw, "AboutWindow"):
-            about = Adw.AboutWindow(
-                transient_for=self,
-                application_name="App Manager",
-                version="1.0.0",
-                developer_name="App Manager Developers",
-                copyright="© 2024 App Manager Developers",
-            )
-            about.present()
-        else:
-            about = Gtk.AboutDialog(
-                transient_for=self,
-                modal=True,
-            )
-            about.set_program_name("App Manager")
-            about.set_version("1.0.0")
-            about.set_comments("Unified installed app inventory")
-            about.present()
-
-
-    def _focus_search(self):
-        if hasattr(self, "search_entry"):
-            self.search_entry.grab_focus()
-
-    def show_shortcuts_window(self):
-        ui = """
-        <interface>
-          <object class="GtkShortcutsWindow" id="shortcuts">
-            <property name="modal">1</property>
-            <child>
-              <object class="GtkShortcutsSection">
-                <property name="section-name">shortcuts</property>
-                <child>
-                  <object class="GtkShortcutsGroup">
-                    <property name="title">General</property>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Search</property>
-                        <property name="accelerator">&lt;Ctrl&gt;f</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Refresh</property>
-                        <property name="accelerator">&lt;Ctrl&gt;r</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Install .deb</property>
-                        <property name="accelerator">&lt;Ctrl&gt;o</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Activity Log</property>
-                        <property name="accelerator">&lt;Ctrl&gt;l</property>
-                      </object>
-                    </child>
-                  </object>
-                </child>
-                <child>
-                  <object class="GtkShortcutsGroup">
-                    <property name="title">Selection</property>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Mark all visible</property>
-                        <property name="accelerator">&lt;Ctrl&gt;a</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Clear marks</property>
-                        <property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;a</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Remove marked</property>
-                        <property name="accelerator">Delete</property>
-                      </object>
-                    </child>
-                  </object>
-                </child>
-              </object>
-            </child>
-          </object>
-        </interface>
-        """
-
-        builder = Gtk.Builder.new_from_string(ui, -1)
-        win = builder.get_object("shortcuts")
-
-        if win:
-            win.set_transient_for(self)
-            win.present()
-
     # ------------------------------------------------------------
     # Sidebar
     # ------------------------------------------------------------
@@ -1683,136 +1503,209 @@ class MainWindow(Adw.ApplicationWindow):
         return label
 
     def _build_sidebar(self):
-        sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        sidebar_box.set_size_request(260, -1)
-        
-        # Scrolled window for top groups
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scrolled.set_vexpand(True)
-        
-        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        content_box.set_margin_top(12)
-        content_box.set_margin_bottom(12)
-        content_box.set_margin_start(12)
-        content_box.set_margin_end(12)
-        
-        # 1. Search
+        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        sidebar.set_size_request(210, -1)
+        sidebar.set_hexpand(False)
+
+        sidebar.set_margin_top(8)
+        sidebar.set_margin_bottom(8)
+        sidebar.set_margin_start(8)
+        sidebar.set_margin_end(8)
+
+        try:
+            sidebar.add_css_class("background")
+        except Exception:
+            pass
+
+        # ------------------------------------------------------------
+        # Top row: hide sidebar button on right side
+        # ------------------------------------------------------------
+        top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+
+        self.sidebar_expand_button = Gtk.Button(label="«")
+        self.sidebar_expand_button.set_tooltip_text("Hide sidebar")
+        self.sidebar_expand_button.add_css_class("flat")
+        self.sidebar_expand_button.set_halign(Gtk.Align.END)
+        self.sidebar_expand_button.set_hexpand(True)
+        self.sidebar_expand_button.connect("clicked", self.on_sidebar_expand_toggled)
+
+        top_row.append(self.sidebar_expand_button)
+        sidebar.append(top_row)
+
+        # ------------------------------------------------------------
+        # Sidebar controls
+        # ------------------------------------------------------------
+        self.sidebar_controls = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=6,
+        )
+
+        # Search
         self.search_entry = Gtk.SearchEntry()
-        self.search_entry.set_placeholder_text("Search apps")
+        self.search_entry.set_placeholder_text("Search")
         self.search_entry.connect("search-changed", self.on_search_changed)
-        content_box.append(self.search_entry)
-        
-        # 2. FILTER
-        filter_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        filter_label = Gtk.Label(label="FILTER")
-        filter_label.add_css_class("sidebar-group-label")
-        filter_label.set_xalign(0.0)
-        filter_box.append(filter_label)
-        
-        self.marked_only_toggle = Gtk.ToggleButton(label="Marked only")
-        self.marked_only_toggle.connect("toggled", self.on_marked_only_toggled)
-        filter_box.append(self.marked_only_toggle)
-        
-        self.duplicates_only_toggle = Gtk.ToggleButton(label="Duplicates only")
-        self.duplicates_only_toggle.connect("toggled", self.on_duplicates_only_toggled)
-        filter_box.append(self.duplicates_only_toggle)
-        
-        self.show_advanced_apps_toggle = Gtk.ToggleButton(label="Show advanced apps")
-        self.show_advanced_apps_toggle.connect("toggled", self.on_show_advanced_apps_toggled)
-        filter_box.append(self.show_advanced_apps_toggle)
-        
-        self.hide_basic_apps_toggle = Gtk.ToggleButton(label="Hide normal apps")
-        self.hide_basic_apps_toggle.connect("toggled", self.on_hide_basic_apps_toggled)
-        filter_box.append(self.hide_basic_apps_toggle)
-        
-        content_box.append(filter_box)
-        
-        # 3. LEFTOVERS
-        leftovers_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        leftovers_label = Gtk.Label(label="LEFTOVERS")
-        leftovers_label.add_css_class("sidebar-group-label")
-        leftovers_label.set_xalign(0.0)
-        leftovers_box.append(leftovers_label)
-        
-        self.show_leftovers_toggle = Gtk.ToggleButton(label="Show leftovers")
-        self.show_leftovers_toggle.connect("toggled", self.on_show_leftovers_toggled)
-        leftovers_box.append(self.show_leftovers_toggle)
-        
-        self.leftovers_revealer = Gtk.Revealer()
-        self.leftovers_revealer.set_reveal_child(self.show_leftovers)
-        leftovers_actions = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        leftovers_actions.set_margin_start(12)
-        
-        self.select_all_leftovers_check = Gtk.CheckButton(label="Select all leftovers")
-        self.select_all_leftovers_check.connect("toggled", self.on_select_all_leftovers_toggled)
-        leftovers_actions.append(self.select_all_leftovers_check)
-        
-        self.purge_leftovers_button = Gtk.Button(label="Purge leftovers")
-        self.purge_leftovers_button.add_css_class("destructive-action")
-        self.purge_leftovers_button.connect("clicked", self.on_purge_leftovers_clicked)
-        leftovers_actions.append(self.purge_leftovers_button)
-        
-        self.leftovers_revealer.set_child(leftovers_actions)
-        leftovers_box.append(self.leftovers_revealer)
-        
-        content_box.append(leftovers_box)
-        
-        # 4. SELECTION
-        selection_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        selection_label = Gtk.Label(label="SELECTION")
-        selection_label.add_css_class("sidebar-group-label")
-        selection_label.set_xalign(0.0)
-        selection_box.append(selection_label)
-        
-        selection_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        selection_btns.set_homogeneous(True)
-        
-        self.mark_all_button = Gtk.Button(label="Mark all")
-        self.mark_all_button.set_action_name("win.mark-all")
-        selection_btns.append(self.mark_all_button)
-        
-        self.clear_all_marks_button = Gtk.Button(label="Clear marks")
-        self.clear_all_marks_button.set_action_name("win.clear-marks")
-        selection_btns.append(self.clear_all_marks_button)
-        
-        selection_box.append(selection_btns)
-        content_box.append(selection_box)
-        
-        scrolled.set_child(content_box)
-        sidebar_box.append(scrolled)
-        
-        # 5. Pinned footer
-        footer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        footer_box.set_margin_top(12)
-        footer_box.set_margin_bottom(12)
-        footer_box.set_margin_start(12)
-        footer_box.set_margin_end(12)
-        
-        footer_box.append(Gtk.Separator())
-        
+
+        # Remove button
         self.remove_marked_button = Gtk.Button()
+        self.remove_marked_button.set_tooltip_text("Remove marked apps")
         self.remove_marked_button.add_css_class("destructive-action")
-        self.remove_marked_button.set_hexpand(True)
-        self.remove_marked_button.set_action_name("win.remove-marked")
-        
-        remove_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.remove_marked_button.set_sensitive(False)
+        self.remove_marked_button.connect("clicked", self.on_remove_marked_clicked)
+
+        remove_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         remove_box.set_halign(Gtk.Align.CENTER)
+
         remove_icon = Gtk.Image.new_from_icon_name("user-trash-symbolic")
         self.remove_marked_label = Gtk.Label(label="Remove (0)")
+
         remove_box.append(remove_icon)
         remove_box.append(self.remove_marked_label)
+
         self.remove_marked_button.set_child(remove_box)
-        
-        footer_box.append(self.remove_marked_button)
-        sidebar_box.append(footer_box)
-        
-        revealer = Gtk.Revealer()
-        revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
-        revealer.set_reveal_child(True)
-        revealer.set_child(sidebar_box)
-        
-        return revealer
+
+        # Mark all
+        mark_all_button = Gtk.Button(label="Mark all")
+        mark_all_button.set_tooltip_text("Mark all visible apps")
+        mark_all_button.add_css_class("flat")
+        mark_all_button.connect("clicked", self.on_mark_all_visible_clicked)
+
+        # Clear marks
+        self.clear_all_marks_button = Gtk.Button(label="Clear marks")
+        self.clear_all_marks_button.set_tooltip_text("Clear all marked apps")
+        self.clear_all_marks_button.add_css_class("flat")
+        self.clear_all_marks_button.set_sensitive(False)
+        self.clear_all_marks_button.connect("clicked", self.on_clear_all_marks_clicked)
+
+        # ------------------------------------------------------------
+        # View group
+        # ------------------------------------------------------------
+        self.marked_only_toggle = Gtk.ToggleButton(label="Marked only")
+        self.marked_only_toggle.add_css_class("flat")
+        self.marked_only_toggle.set_sensitive(False)
+        self.marked_only_toggle.connect("toggled", self.on_marked_only_toggled)
+
+        self.duplicates_only_toggle = Gtk.ToggleButton(label="Duplicates only")
+        self.duplicates_only_toggle.add_css_class("flat")
+        self.duplicates_only_toggle.connect("toggled", self.on_duplicates_only_toggled)
+
+        view_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        view_box.append(self.marked_only_toggle)
+        view_box.append(self.duplicates_only_toggle)
+
+        view_expander = self._sidebar_group("View", view_box)
+
+        # ------------------------------------------------------------
+        # Tools group
+        # ------------------------------------------------------------
+        self.install_deb_button = Gtk.Button(label="Install .deb")
+        self.install_deb_button.set_tooltip_text("Install a local .deb package")
+        self.install_deb_button.add_css_class("flat")
+        self.install_deb_button.connect("clicked", self.on_install_deb_clicked)
+
+        self.install_flatpak_button = Gtk.Button(label="Install Flatpak")
+        self.install_flatpak_button.set_tooltip_text("Install an app from Flathub")
+        self.install_flatpak_button.add_css_class("flat")
+        self.install_flatpak_button.connect("clicked", self.on_install_flatpak_clicked)
+
+        tools_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        tools_box.append(self.install_deb_button)
+        tools_box.append(self.install_flatpak_button)
+
+        tools_expander = self._sidebar_group("Tools", tools_box)
+
+        # ------------------------------------------------------------
+        # Cleanup group
+        # ------------------------------------------------------------
+        self.autoremove_button = Gtk.Button(label="Clean orphaned packages")
+        self.autoremove_button.set_tooltip_text(
+            "Remove orphaned APT dependencies that are no longer needed"
+        )
+        self.autoremove_button.add_css_class("flat")
+        self.autoremove_button.connect("clicked", self.on_autoremove_clicked)
+
+        self.flatpak_cleanup_button = Gtk.Button(label="Clean unused runtimes")
+        self.flatpak_cleanup_button.set_tooltip_text(
+            "Remove unused Flatpak runtimes to free disk space"
+        )
+        self.flatpak_cleanup_button.add_css_class("flat")
+        self.flatpak_cleanup_button.connect("clicked", self.on_flatpak_cleanup_clicked)
+
+        cleanup_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        cleanup_box.append(self.autoremove_button)
+        cleanup_box.append(self.flatpak_cleanup_button)
+
+        cleanup_expander = self._sidebar_group("Cleanup", cleanup_box)
+
+        # ------------------------------------------------------------
+        # Advanced group
+        # ------------------------------------------------------------
+        advanced_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+
+        self.show_leftovers_check = Gtk.CheckButton(label="Show leftovers")
+        self.show_leftovers_check.set_tooltip_text(
+            "Show leftover APT configuration packages"
+        )
+        self.show_leftovers_check.set_active(self.show_leftovers)
+        self.show_leftovers_check.connect("toggled", self.on_show_leftovers_toggled)
+
+        self.show_advanced_apps_check = Gtk.CheckButton(label="Show advanced apps")
+        self.show_advanced_apps_check.set_tooltip_text(
+            "Show non-GUI/system items when available"
+        )
+        self.show_advanced_apps_check.set_active(self.show_advanced_apps)
+        self.show_advanced_apps_check.connect("toggled", self.on_show_advanced_apps_toggled)
+
+        self.hide_basic_apps_check = Gtk.CheckButton(label="Hide normal apps")
+        self.hide_basic_apps_check.set_tooltip_text(
+            "Show only advanced/leftover items"
+        )
+        self.hide_basic_apps_check.set_active(self.hide_basic_apps)
+        self.hide_basic_apps_check.connect("toggled", self.on_hide_basic_apps_toggled)
+
+        self.select_all_leftovers_check = Gtk.CheckButton(label="Select all leftovers")
+        self.select_all_leftovers_check.set_tooltip_text(
+            "Mark or unmark all leftover configuration packages"
+        )
+        self.select_all_leftovers_check.set_visible(False)
+        self.select_all_leftovers_check.set_sensitive(False)
+        self.select_all_leftovers_check.connect(
+            "toggled",
+            self.on_select_all_leftovers_toggled,
+        )
+
+        self.purge_leftovers_button = Gtk.Button(label="Purge leftovers")
+        self.purge_leftovers_button.set_tooltip_text(
+            "Purge marked leftover configuration packages"
+        )
+        self.purge_leftovers_button.add_css_class("destructive-action")
+        self.purge_leftovers_button.set_sensitive(False)
+        self.purge_leftovers_button.connect("clicked", self.on_purge_leftovers_clicked)
+
+        advanced_box.append(self.show_leftovers_check)
+        advanced_box.append(self.show_advanced_apps_check)
+        advanced_box.append(self.hide_basic_apps_check)
+        advanced_box.append(Gtk.Separator())
+        advanced_box.append(self.select_all_leftovers_check)
+        advanced_box.append(self.purge_leftovers_button)
+
+        advanced_expander = self._sidebar_group("Advanced", advanced_box)
+
+        # ------------------------------------------------------------
+        # Control order
+        # ------------------------------------------------------------
+        self.sidebar_controls.append(self.search_entry)
+        self.sidebar_controls.append(self.remove_marked_button)
+        self.sidebar_controls.append(mark_all_button)
+        self.sidebar_controls.append(self.clear_all_marks_button)
+        self.sidebar_controls.append(view_expander)
+        self.sidebar_controls.append(tools_expander)
+        self.sidebar_controls.append(cleanup_expander)
+        self.sidebar_controls.append(advanced_expander)
+
+        sidebar.append(self.sidebar_controls)
+
+        return sidebar
         
     def _sidebar_group(self, title, child_box):
         child_box.set_margin_start(10)
@@ -1909,17 +1802,26 @@ class MainWindow(Adw.ApplicationWindow):
 
         message = "\n".join(lines)
 
-        title = f"Remove {len(packages)} orphaned packages?"
-        
-        def do_autoremove():
-            self.install_progress_window = InstallProgressWindow(self, "Removing orphaned packages")
-            self.install_progress_window.present()
-            self.install_progress_window.start_pulse()
-            self.install_progress_window.set_status("Removing orphaned packages…")
-            thread = threading.Thread(target=self.autoremove_worker, daemon=True)
-            thread.start()
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+        )
+        dialog.set_resizable(False)
+        dialog.set_property("message-type", Gtk.MessageType.WARNING)
+        dialog.set_property(
+            "text",
+            f"Remove {len(packages)} orphaned packages?",
+        )
+        dialog.set_property("secondary-text", message)
 
-        self._show_confirm_dialog(title, message, "Remove", do_autoremove)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+
+        remove_button = dialog.add_button("Remove", Gtk.ResponseType.OK)
+        remove_button.add_css_class("destructive-action")
+
+        dialog.connect("response", self.on_autoremove_confirm_response)
+        dialog.present()
+
         return False
 
     def on_autoremove_confirm_response(self, dialog, response):
@@ -2052,17 +1954,26 @@ class MainWindow(Adw.ApplicationWindow):
 
         message = "\n".join(lines)
 
-        title = "Remove unused Flatpak runtimes?"
-        
-        def do_cleanup():
-            self.install_progress_window = InstallProgressWindow(self, "Cleaning Flatpak runtimes")
-            self.install_progress_window.present()
-            self.install_progress_window.start_pulse()
-            self.install_progress_window.set_status("Removing unused Flatpak runtimes…")
-            thread = threading.Thread(target=self.flatpak_cleanup_worker, daemon=True)
-            thread.start()
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+        )
+        dialog.set_resizable(False)
+        dialog.set_property("message-type", Gtk.MessageType.WARNING)
+        dialog.set_property(
+            "text",
+            "Remove unused Flatpak runtimes?",
+        )
+        dialog.set_property("secondary-text", message)
 
-        self._show_confirm_dialog(title, message, "Clean Up", do_cleanup)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+
+        remove_button = dialog.add_button("Clean Up", Gtk.ResponseType.OK)
+        remove_button.add_css_class("destructive-action")
+
+        dialog.connect("response", self.on_flatpak_cleanup_confirm_response)
+        dialog.present()
+
         return False
 
     def on_flatpak_cleanup_confirm_response(self, dialog, response):
@@ -2153,58 +2064,7 @@ class MainWindow(Adw.ApplicationWindow):
             pass
 
         return column
-    def create_manager_column(self):
-        factory = Gtk.SignalListItemFactory()
-        factory.connect("setup", self.on_setup_manager_cell)
-        factory.connect("bind", self.on_bind_manager_cell)
 
-        column = Gtk.ColumnViewColumn.new("Manager", factory)
-        expression = Gtk.PropertyExpression.new(AppItem, None, "manager")
-        sorter = Gtk.StringSorter.new(expression)
-
-        column.set_sorter(sorter)
-        column.set_resizable(True)
-        column.set_expand(False)
-
-        try:
-            column.set_minimum_width(110)
-            column.set_fixed_width(120)
-        except AttributeError:
-            pass
-
-        return column
-
-    def on_setup_manager_cell(self, factory, list_item):
-        label = Gtk.Label()
-        label.set_xalign(0.5)
-        label.set_halign(Gtk.Align.CENTER)
-        label.set_valign(Gtk.Align.CENTER)
-        label.set_margin_top(2)
-        label.set_margin_bottom(2)
-        label.set_margin_start(6)
-        label.set_margin_end(6)
-        label.add_css_class("manager-badge")
-        list_item.set_child(label)
-
-    def on_bind_manager_cell(self, factory, list_item):
-        item = list_item.get_item()
-        label = list_item.get_child()
-        if item is None or label is None:
-            return
-            
-        manager = getattr(item, "manager", "")
-        label.set_label(manager)
-        
-        # Reset classes
-        for cls in ["manager-apt", "manager-snap", "manager-flatpak", "manager-appimage", "manager-leftover"]:
-            label.remove_css_class(cls)
-            
-        # Apply specific tint
-        if manager == "APT": label.add_css_class("manager-apt")
-        elif manager == "Snap": label.add_css_class("manager-snap")
-        elif manager == "Flatpak": label.add_css_class("manager-flatpak")
-        elif manager == "AppImage": label.add_css_class("manager-appimage")
-        elif manager == "Leftover": label.add_css_class("manager-leftover")
     def on_setup_cell(self, factory, list_item):
         label = Gtk.Label()
         label.set_xalign(0.0)
@@ -2215,28 +2075,17 @@ class MainWindow(Adw.ApplicationWindow):
 
     def on_bind_cell(self, factory, list_item, prop):
         item = list_item.get_item()
-        label = list_item.get_child()
-        if item is None or label is None:
-            return
 
         value = getattr(item, prop, "")
-        
-        if prop == "installed_at":
-            if not value:
-                value = "—"
-                label.add_css_class("dim-label")
-            else:
-                label.remove_css_class("dim-label")
+
+        if prop == "installed_at" and not value:
+            value = "Unknown"
         elif prop == "version" and not value:
             value = "-"
         elif prop == "marked_label" and not value:
             value = ""
-            
-        label.set_label(str(value))
-        
-        # Add tooltips for truncated cells
-        if prop in ("source", "version"):
-            label.set_tooltip_text(str(value) if value and value != "-" and value != "—" else "")
+
+        list_item.get_child().set_label(str(value))
 
     # ------------------------------------------------------------
     # Checkbox column
@@ -2560,7 +2409,6 @@ class MainWindow(Adw.ApplicationWindow):
             return
 
         label.set_label(getattr(item, "name", "") or "-")
-        label.set_tooltip_text(getattr(item, "name", "") or "") # <--- ADD THIS
 
         self.set_image_from_icon(image, getattr(item, "icon", ""))
 
@@ -2959,15 +2807,15 @@ class MainWindow(Adw.ApplicationWindow):
     def update_marked_ui(self):
         marked_entries = self.get_marked_entries()
         removable_marked = [app for app in marked_entries if can_remove(app)]
+
         self.removable_marked_count = len(removable_marked)
-        marked_available = len(self.marked_keys) > 0  # <--- ADD THIS LINE
+
+        marked_available = len(self.marked_keys) > 0
 
         if hasattr(self, "remove_marked_label"):
-            self.remove_marked_label.set_label(f"Remove ({self.removable_marked_count})")
-            
-        if hasattr(self, "action_remove_marked"):
-            self.action_remove_marked.set_enabled(self.removable_marked_count > 0)
-
+            self.remove_marked_label.set_label(
+                f"Remove ({self.removable_marked_count})"
+            )
 
         if hasattr(self, "remove_marked_button"):
             self.remove_marked_button.set_tooltip_text(
@@ -3111,8 +2959,6 @@ class MainWindow(Adw.ApplicationWindow):
 
     def on_show_leftovers_toggled(self, button):
         self.show_leftovers = button.get_active()
-        if hasattr(self, "leftovers_revealer"):
-            self.leftovers_revealer.set_reveal_child(self.show_leftovers)
         self._unmark_hidden_advanced_items()
         self.rebuild_list()
 
@@ -3273,12 +3119,26 @@ class MainWindow(Adw.ApplicationWindow):
 
         message = "\n".join(lines)
 
-        title = f"Purge {len(package_ids)} leftover packages?"
-        
-        def do_purge():
-            self.start_purge_leftovers(leftovers)
-            
-        self._show_confirm_dialog(title, message, "Purge", do_purge)
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+        )
+
+        dialog.set_resizable(False)
+        dialog.set_property("message-type", Gtk.MessageType.WARNING)
+        dialog.set_property("text", f"Purge {len(package_ids)} leftover packages?")
+        dialog.set_property("secondary-text", message)
+
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+
+        purge_button = dialog.add_button("Purge", Gtk.ResponseType.OK)
+        purge_button.add_css_class("destructive-action")
+
+        dialog.connect(
+            "response",
+            self.on_purge_leftovers_confirm_response,
+            leftovers,
+        )
 
         dialog.present()
 
@@ -3572,21 +3432,30 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.set_property("text", f"Remove {len(removable)} marked apps?")
         dialog.set_property("secondary-text", message)
 
-        has_apt = any(getattr(app, "manager", "") == "APT" for app in removable)
+        # Purge checkbox (only relevant if APT apps are included)
+        has_apt = any(
+            getattr(app, "manager", "") == "APT"
+            for app in removable
+        )
+
         if has_apt:
             content_area = dialog.get_content_area()
-            purge_check = Gtk.CheckButton(label="Purge configuration files (APT packages)")
-            purge_check.set_tooltip_text("When enabled, APT packages will be purged instead of removed.")
+
+            purge_check = Gtk.CheckButton(
+                label="Purge configuration files (APT packages)"
+            )
+            purge_check.set_tooltip_text(
+                "When enabled, APT packages will be purged instead of removed.\n"
+                "This deletes configuration files as well."
+            )
             content_area.append(purge_check)
+
+            # Store reference on dialog so we can read it later
             dialog.purge_check = purge_check
 
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         remove_button = dialog.add_button("Remove", Gtk.ResponseType.OK)
         remove_button.add_css_class("destructive-action")
-        
-        # Ensure Cancel is the default and Enter doesn't accidentally trigger removal
-        dialog.set_default_response(Gtk.ResponseType.CANCEL)
-        
         dialog.connect("response", self.on_confirm_batch_response, removable)
         dialog.present()
 
@@ -3760,38 +3629,3 @@ class MainWindow(Adw.ApplicationWindow):
         if hidden_keys:
             self.marked_keys.difference_update(hidden_keys)
             self.save_marked_keys()
-
-    def _show_confirm_dialog(self, title, message, confirm_label, on_confirm_callback, *callback_args):
-        if hasattr(Adw, "AlertDialog"):
-            dialog = Adw.AlertDialog.new(title, message)
-            dialog.add_response("cancel", "Cancel")
-            dialog.add_response("confirm", confirm_label)
-            dialog.set_response_appearance("confirm", Adw.ResponseAppearance.DESTRUCTIVE)
-            dialog.set_default_response("cancel")
-            dialog.set_close_response("cancel")
-            
-            def on_response(d, response):
-                if response == "confirm":
-                    on_confirm_callback(*callback_args)
-                    
-            dialog.connect("response", on_response)
-            dialog.present(self)
-        else:
-            dialog = Gtk.MessageDialog(
-                transient_for=self,
-                modal=True,
-                message_type=Gtk.MessageType.WARNING,
-                text=title,
-                secondary_text=message
-            )
-            dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-            confirm_btn = dialog.add_button(confirm_label, Gtk.ResponseType.OK)
-            confirm_btn.add_css_class("destructive-action")
-            dialog.set_default_response(Gtk.ResponseType.CANCEL)
-            
-            def on_response(d, response):
-                if response == Gtk.ResponseType.OK:
-                    on_confirm_callback(*callback_args)
-                    
-            dialog.connect("response", on_response)
-            dialog.present()

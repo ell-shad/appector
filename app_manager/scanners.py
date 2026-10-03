@@ -102,7 +102,17 @@ def find_snap_icon(snap_name: str) -> str:
         pass
 
     return ""
-
+    
+def get_desktop_icon(path) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                line = raw.strip()
+                if line.startswith("Icon="):
+                    return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
 
 def map_categories(categories: List[str]) -> str:
     mapping = {
