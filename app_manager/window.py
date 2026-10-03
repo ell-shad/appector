@@ -21,7 +21,6 @@ from .actions import (
     can_remove,
     execute_batch_removal,
     prepare_apt_batch_preview,
-    install_deb,
     add_flathub_remote,
     flathub_remote_exists,
     install_flatpak_source,
@@ -92,13 +91,14 @@ class MainWindow(Adw.ApplicationWindow):
         # Install menu (+)
         # ------------------------------------------------------------
         install_menu_model = Gio.Menu()
-        install_menu_model.append("Install .deb…", "win.install-deb")
-        install_menu_model.append("Install Flatpak…", "win.install-flatpak")
+        install_menu_model.append("Install…", "win.install")
 
         if not hasattr(self, "install_menu_btn"):
             self.install_menu_btn = Gtk.MenuButton()
             self.install_menu_btn.set_icon_name("list-add-symbolic")
-            self.install_menu_btn.set_tooltip_text("Install")
+            self.install_menu_btn.set_tooltip_text(
+                "Install apps or drop .deb/.flatpakref files"
+            )
             header.pack_start(self.install_menu_btn)
 
         self.install_menu_btn.set_menu_model(install_menu_model)
@@ -267,6 +267,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.toast_overlay = Adw.ToastOverlay()
         self.toast_overlay.set_child(outer)
         self.set_content(self.toast_overlay)
+        self._add_file_drop_target(self, self.on_main_files_dropped)
 
         # Initial scan
         self.on_reload_clicked(self.reload_button)
@@ -479,185 +480,42 @@ class MainWindow(Adw.ApplicationWindow):
     # .deb batch installation
     # ------------------------------------------------------------
 
-    def on_install_deb_clicked(self, button=None):
-        if not shutil.which("apt-get"):
-            self.show_message(
-                "APT not available",
-                "The apt-get command was not found on this system.",
-                Gtk.MessageType.WARNING,
-            )
-            return
+    def on_install_clicked(self, button=None, initial_paths=None):
+        self.show_install_dialog(button, initial_paths)
 
-        if hasattr(Gtk, "FileDialog"):
-            file_dialog = Gtk.FileDialog.new()
-            file_dialog.set_title("Select .deb packages")
 
-            deb_filter = Gtk.FileFilter()
-            deb_filter.set_name("Debian packages (*.deb)")
-            deb_filter.add_pattern("*.deb")
-
-            all_filter = Gtk.FileFilter()
-            all_filter.set_name("All files")
-            all_filter.add_pattern("*")
-
-            filters = Gio.ListStore.new(Gtk.FileFilter)
-            filters.append(deb_filter)
-            filters.append(all_filter)
-
-            file_dialog.set_filters(filters)
-
-            if hasattr(file_dialog, "open_multiple"):
-                def callback(fd, result):
-                    try:
-                        files_model = fd.open_multiple_finish(result)
-                    except Exception:
-                        return
-
-                    paths = []
-
-                    if files_model:
-                        for i in range(files_model.get_n_items()):
-                            file = files_model.get_item(i)
-
-                            if file:
-                                path = file.get_path()
-
-                                if path:
-                                    paths.append(path)
-
-                    if paths:
-                        self.show_deb_batch_install_confirm(paths)
-
-                self._deb_file_dialog_callback = callback
-                file_dialog.open_multiple(self, None, callback)
-                return
-
-        # Fallback for older GTK file chooser
-        chooser = Gtk.FileChooserDialog(
-            transient_for=self,
-            modal=True,
-            action=Gtk.FileChooserAction.OPEN,
+    def start_install_files_batch(
+        self,
+        deb_paths,
+        flatpakref_paths,
+        user_install=True,
+        delete_source=False,
+    ):
+        file_count = len(deb_paths) + len(flatpakref_paths)
+        self.install_progress_window = InstallProgressWindow(
+            self,
+            "Installing apps",
         )
-
-        chooser.set_property("title", "Select .deb packages")
-        chooser.set_select_multiple(True)
-
-        chooser.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        chooser.add_button("Open", Gtk.ResponseType.OK)
-
-        deb_filter = Gtk.FileFilter()
-        deb_filter.set_name("Debian packages (*.deb)")
-        deb_filter.add_pattern("*.deb")
-
-        chooser.add_filter(deb_filter)
-
-        chooser.connect("response", self.on_deb_file_chooser_response)
-        chooser.present()
-
-    def on_deb_file_chooser_response(self, chooser, response):
-        if response == Gtk.ResponseType.OK:
-            files = chooser.get_files()
-            paths = []
-
-            if files:
-                for i in range(files.get_n_items()):
-                    file = files.get_item(i)
-
-                    if file:
-                        path = file.get_path()
-
-                        if path:
-                            paths.append(path)
-
-            chooser.close()
-
-            if paths:
-                self.show_deb_batch_install_confirm(paths)
-        else:
-            chooser.close()
-
-    def show_deb_batch_install_confirm(self, paths):
-        dialog = Gtk.Dialog(
-            transient_for=self,
-            modal=True,
-        )
-
-        dialog.set_resizable(False)
-        dialog.set_property("title", "Install .deb packages")
-
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-
-        install_button = dialog.add_button("Install", Gtk.ResponseType.OK)
-        install_button.add_css_class("suggested-action")
-
-        content = dialog.get_content_area()
-        content.set_spacing(8)
-
-        content.set_margin_top(12)
-        content.set_margin_bottom(12)
-        content.set_margin_start(12)
-        content.set_margin_end(12)
-
-        label = Gtk.Label(label=f"{len(paths)} package(s) selected:")
-        label.set_xalign(0.0)
-
-        lines = []
-
-        for path in paths[:20]:
-            lines.append(f"• {Path(path).name}")
-
-        if len(paths) > 20:
-            lines.append(f"• …and {len(paths) - 20} more")
-
-        path_label = Gtk.Label(label="\n".join(lines))
-        path_label.set_wrap(True)
-        path_label.set_selectable(True)
-        path_label.set_xalign(0.0)
-
-        dialog.delete_check = Gtk.CheckButton(
-            label="Delete .deb files after successful installation"
-        )
-
-        content.append(label)
-        content.append(path_label)
-        content.append(dialog.delete_check)
-
-        dialog.connect(
-            "response",
-            self.on_deb_batch_install_confirm_response,
-            paths,
-        )
-
-        dialog.present()
-
-    def on_deb_batch_install_confirm_response(self, dialog, response, paths):
-        if response == Gtk.ResponseType.OK:
-            delete_source = dialog.delete_check.get_active()
-            dialog.close()
-            self.start_deb_batch_install(paths, delete_source)
-        else:
-            dialog.close()
-
-    def start_deb_batch_install(self, paths, delete_source=False):
-        label = f"{len(paths)} .deb package(s)"
-
-        self.install_progress_window = InstallProgressWindow(self, "Installing .deb packages")
         self.install_progress_window.present()
         self.install_progress_window.start_pulse()
-        self.install_progress_window.set_status(f"Installing {label}…")
-
-        thread = threading.Thread(
-            target=self.deb_batch_install_worker,
-            args=(
-                paths,
-                delete_source,
-            ),
-            daemon=True,
+        self.install_progress_window.set_status(
+            f"Installing {file_count} package file(s)…"
         )
 
+        thread = threading.Thread(
+            target=self.install_files_batch_worker,
+            args=(deb_paths, flatpakref_paths, user_install, delete_source),
+            daemon=True,
+        )
         thread.start()
 
-    def deb_batch_install_worker(self, paths, delete_source):
+    def install_files_batch_worker(
+        self,
+        deb_paths,
+        flatpakref_paths,
+        user_install,
+        delete_source,
+    ):
         def output_callback(line):
             if self.install_progress_window:
                 GLib.idle_add(
@@ -665,34 +523,70 @@ class MainWindow(Adw.ApplicationWindow):
                     line,
                 )
 
-        success, message = install_deb_batch(
-            paths,
-            output_callback=output_callback,
-            delete_source=delete_source,
-        )
+        results = []
+        success_count = 0
+        total_count = len(deb_paths) + len(flatpakref_paths)
 
+        if deb_paths:
+            if not shutil.which("apt-get"):
+                results.append("DEB packages:\nAPT is not available.")
+            else:
+                success, message = install_deb_batch(
+                    deb_paths,
+                    output_callback=output_callback,
+                    delete_source=delete_source,
+                )
+                if success:
+                    success_count += len(deb_paths)
+                    installed_names = "\n".join(
+                        f"  {Path(path).name}" for path in deb_paths
+                    )
+                    results.append(f"DEB packages installed:\n{installed_names}")
+                    cleanup_lines = [
+                        line for line in message.splitlines()
+                        if "Deleted installation files:" in line
+                        or "Could not delete installation file" in line
+                    ]
+                    if cleanup_lines:
+                        results.append("\n".join(cleanup_lines))
+                else:
+                    results.append(f"DEB package installation failed:\n{message}")
+
+        if flatpakref_paths:
+            if not shutil.which("flatpak"):
+                results.append("Flatpak references:\nFlatpak is not available.")
+            else:
+                success, message, resolved_count = install_flatpak_ref_batch(
+                    flatpakref_paths,
+                    user_install,
+                    output_callback=output_callback,
+                    delete_source=delete_source,
+                )
+                results.append(f"Flatpak references:\n{message}")
+                success_count += resolved_count
+
+        success = success_count == total_count
         GLib.idle_add(
-            self.on_deb_batch_install_finished,
+            self.on_install_files_batch_finished,
             success,
-            message,
+            "\n\n".join(results),
         )
 
-    def on_deb_batch_install_finished(self, success, message):
+    def on_install_files_batch_finished(self, success, message):
         if self.install_progress_window:
             self.install_progress_window.stop_pulse()
+            self.reload()
 
             if success:
                 self.install_progress_window.close_window()
                 self.install_progress_window = None
-                self.reload()
-
                 self.show_message(
                     "Installation finished",
-                    ".deb packages installed successfully.",
+                    message,
                     Gtk.MessageType.INFO,
                 )
             else:
-                self.install_progress_window.finish_failure(message)
+                self.install_progress_window.finish_batch_results(message)
 
         return False
 
@@ -715,21 +609,13 @@ class MainWindow(Adw.ApplicationWindow):
     # Flatpak installation
     # ------------------------------------------------------------
 
-    def on_install_flatpak_clicked(self, button=None):
-        if not shutil.which("flatpak"):
-            self.show_message(
-                "Flatpak not available",
-                "The flatpak command was not found on this system.",
-                Gtk.MessageType.WARNING,
-            )
-            return
-
+    def show_install_dialog(self, button=None, initial_paths=None):
         dialog = Gtk.Dialog(
             transient_for=self,
             modal=True,
         )
         dialog.set_resizable(False)
-        dialog.set_property("title", "Install Flatpak")
+        dialog.set_property("title", "Install apps")
         dialog.set_default_size(520, -1)
 
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
@@ -756,10 +642,10 @@ class MainWindow(Adw.ApplicationWindow):
 
         # Mode selection
         dialog.mode_id_button = Gtk.CheckButton(label="Flathub app ID or URL")
-        dialog.mode_ref_button = Gtk.CheckButton(label=".flatpakref file or URL")
+        dialog.mode_ref_button = Gtk.CheckButton(label="Files (.deb / .flatpakref)")
 
         dialog.mode_ref_button.set_group(dialog.mode_id_button)
-        dialog.mode_id_button.set_active(True)
+        dialog.mode_ref_button.set_active(True)
 
         # App ID entry
         dialog.id_entry = Gtk.Entry()
@@ -770,17 +656,19 @@ class MainWindow(Adw.ApplicationWindow):
 
         # Flatpakref entry + browse
         dialog.file_entry = Gtk.Entry()
-        dialog.file_entry.set_placeholder_text("/path/to/app.flatpakref")
+        dialog.file_entry.set_placeholder_text(
+            "/path/to/package.deb or /path/to/app.flatpakref"
+        )
         dialog.file_entry.set_hexpand(True)
 
-        browse_button = Gtk.Button(label="Browse…")
+        browse_button = Gtk.Button(label="Browse files…")
         browse_button.connect("clicked", self.on_flatpakref_browse_clicked, dialog)
 
         # Scope
         dialog.user_check = Gtk.CheckButton(label="Install for current user only")
         dialog.user_check.set_active(True)
         dialog.delete_source_check = Gtk.CheckButton(
-            label="Delete .flatpakref file after successful installation"
+            label="Delete installation files after successful installation"
         )
         dialog.delete_source_check.set_sensitive(False)        
         dialog.flatpakref_paths = []
@@ -844,15 +732,17 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.batch_expander.set_child(batch_box)
         dialog.id_box.append(dialog.batch_expander)
 
-        ref_label = Gtk.Label(label=".flatpakref file, URL, or Flathub app page URL:")
-        ref_label.set_xalign(0.0)
-
         ref_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         ref_row.append(dialog.file_entry)
         ref_row.append(browse_button)
 
         dialog.ref_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        dialog.ref_box.append(ref_label)
+        file_hint = Gtk.Label(
+            label="Select or drop .deb packages and/or .flatpakref files."
+        )
+        file_hint.set_xalign(0.0)
+        file_hint.add_css_class("dim-label")
+        dialog.ref_box.append(file_hint)
         dialog.ref_box.append(ref_row)
         dialog.ref_box.append(dialog.delete_source_check)
 
@@ -898,10 +788,98 @@ class MainWindow(Adw.ApplicationWindow):
             dialog,
         )
 
+        self._add_file_drop_target(dialog, self.on_installer_files_dropped, dialog)
+
         dialog.connect("response", self.on_flatpak_install_response)
+
+        if initial_paths:
+            self._set_installer_dialog_paths(dialog, initial_paths)
+            dialog.mode_ref_button.set_active(True)
 
         self.update_flatpak_install_dialog_state(dialog)
         dialog.present()
+
+    def _add_file_drop_target(self, widget, callback, *user_data):
+        if not hasattr(Gtk, "DropTarget") or not hasattr(Gdk, "FileList"):
+            return
+
+        target = Gtk.DropTarget.new(Gdk.FileList.__gtype__, Gdk.DragAction.COPY)
+        target.connect("drop", callback, *user_data)
+        widget.add_controller(target)
+
+    @staticmethod
+    def _paths_from_file_list(file_list):
+        if not isinstance(file_list, Gdk.FileList):
+            return []
+
+        paths = []
+        for file in file_list.get_files():
+            path = file.get_path()
+            if path:
+                paths.append(path)
+        return paths
+
+    @staticmethod
+    def _classify_install_paths(paths):
+        deb_paths = []
+        flatpakref_paths = []
+        unsupported = []
+
+        for path in paths:
+            suffix = Path(path).suffix.lower()
+            if suffix == ".deb":
+                deb_paths.append(path)
+            elif suffix == ".flatpakref":
+                flatpakref_paths.append(path)
+            else:
+                unsupported.append(path)
+
+        return deb_paths, flatpakref_paths, unsupported
+
+    def on_main_files_dropped(self, target, file_list, x, y):
+        paths = self._paths_from_file_list(file_list)
+        if not paths:
+            return False
+
+        deb_paths, flatpakref_paths, unsupported = self._classify_install_paths(paths)
+        if unsupported:
+            self.show_message(
+                "Unsupported dropped files",
+                "Drop .deb packages and/or .flatpakref files.",
+                Gtk.MessageType.WARNING,
+            )
+            return False
+
+        self.on_install_clicked(initial_paths=deb_paths + flatpakref_paths)
+        return True
+
+    def on_installer_files_dropped(self, target, file_list, x, y, dialog):
+        paths = self._paths_from_file_list(file_list)
+        if not paths:
+            return False
+
+        deb_paths, flatpakref_paths, unsupported = self._classify_install_paths(paths)
+        if unsupported:
+            dialog.status_label.set_label(
+                "Only .deb and .flatpakref files can be dropped here."
+            )
+            return False
+
+        self._set_installer_dialog_paths(dialog, deb_paths + flatpakref_paths)
+        dialog.mode_ref_button.set_active(True)
+        return True
+
+    def _set_installer_dialog_paths(self, dialog, paths):
+        dialog.flatpakref_paths = list(dict.fromkeys(paths))
+        dialog._setting_file_entry = True
+        if len(dialog.flatpakref_paths) == 1:
+            dialog.file_entry.set_text(dialog.flatpakref_paths[0])
+        else:
+            dialog.file_entry.set_text(
+                f"{len(dialog.flatpakref_paths)} installation files selected"
+            )
+        dialog._setting_file_entry = False
+        self.update_flatpak_install_dialog_state(dialog)
 
     def on_flatpak_install_mode_changed(self, button, dialog):
         self.update_flatpak_install_dialog_state(dialog)
@@ -941,6 +919,7 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.batch_expander.set_visible(mode_id)
 
         if mode_id:
+            dialog.user_check.set_visible(True)
             batch_mode = dialog.batch_expander.get_expanded()
             dialog.id_label.set_visible(not batch_mode)
             dialog.id_entry.set_visible(not batch_mode)
@@ -1029,18 +1008,33 @@ class MainWindow(Adw.ApplicationWindow):
             dialog.id_entry.set_visible(True)
             paths = getattr(dialog, "flatpakref_paths", []) or []
             value = dialog.file_entry.get_text().strip()
+            has_flatpakref = any(
+                Path(path).suffix.lower() == ".flatpakref"
+                for path in paths
+            ) or (
+                not paths
+                and Path(value.split("?", 1)[0]).suffix.lower() == ".flatpakref"
+            ) or (
+                not paths and bool(extract_flathub_app_id(value))
+            )
+            dialog.user_check.set_visible(has_flatpakref)
 
             if paths:
                 install_enabled = True
                 add_enabled = False
 
-                if len(paths) == 1:
-                    status = f"Selected file: {Path(paths[0]).name}"
+                deb_paths, flatpakref_paths, unsupported = self._classify_install_paths(paths)
+                if unsupported:
+                    install_enabled = False
+                    status = "Only .deb and .flatpakref files can be installed here."
                 else:
-                    status = f"{len(paths)} .flatpakref files selected."
+                    status = (
+                        f"{len(deb_paths)} .deb and "
+                        f"{len(flatpakref_paths)} .flatpakref file(s) selected."
+                    )
 
                 if hasattr(dialog, "delete_source_check"):
-                    dialog.delete_source_check.set_sensitive(True)
+                    dialog.delete_source_check.set_sensitive(not unsupported)
             else:
                 flathub_app_id = extract_flathub_app_id(value)
 
@@ -1064,7 +1058,15 @@ class MainWindow(Adw.ApplicationWindow):
                 else:
                     install_enabled = bool(value)
                     add_enabled = False
-                    status = "Enter or browse for a .flatpakref file or URL."
+                    if value and not (
+                        value.startswith("http://")
+                        or value.startswith("https://")
+                        or Path(value).suffix.lower() in {".deb", ".flatpakref"}
+                    ):
+                        install_enabled = False
+                        status = "Choose a .deb or .flatpakref file, or paste a Flatpak URL."
+                    else:
+                        status = "Choose or drop install files, or paste a Flatpak URL."
 
                 if hasattr(dialog, "delete_source_check"):
                     is_url = (
@@ -1080,6 +1082,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         dialog.status_label.set_label(status)
 
+        dialog.add_flatpak_button.set_visible(mode_id or add_enabled)
         dialog.add_flatpak_button.set_sensitive(add_enabled and not busy)
         dialog.install_button.set_sensitive(install_enabled and not busy)
 
@@ -1141,10 +1144,18 @@ class MainWindow(Adw.ApplicationWindow):
                     and dialog.delete_source_check.get_active()
                 )
 
+                deb_paths, flatpakref_paths, unsupported = self._classify_install_paths(paths)
+                if unsupported:
+                    dialog.status_label.set_label(
+                        "Only .deb and .flatpakref files can be installed here."
+                    )
+                    return
+
                 dialog.close()
 
-                self.start_flatpak_ref_batch_install(
-                    paths,
+                self.start_install_files_batch(
+                    deb_paths,
+                    flatpakref_paths,
                     user_install,
                     delete_source,
                 )
@@ -1158,6 +1169,26 @@ class MainWindow(Adw.ApplicationWindow):
 
             flathub_app_id = extract_flathub_app_id(value)
             is_url = value.startswith("http://") or value.startswith("https://")
+
+            if not is_url and Path(value).suffix.lower() == ".deb":
+                dialog.close()
+                self.start_install_files_batch(
+                    [value],
+                    [],
+                    user_install,
+                    dialog.delete_source_check.get_active(),
+                )
+                return
+
+            if not is_url and Path(value).suffix.lower() == ".flatpakref":
+                dialog.close()
+                self.start_install_files_batch(
+                    [],
+                    [value],
+                    user_install,
+                    dialog.delete_source_check.get_active(),
+                )
+                return
 
             delete_source = (
                 hasattr(dialog, "delete_source_check")
@@ -1233,18 +1264,19 @@ class MainWindow(Adw.ApplicationWindow):
     def on_flatpakref_browse_clicked(self, button, dialog):
         if hasattr(Gtk, "FileDialog"):
             file_dialog = Gtk.FileDialog.new()
-            file_dialog.set_title("Select .flatpakref files")
+            file_dialog.set_title("Select installation files")
 
-            flatpakref_filter = Gtk.FileFilter()
-            flatpakref_filter.set_name("Flatpak references (*.flatpakref)")
-            flatpakref_filter.add_pattern("*.flatpakref")
+            installer_filter = Gtk.FileFilter()
+            installer_filter.set_name("Installable files (*.deb, *.flatpakref)")
+            installer_filter.add_pattern("*.deb")
+            installer_filter.add_pattern("*.flatpakref")
 
             all_filter = Gtk.FileFilter()
             all_filter.set_name("All files")
             all_filter.add_pattern("*")
 
             filters = Gio.ListStore.new(Gtk.FileFilter)
-            filters.append(flatpakref_filter)
+            filters.append(installer_filter)
             filters.append(all_filter)
 
             file_dialog.set_filters(filters)
@@ -1269,18 +1301,8 @@ class MainWindow(Adw.ApplicationWindow):
                                     paths.append(path)
 
                     if paths:
-                        dialog.flatpakref_paths = paths
-
-                        dialog._setting_file_entry = True
-
-                        if len(paths) == 1:
-                            dialog.file_entry.set_text(paths[0])
-                        else:
-                            dialog.file_entry.set_text(f"{len(paths)} files selected")
-
-                        dialog._setting_file_entry = False
-
-                        self.update_flatpak_install_dialog_state(dialog)
+                        self._set_installer_dialog_paths(dialog, paths)
+                        dialog.mode_ref_button.set_active(True)
 
                 dialog._file_dialog_callback = callback
                 file_dialog.open_multiple(self, None, callback)
@@ -1293,17 +1315,18 @@ class MainWindow(Adw.ApplicationWindow):
             action=Gtk.FileChooserAction.OPEN,
         )
 
-        chooser.set_property("title", "Select .flatpakref files")
+        chooser.set_property("title", "Select installation files")
         chooser.set_select_multiple(True)
 
         chooser.add_button("Cancel", Gtk.ResponseType.CANCEL)
         chooser.add_button("Open", Gtk.ResponseType.OK)
 
-        flatpakref_filter = Gtk.FileFilter()
-        flatpakref_filter.set_name("Flatpak references (*.flatpakref)")
-        flatpakref_filter.add_pattern("*.flatpakref")
+        installer_filter = Gtk.FileFilter()
+        installer_filter.set_name("Installable files (*.deb, *.flatpakref)")
+        installer_filter.add_pattern("*.deb")
+        installer_filter.add_pattern("*.flatpakref")
 
-        chooser.add_filter(flatpakref_filter)
+        chooser.add_filter(installer_filter)
 
         chooser.connect(
             "response",
@@ -1329,18 +1352,8 @@ class MainWindow(Adw.ApplicationWindow):
                             paths.append(path)
 
             if paths:
-                dialog.flatpakref_paths = paths
-
-                dialog._setting_file_entry = True
-
-                if len(paths) == 1:
-                    dialog.file_entry.set_text(paths[0])
-                else:
-                    dialog.file_entry.set_text(f"{len(paths)} files selected")
-
-                dialog._setting_file_entry = False
-
-                self.update_flatpak_install_dialog_state(dialog)
+                self._set_installer_dialog_paths(dialog, paths)
+                dialog.mode_ref_button.set_active(True)
 
         chooser.close()
 
@@ -1650,8 +1663,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.action_group.add_action(action)
             setattr(self, f"action_{action_name.replace('-', '_')}", action)
 
-        add_window_action("install-deb", "on_install_deb_clicked")
-        add_window_action("install-flatpak", "on_install_flatpak_clicked")
+        add_window_action("install", "on_install_clicked")
 
         add_window_action("clean-orphans", "on_autoremove_clicked")
         add_window_action("clean-runtimes", "on_flatpak_cleanup_clicked")
@@ -1678,8 +1690,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         if app:
             try:
-                app.set_accels_for_action("win.install-deb", ["<Ctrl>o"])
-                app.set_accels_for_action("win.install-flatpak", ["<Ctrl><Shift>o"])
+                app.set_accels_for_action("win.install", ["<Ctrl>o"])
                 app.set_accels_for_action("win.show-log", ["<Ctrl>l"])
                 app.set_accels_for_action("win.refresh", ["<Ctrl>r"])
                 app.set_accels_for_action("win.mark-all", ["<Ctrl>a"])
@@ -1824,14 +1835,8 @@ class MainWindow(Adw.ApplicationWindow):
                     </child>
                     <child>
                       <object class="GtkShortcutsShortcut">
-                        <property name="title">Install .deb</property>
+                        <property name="title">Install apps</property>
                         <property name="accelerator">&lt;Ctrl&gt;o</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Install Flatpak</property>
-                        <property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;o</property>
                       </object>
                     </child>
                     <child>
