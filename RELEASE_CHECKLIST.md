@@ -12,7 +12,7 @@ approves publication.** This checklist is not authorization to publish.
 | Map privileged helper, polkit, D-Bus and system services | Done | `pkexec` and system package managers are used; no dedicated helper/action IDs, D-Bus service or systemd unit found. |
 | Document package/runtime prerequisites | Done | Debian runtime dependencies are declared; no pip distribution is required. |
 | Build from documented source commands | Done | `python3 -m unittest discover -s tests -v`; `./scripts/build-deb.sh`; package validation. |
-| Clean-checkout build after audit commits | Pending | Re-run after the icon/package changes are committed. |
+| Clean-checkout build after audit commits | Done | Final committed tree passed all 16 tests and package validation in an isolated temporary worktree. |
 | Confirm every user-visible/build/tag version agrees | Done | CLI/About/build/tag gate use `appector/__init__.py`; release tag must be `v0.1.0` for current version. |
 | Confirm runtime/build dependency versions and licences | Partial | Source inventory found standard-library and system GI imports, with no vendored application code/assets; review target archive dependency licences and vulnerabilities. |
 | Application icon and GitHub branding asset | Partial | Icon is packaged and shown in the README/About dialog; preview artwork is ready, but upload `assets/github-social-preview.png` manually in Settings → General → Social preview. |

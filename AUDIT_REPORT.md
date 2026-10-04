@@ -28,11 +28,11 @@ automated tests pass. These results do **not** establish safe package
 installation/removal, GUI usability, support on the target distributions, or
 release readiness.
 
-Before the icon assets were added, the committed audit tree was cloned locally
-into a clean checkout: all 16 tests passed there, and its package passed
-package/desktop validation and matched the worktree build byte-for-byte. The
-later icon and final-documentation changes have been retested in the current
-worktree; a clean-checkout rerun after those changes remains pending.
+The final committed tree was tested in an isolated clean worktree: all 16
+tests passed there, the package passed `lintian --pedantic` and desktop-file
+validation, and its `.deb` bytes matched the worktree build exactly. This
+validates reproducible construction from the committed source; it does not
+replace installation and lifecycle testing in a disposable Ubuntu VM.
 
 The owner has confirmed Elshad Guliyev owns the original application code,
 intends to license it under GNU GPL version 3, and selected Ubuntu 26.04 amd64

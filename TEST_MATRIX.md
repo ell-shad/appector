@@ -51,8 +51,8 @@ audit.
 | Commit author email privacy | Public `main` and local audit branch | **Needs owner decision** | Checked domains only: public and local commits use a Gmail-domain address. Actual addresses are not printed here; consider GitHub's private noreply address for future commits. |
 | Shell script syntax | POSIX shell parser | **Pass** | `sh -n scripts/build-deb.sh`. |
 | First deterministic `.deb` build | Ubuntu 26.04 amd64 | **Pass** | Produces `dist/appector_0.1.0_all.deb`. |
-| Repeated deterministic `.deb` build | Same host/checkout | **Pass** | Two consecutive builds of the same source checkout had identical SHA-256: `a879166f5dae673b871e6f340ed1019f7ffdd270566d3a10dad33146a9d29c1e`; package size 373,572 bytes. |
-| Clean-checkout tests/build | Local clone of committed audit tree | **Pending** | Re-run after the icon/package changes are committed. |
+| Repeated deterministic `.deb` build | Same host/checkout | **Pass** | Two consecutive builds of the same source checkout had identical SHA-256: `98463af2f892c2f13b9d92f0d6de9544bb76f56c10fa48590ee76f37a583d51a`; package size 373,572 bytes. |
+| Clean-checkout tests/build | Isolated worktree at `7423502` | **Pass** | All 16 tests passed; package built, passed `lintian --pedantic` and desktop validation, and matched the worktree build byte-for-byte. |
 | Debian package metadata / file list | `dpkg-deb` | **Pass** | Architecture `all`, dependency metadata, launcher, GTK desktop entry, man page and copyright present. |
 | Runtime dependency/source inventory | Source imports and Ubuntu package copyright notices | **Partial** | App imports use standard library and system GI bindings; no vendored app code/assets. PyGObject/GTK/libadwaita copyright notices list LGPL terms; full transitive SBOM/licence review remains. |
 | Lintian | lintian 2.129.0, `--pedantic` | **Pass: no diagnostics** | `lintian --pedantic dist/appector_0.1.0_all.deb`. |
