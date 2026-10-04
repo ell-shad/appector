@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -69,6 +70,8 @@ SINGLE_REMOVABLE_MANAGERS = {
 }
 
 BLOCKED_PACKAGE_IDS = {
+    "appector",
+    "app-manager",
     "snapd",
     "core",
     "core18",
@@ -132,6 +135,8 @@ FLATPAK_BLOCKED_PREFIXES = (
 )
 
 APT_CRITICAL_PACKAGES = {
+    "appector",
+    "app-manager",
     "apt",
     "bash",
     "ca-certificates",
@@ -246,16 +251,31 @@ def app_key(app) -> str:
 
 
 def _log_action(message: str):
+    log_dir = Path.home() / ".local" / "state" / "app-manager"
+    log_file = log_dir / "actions.log"
+    descriptor = None
     try:
-        log_dir = Path.home() / ".local" / "state" / "app-manager"
-        log_dir.mkdir(parents=True, exist_ok=True)
-
-        log_file = log_dir / "actions.log"
-
-        with open(log_file, "a", encoding="utf-8") as f:
+        log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        home_dir = Path.home().resolve()
+        if log_dir.is_symlink() or not log_dir.resolve().is_relative_to(home_dir):
+            raise OSError("Action log directory is not a private directory in the home folder.")
+        os.chmod(log_dir, 0o700)
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(log_file, flags, 0o600)
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise OSError("Action log path is not a regular file.")
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as f:
+            descriptor = None
             f.write(f"{datetime.now().isoformat()} {message}\n")
-    except Exception:
-        pass
+    except OSError:
+        logging.getLogger(__name__).warning("Appector could not write its private action log.")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _normalize_package_id(name: str) -> str:
@@ -1637,17 +1657,13 @@ def execute_removal(app):
             for path in validated_paths
         )
         if requires_privilege:
-            pkexec_command = shutil.which("pkexec")
-            rm_command = shutil.which("rm")
-            if not pkexec_command or not rm_command:
-                message = "Removing this system-wide manual app requires pkexec and rm."
-                _log_action(f"REMOVE_FAILED {key} manager=Manual reason=privilege-unavailable")
-                return False, message
-            cmd = [pkexec_command, rm_command, "--"] + validated_paths
-            success, message = _run_command_stream(cmd)
-            if not success:
-                _log_action(f"REMOVE_FAILED {key} manager=Manual error={message}")
-                return False, message
+            message = (
+                "Appector refuses to remove manual app files that require "
+                "administrator privileges. Remove this app with its package "
+                "manager or another reviewed system-administration method."
+            )
+            _log_action(f"REMOVE_BLOCKED {key} manager=Manual reason=privileged-path")
+            return False, message
         else:
             removed = []
             failures = []
@@ -1715,7 +1731,10 @@ def simulate_apt_remove_multiple(package_ids, purge=False):
 
     _log_action(f"APT_SIMULATION cmd={shlex.join(cmd)}")
 
-    returncode, output = _run_command_raw(cmd)
+    returncode, output = _run_command_raw(
+        cmd,
+        env_overrides={"LC_ALL": "C"},
+    )
 
     if returncode != 0:
         _log_action("APT_SIMULATION_FAILED")

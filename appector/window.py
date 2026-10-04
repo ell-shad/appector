@@ -1,9 +1,12 @@
-import gi
-import shutil
-import json
-import subprocess
 import csv
+import json
+import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
+
+import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
@@ -18,6 +21,8 @@ from .models import mark_duplicate_apps
 from .app_item import AppItem
 from .details import DetailsWindow
 from .progress import ProgressWindow, InstallProgressWindow
+from . import __version__
+from .updater import check_for_update
 from .actions import (
     app_key,
     can_remove,
@@ -148,6 +153,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         misc_section = Gio.Menu()
         misc_section.append("Check for installed app updates…", "win.check-updates")
+        misc_section.append("Check for Appector updates…", "win.check-appector-updates")
         misc_section.append("Export installed app list as CSV…", "win.export-app-list")
         misc_section.append("Export installed app list as JSON…", "win.export-app-list-json")
         misc_section.append("Activity Log", "win.show-log")
@@ -837,13 +843,20 @@ class MainWindow(Adw.ApplicationWindow):
             }
             for app in self.current_apps
         ]
+        descriptor = None
+        temporary_path = None
         try:
-            with open(
-                path,
+            descriptor, temporary_path = tempfile.mkstemp(
+                prefix=".appector-export-",
+                dir=str(Path(path).parent),
+            )
+            with os.fdopen(
+                descriptor,
                 "w",
                 encoding="utf-8",
                 newline="" if file_format == "csv" else None,
             ) as output:
+                descriptor = None
                 if file_format == "json":
                     json.dump(rows, output, ensure_ascii=False, indent=2)
                     output.write("\n")
@@ -851,10 +864,28 @@ class MainWindow(Adw.ApplicationWindow):
                     writer = csv.DictWriter(output, fieldnames=fields)
                     writer.writeheader()
                     writer.writerows(rows)
-        except OSError as error:
+            os.replace(temporary_path, path)
+            temporary_path = None
+        except (OSError, csv.Error, TypeError) as error:
+            cleanup_note = ""
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as cleanup_error:
+                    cleanup_note = f"\nTemporary export descriptor could not be closed: {cleanup_error}"
+            if temporary_path:
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as cleanup_error:
+                    cleanup_note += (
+                        f"\nTemporary export file could not be removed: "
+                        f"{cleanup_error}"
+                    )
             self.show_message(
                 "Export failed",
-                f"Could not save the installed app list:\n{error}",
+                f"Could not save the installed app list:\n{error}{cleanup_note}",
                 Gtk.MessageType.ERROR,
             )
             return
@@ -2149,6 +2180,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         add_window_action("cleanup-residuals", "on_cleanup_residuals_clicked")
         add_window_action("check-updates", "on_check_updates_clicked")
+        add_window_action("check-appector-updates", "on_check_appector_updates")
         add_window_action("export-app-list", "on_export_app_list_clicked")
         add_window_action("export-app-list-json", "on_export_app_list_json_clicked")
 
@@ -2266,7 +2298,7 @@ class MainWindow(Adw.ApplicationWindow):
             about = Adw.AboutWindow(
                 transient_for=self,
                 application_name="Appector",
-                version="1.0.0",
+                version=__version__,
                 developer_name="Appector contributors",
                 copyright="© 2026 Appector contributors",
                 website="https://github.com/ell-shad/appector",
@@ -2279,11 +2311,64 @@ class MainWindow(Adw.ApplicationWindow):
                 modal=True,
             )
             about.set_program_name("Appector")
-            about.set_version("1.0.0")
+            about.set_version(__version__)
             about.set_comments("Unified installed app inventory")
             about.set_website("https://github.com/ell-shad/appector")
             about.set_license_type(Gtk.License.GPL_3_0)
             about.present()
+
+    def on_check_appector_updates(self):
+        self.action_check_appector_updates.set_enabled(False)
+        self.show_toast("Checking for Appector updates…")
+        threading.Thread(
+            target=self._check_appector_updates_worker,
+            daemon=True,
+        ).start()
+
+    def _check_appector_updates_worker(self):
+        try:
+            result = check_for_update(__version__)
+            GLib.idle_add(self._show_appector_update_result, result, None)
+        except (RuntimeError, ValueError, OSError) as error:
+            GLib.idle_add(self._show_appector_update_result, None, str(error))
+
+    def _show_appector_update_result(self, result, error):
+        self.action_check_appector_updates.set_enabled(True)
+        if error:
+            self.show_message(
+                "Could not check for updates",
+                error,
+                Gtk.MessageType.ERROR,
+            )
+        elif result["available"]:
+            dialog = Gtk.MessageDialog(
+                transient_for=self,
+                modal=True,
+                message_type=Gtk.MessageType.INFO,
+                text=f"Appector {result['version']} is available",
+                secondary_text="Open the release page to download and install the update.",
+            )
+            dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+            dialog.add_button("Open Release", Gtk.ResponseType.OK)
+            dialog.connect("response", self._on_appector_update_dialog_response, result["url"])
+            dialog.present()
+        else:
+            self.show_toast("Appector is up to date.")
+        return GLib.SOURCE_REMOVE
+
+    def _on_appector_update_dialog_response(self, dialog, response, release_url):
+        dialog.close()
+        if response != Gtk.ResponseType.OK:
+            return
+
+        try:
+            Gio.AppInfo.launch_default_for_uri(release_url, None)
+        except GLib.Error as error:
+            self.show_message(
+                "Could not open release page",
+                str(error),
+                Gtk.MessageType.ERROR,
+            )
 
 
     def _focus_search(self):
@@ -4113,7 +4198,18 @@ class MainWindow(Adw.ApplicationWindow):
 
         lines = []
 
-        lines.append("The following leftover configuration packages will be purged:")
+        lines.append(
+            "These packages are already removed. Purging deletes only their "
+            "remaining dpkg-registered configuration files."
+        )
+        lines.append(
+            "Appector first creates a private backup under "
+            "~/.local/state/app-manager/purge-backups. If a file cannot be "
+            "safely backed up, the purge will not run. The backup is not "
+            "restored automatically."
+        )
+        lines.append("")
+        lines.append("The following APT configurations will be purged:")
         lines.append("")
 
         for package_id in package_ids[:30]:
