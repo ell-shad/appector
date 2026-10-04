@@ -45,6 +45,7 @@ mkdir -p \
     "$STAGING/usr/bin" \
     "$STAGING/usr/share/doc/appector" \
     "$STAGING/usr/share/applications" \
+    "$STAGING/usr/share/icons" \
     "$STAGING/usr/share/man/man1"
 
 cp -R "$ROOT/appector" "$STAGING/usr/lib/"
@@ -71,6 +72,8 @@ export PYTHONPATH="/usr/lib${PYTHONPATH:+:$PYTHONPATH}"
 exec /usr/bin/python3 -m appector "$@"
 EOF
 chmod 0755 "$STAGING/usr/bin/appector"
+
+cp -R "$ROOT/assets/icons/hicolor" "$STAGING/usr/share/icons/"
 
 cp "$ROOT/debian/copyright" "$STAGING/usr/share/doc/appector/copyright"
 cat > "$STAGING/usr/share/doc/appector/changelog" <<EOF
@@ -113,6 +116,7 @@ cat > "$STAGING/usr/share/applications/com.appector.appector.desktop" <<'EOF'
 Name=Appector
 Comment=Manage installed applications
 Exec=appector
+Icon=com.appector.appector
 Terminal=false
 Type=Application
 Categories=System;

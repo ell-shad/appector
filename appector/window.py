@@ -59,6 +59,7 @@ class MainWindow(Adw.ApplicationWindow):
             default_width=1250,
             default_height=760,
         )
+        self.set_icon_name("com.appector.appector")
 
         self.search_text = ""
         self.marked_only = False
@@ -2301,6 +2302,7 @@ class MainWindow(Adw.ApplicationWindow):
                 version=__version__,
                 developer_name="Elshad Guliyev",
                 copyright="© 2026 Elshad Guliyev",
+                application_icon="com.appector.appector",
                 website="https://github.com/ell-shad/appector",
             )
             about.set_license_type(Gtk.License.GPL_3_0)
@@ -2314,6 +2316,7 @@ class MainWindow(Adw.ApplicationWindow):
             about.set_version(__version__)
             about.set_comments("Unified installed app inventory")
             about.set_website("https://github.com/ell-shad/appector")
+            about.set_logo_icon_name("com.appector.appector")
             about.set_license_type(Gtk.License.GPL_3_0)
             about.present()
 
