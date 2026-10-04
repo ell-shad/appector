@@ -107,7 +107,7 @@ performed.
   metadata that predates the privacy settings. The unpublished audit branch
   was rewritten to use the GitHub noreply identity; published `main` was not
   rewritten. No actual personal address is included in this report.
-- The final `.deb` is 375,874 bytes and includes Appector's Python source
+- The final `.deb` is about 367 KiB and includes Appector's Python source
   files and eight hicolor icon assets by design. Its 24 regular files contain
   no `.git`, bytecode caches, embedded local build paths or group/world-write
   bits. It contains no vendored runtime libraries by design.
@@ -160,8 +160,8 @@ made so far.
    and deletion; GitHub currently reports no rulesets.
 3. Complete/confirm install, launch, remove and purge tests in a disposable
    Ubuntu 26.04 amd64 VM.
-4. Push the local audit branch only after the authorized GitHub noreply
-   rewrite and final clean-worktree validation.
+4. Open a pull request from the pushed `pre-release-audit` branch into `main`
+   after the main-branch ruleset is configured.
 5. The owner accepted generic `pkexec` authorization for the initial beta;
    the GUI remains unprivileged and system actions receive individual
    authorization prompts.

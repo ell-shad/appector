@@ -103,7 +103,7 @@ approves publication.** This checklist is not authorization to publish.
 | Lintian `--pedantic` | Done | Clean on Ubuntu 26.04. |
 | Reproducible build | Done on one host | Two same-host builds had identical SHA-256; clean chroot/container and cross-architecture builds not proven. |
 | Install/upgrade/remove/purge test | Needs result confirmation | Owner reports successful app testing without issues; confirm whether package install, remove and purge were tested in a disposable Ubuntu VM. |
-| Package size | Done | Final package is 375,874 bytes (about 367 KiB). |
+| Package size | Done | Final package is about 367 KiB. |
 
 ## Phase 7 — GitHub repository and release setup
 
@@ -141,9 +141,9 @@ approves publication.** This checklist is not authorization to publish.
 2. Protect `main` in Settings → Rules → Rulesets. GitHub's public API currently
    shows no rulesets and reports `main` as unprotected. The click-by-click
    setup and timing for selecting CI are below.
-3. Once the local history rewrite and final checks are complete, push
-   `pre-release-audit` and open a PR into `main` for code review. This is only
-   a source branch/PR, not a release or tag; because the repository is public,
+3. The local history rewrite and final checks are complete. After I push
+   `pre-release-audit`, open a PR into `main` for code review. This is only a
+   source branch/PR, not a release or tag; because the repository is public,
    pushed branch contents and PR changes are visible to everyone.
 4. In Settings → Environments → `public-release`, add a required reviewer and
    disable administrator bypass. The `v*` tag policy is already confirmed;

@@ -54,7 +54,7 @@ audit.
 | Commit author email privacy | Published history / unpublished branch | **Pass for unpublished branch** | All 15 unpublished commits now use GitHub noreply; previously published `main` history was left untouched. |
 | Shell script syntax | POSIX shell parser | **Pass** | `sh -n scripts/build-deb.sh`. |
 | First deterministic `.deb` build | Ubuntu 26.04 amd64 | **Pass** | Produces `dist/appector_0.1.0_all.deb`. |
-| Repeated deterministic `.deb` build | Same host/checkout | **Pass** | Repeated builds had identical SHA-256; the clean-worktree package was byte-identical. Final package size: 375,874 bytes. |
+| Repeated deterministic `.deb` build | Same host/checkout | **Pass** | Repeated builds had identical SHA-256; the clean-worktree package was byte-identical. Final package size is about 367 KiB. |
 | Clean-checkout tests/build | Isolated worktree at rewritten branch head | **Pass** | All 25 tests passed; package built, passed `lintian --pedantic` and desktop validation, and matched the worktree package byte-for-byte. |
 | Debian package metadata / file list | `dpkg-deb` | **Pass** | Architecture `all`, dependency metadata, launcher, GTK desktop entry, man page and copyright present. |
 | Runtime dependency/source inventory | Source imports and Ubuntu package copyright notices | **Partial** | App imports use standard library and system GI bindings; no vendored app code/assets. PyGObject/GTK/libadwaita copyright notices list LGPL terms; full transitive SBOM/licence review remains. |
@@ -62,7 +62,7 @@ audit.
 | Desktop entry validation | desktop-file-utils 0.28 | **Pass** | `desktop-file-validate` on staged desktop file. |
 | App icon package entries | Debian package contents and image dimensions | **Pass** | Desktop file references `com.appector.appector`; hicolor PNGs are packaged at 16, 24, 32, 48, 64, 128, 256 and 512 px; README/About/window use same icon ID. |
 | GitHub social-preview image | Generated local PNG | **Ready to upload** | `assets/github-social-preview.png` is 1200x630 and visually reviewed; upload manually in repository Settings → General → Social preview after merging the asset commit. |
-| Package contents/privacy/modes | Extracted Debian package | **Pass: 53 paths / 24 regular files** | Includes 8 hicolor icons; no `.git`, Python caches, embedded local paths or group/world-writable files. |
+| Package contents/privacy/modes | Extracted Debian package | **Pass: 24 regular files** | Includes 8 hicolor icons; no `.git`, Python caches, embedded local paths or group/world-writable files. `dpkg-deb --contents` reports 53 archive entries including directories. |
 | Git whitespace check | Local branch | **Pass** | `git diff --check`. |
 
 ## Platform matrix
