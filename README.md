@@ -218,6 +218,17 @@ Report bugs at
 architecture, Appector version, and a redacted error or log excerpt. Do not
 post credentials, private logs, or personal installed-app exports.
 
+##  Disclaimer
+Appector is currently in an experimental/beta stage of development. While it 
+has been developed and tested with the assistance of AI tools under strict 
+human review, it is not yet perfect and may contain bugs.
+• No Backup/Restore: Full backup and restore functionality is not yet implemented.
+Please modify settings or manage your applications with caution.
+• User Responsibility: Using this software on a live or production system is done 
+entirely at your own risk. The developer(s) assume no responsibility for data loss, 
+system instability, or any other issues.
+This software is provided "as is", without warranty of any kind.
+
 ## License and security
 
 Copyright © 2026 Elshad Guliyev. Appector's original application code is
