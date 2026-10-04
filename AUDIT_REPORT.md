@@ -130,7 +130,7 @@ before commits were made.
 | Security | `d11201a` | Harden privileged/removal/log/export/update behavior. |
 | Tests | `1675ba4` | Add safety and updater regression tests. |
 | Packaging | `ba2eb39` | Build reproducible `.deb`; add package and release workflows. |
-| Documentation/audit | `671d13e` (initial; verification follow-up pending) | Add audit report, test matrix, release checklist and user/release guidance. |
+| Documentation/audit | `671d13e`, `74bc51f` | Add audit report, test matrix and release guidance; record clean-checkout verification. |
 
 ## Needs decision
 
