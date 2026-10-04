@@ -3,6 +3,14 @@
 Appector's source repository is public. Contributions should be proposed as
 pull requests against `main`.
 
+## Branding
+
+The hicolor application icons are in `assets/icons/hicolor/`. The GitHub
+repository social-preview image is `assets/github-social-preview.png`; upload
+it in the repository's **Settings → General → Social preview** page. The
+desktop icon is installed with the Debian package and referenced by the
+desktop entry and About dialog.
+
 ## Development setup
 
 Use a Debian-based development machine or disposable VM with Python 3,

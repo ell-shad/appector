@@ -12,9 +12,10 @@ approves publication.** This checklist is not authorization to publish.
 | Map privileged helper, polkit, D-Bus and system services | Done | `pkexec` and system package managers are used; no dedicated helper/action IDs, D-Bus service or systemd unit found. |
 | Document package/runtime prerequisites | Done | Debian runtime dependencies are declared; no pip distribution is required. |
 | Build from documented source commands | Done | `python3 -m unittest discover -s tests -v`; `./scripts/build-deb.sh`; package validation. |
-| Clean-checkout build after audit commits | Done | A clean local clone passed all 16 tests, built the package, passed lintian/desktop validation and matched the worktree package byte-for-byte; the check is re-run after the final documentation commit. |
+| Clean-checkout build after audit commits | Pending | Re-run after the icon/package changes are committed. |
 | Confirm every user-visible/build/tag version agrees | Done | CLI/About/build/tag gate use `appector/__init__.py`; release tag must be `v0.1.0` for current version. |
 | Confirm runtime/build dependency versions and licences | Partial | Source inventory found standard-library and system GI imports, with no vendored application code/assets; review target archive dependency licences and vulnerabilities. |
+| Application icon and GitHub branding asset | Partial | Icon is packaged and shown in the README/About dialog; preview artwork is ready, but upload `assets/github-social-preview.png` manually in Settings → General → Social preview. |
 
 ## Phase 1 — Secrets and sensitive information
 
@@ -25,7 +26,7 @@ approves publication.** This checklist is not authorization to publish.
 | Review commit author/committer metadata | Decision required | Public history and local audit commits use a Gmail-domain email; review privacy before pushing the local branch. Actual addresses are omitted from audit files. |
 | Review Debian Maintainer identity | Done | Package metadata uses `Elshad Guliyev <ell-shad@users.noreply.github.com>`. |
 | Inspect final `.deb` paths, caches, local paths and permissions | Done | No build paths/caches/vendor files/group-world-writable files detected; source `.py` files are included. |
-| Review screenshots/icons/sample data for private information | Not applicable / incomplete | No screenshot or app icon is packaged; no screenshot-driven visual privacy review was possible. |
+| Review screenshots/icons/sample data for private information | Done for supplied branding | No application screenshot or sample user data is bundled. The chosen icon and generated social-preview image were visually reviewed; no personal information is visible. |
 | Ensure logs/exports are user-private | Done | Log `0700` directory/`0600` file; exports `0600` with symlink-target regression test. |
 | Identify direct network endpoints and telemetry | Partial | Direct update endpoint documented; package managers contact configured remotes; no telemetry client found by inspection, no sandbox capture. |
 | Confirm copyright, GPLv3 intent, and corresponding source availability | Done | Owner confirmed original code and copyright; source repo is public and matching source/build scripts are included at each release tag. |
@@ -97,12 +98,12 @@ approves publication.** This checklist is not authorization to publish.
 | Accurate control metadata and dependencies | Partial | Lintian clean; maintainer/copyright assumptions provisional. |
 | DEP-5 copyright coverage and licence match | Partial | Provisional GPL-3 metadata; owner must confirm grant and copyright. |
 | Maintainer scripts safe/idempotent | Not applicable | No postinst/prerm/postrm scripts are packaged. |
-| Desktop file validation and standard paths/modes | Done | Validated; launcher and files use standard paths; no unsafe write bits found. |
-| AppStream, icons, MIME types, polkit, D-Bus and systemd artifacts | Not done / not applicable | AppStream/icons/MIME/polkit/D-Bus/systemd metadata not packaged; dedicated helper/policy remains a security gap. |
+| Desktop file validation and standard paths/modes | Done | Validated; app icon is installed in hicolor sizes and referenced by desktop entry; no unsafe write bits found. |
+| AppStream, icons, MIME types, polkit, D-Bus and systemd artifacts | Partial | Hicolor application icons and desktop entry are packaged; AppStream/MIME and dedicated polkit/helper metadata are absent. Direct GitHub `.deb` distribution can proceed without AppStream, but not without resolving release blockers. |
 | Lintian `--pedantic` | Done | Clean on Ubuntu 26.04. |
 | Reproducible build | Done on one host | Two same-host builds had identical SHA-256; clean chroot/container and cross-architecture builds not proven. |
 | Install/upgrade/remove/purge test | Not done — release blocker | Never run on the host; perform in disposable environments. |
-| Package size | Done | About 54 KiB compressed; Python source included. |
+| Package size | Partial | Previous package was about 54 KiB; icon assets add size, measure the updated package after final build. |
 
 ## Phase 7 — GitHub repository and release setup
 
@@ -159,6 +160,147 @@ approves publication.** This checklist is not authorization to publish.
    a disposable VM.
 9. Decide whether generic `pkexec` package operations are acceptable for an
    initial release or require a dedicated helper/polkit policy.
+10. After the icon commit is on GitHub, open Settings → General → Social
+    preview and upload `assets/github-social-preview.png`, then save.
+
+## Click-by-click setup guide
+
+### Protect your commit email before pushing this branch
+
+1. Open GitHub → profile menu → **Settings → Emails**.
+2. Enable **Keep my email addresses private** and copy the GitHub-provided
+   `...@users.noreply.github.com` address.
+3. In this repository checkout, configure future commits:
+
+   ```sh
+   git config user.name "Elshad Guliyev"
+   git config user.email "PASTE-YOUR-GITHUB-NOREPLY-ADDRESS-HERE"
+   ```
+
+4. This setting does not change commits already made. The published `main`
+   history already has commits with a personal Gmail-domain author address.
+   The local `pre-release-audit` commits would expose their author email if
+   pushed unchanged. Choose either:
+   - authorize me to rewrite only the unpublished local audit branch to use
+     your GitHub noreply address before it is pushed; or
+   - accept that the address in those new commits will become public.
+
+   A rewrite of the already-published `main` history is a separate, disruptive
+   operation and is not recommended without a deliberate plan.
+
+### Push and review the source changes (not a release)
+
+After deciding the email issue, push the branch and open a pull request:
+
+```sh
+git push -u origin pre-release-audit
+```
+
+On GitHub, compare `pre-release-audit` into `main`, review the changed-file
+list and CI result, then merge the PR. This does **not** create a release.
+The PR includes the app icon, GitHub preview image, package/update changes,
+and audit documents. The generated `.deb` in `dist/` is local/ignored and is
+not committed as source.
+
+### Protect `main`
+
+In **Repository Settings → Rules → Rulesets**, create an active branch
+ruleset targeting the default branch `main`:
+
+- require a pull request before merging;
+- require at least one approval if you have a second trusted reviewer (if you
+  are the sole maintainer, keep the PR requirement and CI check, but do not
+  create an approval rule that nobody can satisfy);
+- require the CI job/status `test-and-package` once it appears after the first
+  PR run;
+- block force pushes and branch deletion.
+
+GitHub reported `main` unprotected during this audit. Do not require a status
+check by an incorrect display name: open the first PR, wait for CI, and select
+the exact successful check name shown by GitHub.
+
+### Add the GitHub social preview
+
+After the image file has merged into `main`:
+
+1. Open the repository → **Settings → General**.
+2. Find **Social preview**, choose **Edit**, and upload
+   `assets/github-social-preview.png` (1200 × 630).
+3. Save and check the repository page/link preview.
+
+The desktop and `.deb` already use the square icon. GitHub's social-preview
+image is a separate repository page setting; it cannot be activated merely by
+committing the file. This does not change the account/profile avatar.
+
+### Require a human approval for releases
+
+In **Repository Settings → Environments → New environment**, create
+`public-release`:
+
+- add a required reviewer (you can approve manually; for independent
+  separation, choose another trusted GitHub account);
+- configure deployment branches/tags to allow version tags matching `v*`;
+- save and review the environment protection settings.
+
+The release workflow uses GitHub's built-in `GITHUB_TOKEN`, with
+`contents: write` only on the release job. **Do not create a PAT, do not add
+`APPECTOR_RELEASES_TOKEN`, and do not paste any token into chat.** A tag push
+starts a real release run; do not push a dummy tag as a gate test. The workflow
+must pause at the environment approval before it uploads the release.
+
+### Test the `.deb` safely on the selected system
+
+The target is the same release series as the audit host: **Ubuntu 26.04 LTS,
+amd64**. This is the first target, not a verified support claim yet. Use a
+fresh disposable VM (GNOME Boxes, VirtualBox or virt-manager), not your
+everyday installation. Give it at least 2 CPUs, 4 GB RAM and 25 GB disk, take
+a VM snapshot before testing, and copy the locally built `.deb` into it.
+
+Inside the VM:
+
+```sh
+dpkg-deb --info ./appector_0.1.0_all.deb
+sudo apt install ./appector_0.1.0_all.deb
+appector --version
+dpkg -L appector | grep -E 'applications/com.appector.appector.desktop|icons/hicolor/.*/com.appector.appector.png'
+```
+
+Launch Appector from the Applications grid and confirm the icon appears in
+the launcher, window/About dialog and app list. Use the app only for
+non-destructive browsing during this basic package test. Then exercise package
+removal/purge in the disposable VM:
+
+```sh
+sudo apt remove appector
+sudo apt install ./appector_0.1.0_all.deb
+sudo apt purge appector
+sudo dpkg --audit
+```
+
+Record any error and the exact distro/version/architecture; remove or revert
+the VM after the test. Do not test package-manager cleanup/removal of other
+software on your host. A version-to-version upgrade test requires a later
+version; GitHub-release `.deb` installs do not update through `apt upgrade`.
+
+### Final decisions to send me
+
+No passwords or tokens are needed. Before I prepare the final release PR,
+please tell me:
+
+1. **Local `.deb` install feature**: implement the metadata/trust/transaction
+   review first (recommended), or disable/defer that feature in the initial
+   release? This is Appector's feature for installing other `.deb` files,
+   not the Appector package being released.
+2. **Commit email**: authorize rewriting the unpublished local branch to use
+   your GitHub noreply address, or accept exposing its current author email?
+3. **Release integrity**: add GitHub provenance attestation before the first
+   binary (recommended; no signing key/token to provide), or accept
+   checksum-only integrity for an explicitly marked pre-release?
+4. **Privileged operations**: accept the current system `pkexec`/polkit
+   prompts for the initial beta, or require a dedicated restricted helper
+   before publication?
+5. Once the VM test is done, send the pass/fail result and any exact error
+   text. Do not send personal logs with usernames or package inventories.
 
 ## Exact commands to tag and publish (do not run without explicit approval)
 

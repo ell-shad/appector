@@ -28,9 +28,11 @@ automated tests pass. These results do **not** establish safe package
 installation/removal, GUI usability, support on the target distributions, or
 release readiness.
 
-The committed tree was cloned locally into a clean checkout: all 16 tests
-passed there, the package built and passed package/desktop validation, and its
-`.deb` bytes matched the working-tree build.
+Before the icon assets were added, the committed audit tree was cloned locally
+into a clean checkout: all 16 tests passed there, and its package passed
+package/desktop validation and matched the worktree build byte-for-byte. The
+later icon and final-documentation changes have been retested in the current
+worktree; a clean-checkout rerun after those changes remains pending.
 
 The owner has confirmed Elshad Guliyev owns the original application code,
 intends to license it under GNU GPL version 3, and selected Ubuntu 26.04 amd64
@@ -55,7 +57,7 @@ no-go for now.
 | Scanners and data model | [`appector/scanners.py`](./appector/scanners.py), `appector/models.py`, `appector/app_item.py` | APT, Snap, Flatpak, AppImage and detected manual apps; “leftovers” are dpkg residual-config packages only. |
 | Package operations | [`appector/actions.py`](./appector/actions.py) | Package-manager and file operations; system authorisation uses `pkexec` where applicable. |
 | Update checker | [`appector/updater.py`](./appector/updater.py) | HTTPS GitHub latest-release API; Debian version ordering; opens release page without downloading/installing. |
-| Debian build | [`scripts/build-deb.sh`](./scripts/build-deb.sh), [`debian/copyright`](./debian/copyright) | Builds an `Architecture: all` binary package; no maintainer scripts. |
+| Debian build | [`scripts/build-deb.sh`](./scripts/build-deb.sh), [`debian/copyright`](./debian/copyright), [`assets/icons/hicolor/`](./assets/icons/hicolor/) | Builds an `Architecture: all` binary package with hicolor icons; no maintainer scripts. |
 | CI/release | [`.github/workflows/ci.yml`](./.github/workflows/ci.yml), [`.github/workflows/release.yml`](./.github/workflows/release.yml) | Tests and packages on CI; a `v*` tag can publish a release in the public source repository. |
 | Tests | [`tests/`](./tests/) | 16 `unittest` tests; safety, updater and source-integrity checks. |
 | User/release documentation | [`README.md`](./README.md), [`SECURITY.md`](./SECURITY.md), [`CONTRIBUTING.md`](./CONTRIBUTING.md), [`CHANGELOG.md`](./CHANGELOG.md) | Drafted; several public-release decisions and settings remain open. |
@@ -86,11 +88,12 @@ performed.
 | A-07 | Medium | Platform/install validation | [`scripts/build-deb.sh`](./scripts/build-deb.sh); [`README.md`](./README.md) | Ubuntu 26.04 amd64 is the owner's first target and the available build host, but the package has not been installed or lifecycle-tested. Other distributions and arm64 are not in the initial support claim. Docker/Podman/LXD were unavailable and no disposable VM image was configured. | **Open; release blocker.** Test install, launch, upgrade, removal and purge in a disposable Ubuntu 26.04 amd64 environment before claiming support. |
 | A-08 | Medium | Residual cleanup and recovery | [`appector/scanners.py:165`](./appector/scanners.py)–205; [`appector/window.py:4174`](./appector/window.py)–4235 | “Leftovers” cover dpkg `rc` residual configuration only, not a general allow-listed filesystem residual engine. Backups are made before purge, but there is no in-app restore/index browser. No labelled precision dataset was run. | **Limited scope documented.** Keep the feature restricted to dpkg-listed conffiles; add restore UX and a labelled dataset before claiming general cleanup. |
 | A-09 | Medium | Update-check throttling/cache | [`appector/updater.py:54`](./appector/updater.py)–65; [`appector/window.py:2328`](./appector/window.py)–2355 | The checker is user-initiated and uses HTTPS, a User-Agent and a timeout, but does not use ETag/conditional requests, a cache, or a configurable disable option. GitHub API behavior was tested with mocks; no live stable release currently exists at the configured destination. | **Open, non-blocking for a strictly manual checker.** Decide whether to retain manual-only behavior or add opt-out, cache and conditional requests before automatic checks are considered. |
-| A-10 | Medium | Debian desktop integration | [`scripts/build-deb.sh`](./scripts/build-deb.sh) | The built package has a desktop entry and man page and passed `desktop-file-validate`, but has no AppStream metainfo, packaged application icon, MIME association, localization catalog, or AppStream validation result. | **Open.** Add metadata/assets before seeking software-center distribution; otherwise keep distribution explicitly limited to direct `.deb` releases. |
+| A-10 | Low | Debian desktop integration | [`scripts/build-deb.sh`](./scripts/build-deb.sh), [`assets/icons/hicolor/`](./assets/icons/hicolor/) | The package now includes the desktop entry and icon in eight hicolor sizes and passes desktop-file validation. AppStream metainfo, MIME association, and localization catalog are absent. | **Partially complete.** Good for direct `.deb` release; add AppStream/MIME/localization before software-center distribution. |
 | A-11 | Medium | Automated quality and source-adapter coverage | [`tests/test_safety.py:1`](./tests/test_safety.py), [`tests/test_updater.py:1`](./tests/test_updater.py) | Sixteen unit tests pass, but tests do not comprehensively cover recorded source-adapter fixtures, residual matching, batch state transitions, failure injection, the GUI, or the distribution matrix. Coverage was not measured. Ruff, mypy, pytest, ShellCheck, gitleaks and TruffleHog were unavailable. | **Open.** Expand tests and run the missing tooling in CI or a disposable test environment. |
 | A-12 | Low | Release process / package lifecycle | [`.github/workflows/release.yml`](./.github/workflows/release.yml), [`README.md`](./README.md) | The package is a direct `.deb`, so it will not update via `apt upgrade`; there is no signed APT repository or rollback/yank drill. Public issue tracking is available, but supported-version policy is not yet published. | **Documented/deferred.** Use the release page for a manually approved pre-release; decide on an APT repository and support policy separately. |
 | A-13 | Medium | Public branch protection | Public GitHub repository settings (`main`) | GitHub reports only `main` as a branch and `protected: false`. A direct push or compromised account could bypass CI/review requirements. | **Open.** Protect `main`, require pull requests and the CI `test-and-package` check, and prevent force-push/deletion. |
-| A-14 | Medium | Public commit email privacy | Public `main` history and local `pre-release-audit` history | Commit metadata uses a Gmail-domain address in all 14 published commits and all 24 local audit-branch commits checked. The actual addresses are intentionally omitted; this is personal contact information, not a detected credential. | **Owner decision before pushing the audit branch.** Enable GitHub's private commit email for future commits. If you do not want this address in the unpublished audit commits, explicitly authorize rewriting that local-only branch before it is pushed. No published history was rewritten. |
+| A-14 | Medium | Public commit email privacy | Public `main` history and local `pre-release-audit` history | Commit metadata uses a Gmail-domain address in the published `main` history and in local audit-branch commits. The actual address is intentionally omitted; this is personal contact information, not a detected credential. | **Owner decision before pushing the audit branch.** Enable GitHub's private commit email for future commits. If you do not want the address in the unpublished audit commits, explicitly authorize rewriting that local-only branch before it is pushed. No published history was rewritten. |
+| A-15 | Low | App and repository icon | [`assets/icons/hicolor/`](./assets/icons/hicolor/), [`assets/github-social-preview.png`](./assets/github-social-preview.png) | Owner-supplied artwork has been cropped to a square app icon, included in the README/About/window, and packaged in standard hicolor sizes. A 1200x630 GitHub social-preview image is ready. | **App/package integration done.** Upload the social preview manually in GitHub Settings after the asset is merged; repository owner avatar is separate and remains unchanged. |
 
 ## Security, privacy and history results
 
@@ -148,6 +151,8 @@ made so far.
 | Packaging | `ba2eb39` | Build reproducible `.deb`; add package and release workflows. |
 | Documentation/audit | `671d13e`, `74bc51f` | Add audit report, test matrix and release guidance; record clean-checkout verification. |
 | Owner follow-up | `6626370`, `0c53f10` | Align metadata, updater and publishing workflow with the public source repository and confirmed copyright; record the owner's intentional `window.txt` deletion. |
+| App icon | `814b042` | Package hicolor icon sizes; apply icon to app windows, About dialog, launcher, README and GitHub preview art. |
+| Release instructions | Complete | [`RELEASE_CHECKLIST.md`](./RELEASE_CHECKLIST.md) includes GitHub setup paths, isolated VM test steps, and the remaining owner decisions. |
 
 ## Owner actions remaining
 
@@ -187,5 +192,6 @@ made so far.
   completed.
 - Ruff, mypy, pytest, ShellCheck, gitleaks and TruffleHog were not installed.
   Shell syntax was checked with `sh -n`; CI is configured to run ShellCheck.
-- Secret scanning covered the local branch and locally reachable Git blobs;
-  public remote branches/tags and the full remote history still need scanning.
+- A manual high-confidence secret-pattern scan covered the public mirror
+  history and local audit commits with no matches. Dedicated scanners were
+  unavailable; repeat a dedicated scan on the final branch before merge.

@@ -11,6 +11,7 @@ Versions use the application's Debian-compatible version order.
 
 - Initial Debian package build and release workflow.
 - Manual check for stable updates through GitHub Releases.
+- Add the Appector application icon to the desktop app, Debian package, and GitHub branding assets.
 - Regression tests for removal protection, private logs, and update version checks.
 
 ### Fixed

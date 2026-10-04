@@ -5,6 +5,13 @@ and performing package-management tasks on Linux. It can list APT, Snap,
 Flatpak, AppImage, and detected manual installs; install local `.deb`,
 `.flatpakref`, and AppImage files; and preview selected cleanup operations.
 
+<p align="center">
+  <img src="assets/icons/hicolor/256x256/apps/com.appector.appector.png" width="160" alt="Appector app icon: a package box and magnifying glass">
+</p>
+
+Repository social-preview artwork is available at
+[`assets/github-social-preview.png`](assets/github-social-preview.png).
+
 Appector is not affiliated with or endorsed by Debian, Ubuntu, Canonical,
 Flathub, or the Snap Store.
 
