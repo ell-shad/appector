@@ -16,6 +16,7 @@ Flatpak, AppImage, and detected manual installs; install local `.deb`,
 - Uninstall existing apps those were installed form different sources, manually, APT, snap, AppiIage, FLatpak. Batch uninstall is also supported.
 - Install applications from .deb, .AppImage, .flatpakref files or directly from FlatHub URL/ID. Batch install is also supported, as well as drag & drop.
 - Find duplicate application in the system.
+- Check for application updates in one place. (Except manually installed apps)
 - Export existing app list as CSV or JSON.
 - (EXPERIMENTAL)Remove APT, Flatpak residuals.
 
