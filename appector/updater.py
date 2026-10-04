@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
-RELEASE_REPOSITORY = "ell-shad/appector-releases"
+RELEASE_REPOSITORY = "ell-shad/appector"
 LATEST_RELEASE_URL = (
     f"https://api.github.com/repos/{RELEASE_REPOSITORY}/releases/latest"
 )

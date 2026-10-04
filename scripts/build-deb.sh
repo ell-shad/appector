@@ -58,7 +58,7 @@ Version: $VERSION
 Section: utils
 Priority: optional
 Architecture: all
-Maintainer: Appector maintainers <ell-shad@users.noreply.github.com>
+Maintainer: Elshad Guliyev <ell-shad@users.noreply.github.com>
 Homepage: https://github.com/ell-shad/appector
 Description: GTK application manager for Linux
  Manage installed applications and software sources with a GTK desktop app.
@@ -78,7 +78,7 @@ appector ($VERSION) unstable; urgency=medium
 
   * Initial packaged release candidate.
 
- -- Appector maintainers <ell-shad@users.noreply.github.com>  $CHANGELOG_DATE
+ -- Elshad Guliyev <ell-shad@users.noreply.github.com>  $CHANGELOG_DATE
 EOF
 gzip -9n "$STAGING/usr/share/doc/appector/changelog"
 

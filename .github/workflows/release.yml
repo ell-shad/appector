@@ -12,8 +12,10 @@ jobs:
   release:
     runs-on: ubuntu-24.04
     environment: public-release
+    permissions:
+      contents: write
     steps:
-      - name: Check out private source
+      - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Install package validation tools
@@ -79,20 +81,15 @@ jobs:
               raise SystemExit(f"No changelog section found for {tag}.")
           PY
 
-      - name: Publish package to public release repository
+      - name: Publish package to GitHub Release
         env:
-          GH_TOKEN: ${{ secrets.APPECTOR_RELEASES_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          test -n "$GH_TOKEN" || {
-            echo "Configure the APPECTOR_RELEASES_TOKEN Actions secret first." >&2
-            exit 1
-          }
           release_args=()
           case "$GITHUB_REF_NAME" in
             v0.*) release_args+=(--prerelease) ;;
           esac
           gh release create "$GITHUB_REF_NAME" dist/*.deb dist/SHA256SUMS \
-            --repo ell-shad/appector-releases \
             --title "Appector $GITHUB_REF_NAME" \
             --notes-file dist/release-notes.md \
             "${release_args[@]}"

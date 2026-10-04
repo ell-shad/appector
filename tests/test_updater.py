@@ -36,7 +36,7 @@ class ReleaseCheckTests(unittest.TestCase):
         payload = {
             "tag_name": "v0.2.0",
             "html_url": (
-                "https://github.com/ell-shad/appector-releases/"
+                "https://github.com/ell-shad/appector/"
                 "releases/tag/v0.2.0"
             ),
         }

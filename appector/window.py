@@ -2299,8 +2299,8 @@ class MainWindow(Adw.ApplicationWindow):
                 transient_for=self,
                 application_name="Appector",
                 version=__version__,
-                developer_name="Appector contributors",
-                copyright="© 2026 Appector contributors",
+                developer_name="Elshad Guliyev",
+                copyright="© 2026 Elshad Guliyev",
                 website="https://github.com/ell-shad/appector",
             )
             about.set_license_type(Gtk.License.GPL_3_0)
