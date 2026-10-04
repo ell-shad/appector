@@ -2,7 +2,8 @@
 set -eu
 umask 022
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 VERSION=$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' "$ROOT/appector/__init__.py")
 
 if [ -z "$VERSION" ]; then
