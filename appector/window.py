@@ -1045,21 +1045,6 @@ class MainWindow(Adw.ApplicationWindow):
 
         return False
 
-    def on_show_leftovers_toggled(self, button):
-        self.show_leftovers = button.get_active()
-        self._unmark_hidden_advanced_items()
-        self.rebuild_list()
-
-    def on_show_advanced_apps_toggled(self, button):
-        self.show_advanced_apps = button.get_active()
-        self._unmark_hidden_advanced_items()
-        self.rebuild_list()
-
-    def on_hide_basic_apps_toggled(self, button):
-        self.hide_basic_apps = button.get_active()
-        self._unmark_hidden_advanced_items()
-        self.rebuild_list()
-                    
     # ------------------------------------------------------------
     # Flatpak installation
     # ------------------------------------------------------------
@@ -3337,178 +3322,6 @@ class MainWindow(Adw.ApplicationWindow):
                 pass
 
     # ------------------------------------------------------------
-    # Leftover config helpers
-    # ------------------------------------------------------------
-
-    def get_marked_leftover_entries(self):
-        return [
-            app
-            for app in self.get_marked_entries()
-            if getattr(app, "manager", "") == "Leftover"
-        ]
-
-    def unmark_all_leftovers(self):
-        changed = False
-
-        for app in self.get_leftover_entries():
-            key = app_key(app)
-
-            if key and key in self.marked_keys:
-                self.marked_keys.remove(key)
-                changed = True
-
-        if changed:
-            self.save_marked_keys()
-            self.rebuild_list()
-
-    def on_select_all_leftovers_toggled(self, button):
-        if getattr(self, "_updating_select_all_leftovers", False):
-            return
-
-        if button.get_active():
-            self.mark_all_leftovers()
-        else:
-            self.unmark_all_leftovers()
-
-    # ------------------------------------------------------------
-    # Leftover purge
-    # ------------------------------------------------------------
-
-    def on_purge_leftovers_clicked(self, button=None):
-        leftovers = self.get_marked_leftover_entries()
-
-        if not leftovers:
-            self.show_toast("No leftovers selected")
-            return
-
-        package_ids = [
-            getattr(app, "package_id", "")
-            for app in leftovers
-            if getattr(app, "package_id", "")
-        ]
-
-        if not package_ids:
-            self.show_message(
-                "No valid leftovers selected",
-                "Selected leftover items do not have valid package IDs.",
-                Gtk.MessageType.WARNING,
-            )
-            return
-
-        lines = []
-
-        lines.append(
-            "These packages are already removed; purging deletes only their remaining "
-            "configuration files."
-        )
-        lines.append("")
-        lines.append("The following APT configurations will be purged:")
-        lines.append("")
-
-        for package_id in package_ids[:30]:
-            lines.append(f"• {package_id}")
-
-        if len(package_ids) > 30:
-            lines.append(f"• …and {len(package_ids) - 30} more")
-
-        message = "\n".join(lines)
-
-        dialog = Gtk.MessageDialog(
-            transient_for=self,
-            modal=True,
-        )
-
-        dialog.set_resizable(False)
-        dialog.set_property("message-type", Gtk.MessageType.WARNING)
-        dialog.set_property("text", f"Purge {len(package_ids)} leftover packages?")
-        dialog.set_property("secondary-text", message)
-
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-
-        purge_button = dialog.add_button("Purge", Gtk.ResponseType.OK)
-        purge_button.add_css_class("destructive-action")
-
-        dialog.connect(
-            "response",
-            self.on_purge_leftovers_confirm_response,
-            leftovers,
-        )
-
-        dialog.present()
-
-    def on_purge_leftovers_confirm_response(self, dialog, response, leftovers):
-        dialog.close()
-
-        if response != Gtk.ResponseType.OK:
-            return
-
-        self.start_purge_leftovers(leftovers)
-
-    def start_purge_leftovers(self, leftovers):
-        self._pending_leftover_keys = [app_key(app) for app in leftovers]
-
-        package_ids = [
-            getattr(app, "package_id", "")
-            for app in leftovers
-            if getattr(app, "package_id", "")
-        ]
-
-        self.install_progress_window = InstallProgressWindow(
-            self,
-            "Purging leftovers",
-        )
-
-        self.install_progress_window.present()
-        self.install_progress_window.start_pulse()
-        self.install_progress_window.set_status("Purging leftover configuration packages…")
-
-        thread = threading.Thread(
-            target=self.purge_leftover_worker,
-            args=(package_ids,),
-            daemon=True,
-        )
-
-        thread.start()
-
-    def purge_leftover_worker(self, package_ids):
-        def output_callback(line):
-            if self.install_progress_window:
-                GLib.idle_add(
-                    self.install_progress_window.append_output,
-                    line,
-                )
-
-        success, message = purge_leftover_configs(
-            package_ids,
-            output_callback=output_callback,
-        )
-
-        GLib.idle_add(
-            self.on_purge_leftovers_finished,
-            success,
-            message,
-        )
-
-    def on_purge_leftovers_finished(self, success, message):
-        if self.install_progress_window:
-            self.install_progress_window.stop_pulse()
-
-            if success:
-                self.install_progress_window.finish_batch_results(message)
-
-                for key in getattr(self, "_pending_leftover_keys", []):
-                    self.marked_keys.discard(key)
-
-                self.save_marked_keys()
-                self._pending_leftover_keys = []
-
-                self.reload()
-            else:
-                self.install_progress_window.finish_failure(message)
-
-        return False
-
-    # ------------------------------------------------------------
     # Icon + name column
     # ------------------------------------------------------------
 
@@ -4670,32 +4483,6 @@ class MainWindow(Adw.ApplicationWindow):
             daemon=True,
         )
         thread.start()
-    # ------------------------------------------------------------
-    # Leftover selection
-    # ------------------------------------------------------------
-    def unmark_all_leftovers(self):
-        changed = False
-
-        for app in self.get_leftover_entries():
-            key = app_key(app)
-
-            if key and key in self.marked_keys:
-                self.marked_keys.remove(key)
-                changed = True
-
-        if changed:
-            self.save_marked_keys()
-            self.rebuild_list()
-
-    def on_select_all_leftovers_toggled(self, button):
-        if getattr(self, "_updating_select_all_leftovers", False):
-            return
-
-        if button.get_active():
-            self.mark_all_leftovers()
-        else:
-            self.unmark_all_leftovers()
-
     def batch_worker(self, apps, purge=False):
         def progress_callback(current, total, message):
             if self.install_progress_window:
@@ -4788,35 +4575,6 @@ class MainWindow(Adw.ApplicationWindow):
 
         dialog.present()
         
-    # ------------------------------------------------------------
-    # Advanced visibility helpers
-    # ------------------------------------------------------------
-
-    def _entry_hidden_by_advanced_options(self, app):
-        manager = getattr(app, "manager", "")
-
-        is_leftover = manager == "Leftover"
-        is_advanced = is_leftover or not getattr(app, "is_gui_app", True)
-
-        if is_advanced:
-            if is_leftover:
-                return not self.show_leftovers
-
-            return not self.show_advanced_apps
-
-        return self.hide_basic_apps
-
-    def _unmark_hidden_advanced_items(self):
-        hidden_keys = set()
-
-        for app in self.current_apps:
-            if self._entry_hidden_by_advanced_options(app):
-                hidden_keys.add(app_key(app))
-
-        if hidden_keys:
-            self.marked_keys.difference_update(hidden_keys)
-            self.save_marked_keys()
-
     def _show_confirm_dialog(self, title, message, confirm_label, on_confirm_callback, *callback_args):
         if hasattr(Adw, "AlertDialog"):
             dialog = Adw.AlertDialog.new(title, message)
