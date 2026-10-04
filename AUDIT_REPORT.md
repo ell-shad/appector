@@ -28,10 +28,10 @@ automated tests pass. These results do **not** establish safe package
 installation/removal, GUI usability, support on the target distributions, or
 release readiness.
 
-The final committed tree still needs a clean-worktree rerun after the current
-local-package review and provenance changes. A built `.deb` passed local
-metadata inspection, APT simulation, `lintian --pedantic`, and desktop-file
-validation; no install was run by the audit.
+The rewritten branch passed a clean-worktree run of all 25 tests, package
+build, `lintian --pedantic`, desktop-file validation and byte-for-byte build
+comparison. The resulting `.deb` also passed metadata inspection and APT
+simulation; no install was run by the audit.
 
 The owner has confirmed Elshad Guliyev owns the original application code,
 intends to license it under GNU GPL version 3, and selected Ubuntu 26.04 amd64
@@ -92,7 +92,7 @@ performed.
 | A-11 | Medium | Automated quality and source-adapter coverage | [`tests/`](./tests/) | Twenty-five unit tests pass, but tests do not comprehensively cover recorded source-adapter fixtures, residual matching, batch state transitions, failure injection, the GUI, or the distribution matrix. Coverage was not measured. Ruff, mypy, pytest, ShellCheck, gitleaks and TruffleHog were unavailable. | **Open.** Expand tests and run the missing tooling in CI or a disposable test environment. |
 | A-12 | Low | Release process / package lifecycle | [`.github/workflows/release.yml`](./.github/workflows/release.yml), [`README.md`](./README.md) | The package is a direct `.deb`, so it will not update via `apt upgrade`; there is no signed APT repository or rollback/yank drill. Public issue tracking is available, but supported-version policy is not yet published. | **Documented/deferred.** Use the release page for a manually approved pre-release; decide on an APT repository and support policy separately. |
 | A-13 | Medium | Public branch protection | Public GitHub repository settings (`main`) | GitHub reports no repository rulesets and `main` as unprotected. A direct push or compromised account could bypass CI/review requirements. | **Open.** Create an active ruleset for `main`, require pull requests and the CI check, and prevent force-push/deletion. |
-| A-14 | Medium | Public commit identity privacy | Public `main` history and local `pre-release-audit` history | Some already-published commits use the author identity recorded at the time; the unpublished audit branch still needs identity cleanup before it is pushed. | **Local branch rewrite authorized and pending.** Rewrite the unpublished branch to use the owner's GitHub noreply identity. This does not alter any history already published on `main`. |
+| A-14 | Medium | Public commit identity privacy | Public `main` history and local `pre-release-audit` history | Some already-published commits use the author identity recorded at the time; all unpublished audit commits have now been rewritten to the owner's GitHub noreply identity. | **Local rewrite complete.** Only the unpublished branch was rewritten; already-published `main` is untouched. |
 | A-15 | Low | App and repository icon | [`assets/icons/hicolor/`](./assets/icons/hicolor/), [`assets/github-social-preview.png`](./assets/github-social-preview.png) | Owner-supplied artwork has been cropped to a square app icon, included in the README/About/window, and packaged in standard hicolor sizes. A 1200x630 GitHub social-preview image is ready. | **App/package integration done.** Upload the social preview manually in GitHub Settings after the asset is merged; repository owner avatar is separate and remains unchanged. |
 
 ## Security, privacy and history results
@@ -104,15 +104,13 @@ performed.
   **not** equivalent to gitleaks/TruffleHog; dedicated scanners were
   unavailable. No live credential was identified.
 - The source repository is public. Some published commits retain author
-  metadata that predates the privacy settings. The owner authorized rewriting
-  only the unpublished audit branch to use the GitHub noreply identity before
-  push; published `main` will not be rewritten. No actual personal address is
-  included in this report.
-- The final `.deb` includes Appector's Python source files and eight hicolor
-  icon assets by design. Package paths, caches, embedded build paths and file
-  modes should be rechecked after the final build. It contains no vendored
-  runtime libraries by design.
-  (55,000 bytes for this build).
+  metadata that predates the privacy settings. The unpublished audit branch
+  was rewritten to use the GitHub noreply identity; published `main` was not
+  rewritten. No actual personal address is included in this report.
+- The final `.deb` is 375,874 bytes and includes Appector's Python source
+  files and eight hicolor icon assets by design. Its 24 regular files contain
+  no `.git`, bytecode caches, embedded local build paths or group/world-write
+  bits. It contains no vendored runtime libraries by design.
 - Activity logs are created under the user state directory with mode `0700`
   and file mode `0600`, with symlink checks. New installed-app exports use a
   mode-`0600` temporary file followed by atomic replacement; the test verifies

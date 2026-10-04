@@ -12,7 +12,7 @@ approves publication.** This checklist is not authorization to publish.
 | Map privileged helper, polkit, D-Bus and system services | Done | `pkexec` and system package managers are used; no dedicated helper/action IDs, D-Bus service or systemd unit found. |
 | Document package/runtime prerequisites | Done | Debian runtime dependencies are declared; no pip distribution is required. |
 | Build from documented source commands | Done | `python3 -m unittest discover -s tests -v`; `./scripts/build-deb.sh`; package validation. |
-| Clean-checkout build after audit commits | Pending | Repeat after the package-review and provenance changes are committed. |
+| Clean-checkout build after audit commits | Done | After the local identity rewrite, all 25 tests passed in an isolated worktree; package passed lintian/desktop validation and matched the local build byte-for-byte. |
 | Confirm every user-visible/build/tag version agrees | Done | CLI/About/build/tag gate use `appector/__init__.py`; release tag must be `v0.1.0` for current version. |
 | Confirm runtime/build dependency versions and licences | Partial | Source inventory found standard-library and system GI imports, with no vendored application code/assets; review target archive dependency licences and vulnerabilities. |
 | Application icon and GitHub branding asset | Partial | Icon is packaged and shown in the README/About dialog; preview artwork is ready, but upload `assets/github-social-preview.png` manually in Settings → General → Social preview. |
@@ -23,7 +23,7 @@ approves publication.** This checklist is not authorization to publish.
 |---|---|---|
 | Scan working tree and locally reachable history for high-confidence secret patterns | Partial | Manual pattern scan found no matches; gitleaks/TruffleHog unavailable. |
 | Scan all public remote refs/history for high-confidence secret patterns | Partial | Public mirror scan covered 14 commits and 101 blobs with no matches; dedicated scanners still unavailable. |
-| Review commit author/committer metadata | In progress | Owner enabled GitHub private email and authorized rewriting unpublished audit-branch commits before push. |
+| Review commit author/committer metadata | Done | All unpublished commits now use the GitHub noreply identity. |
 | Review Debian Maintainer identity | Done | Package metadata uses `Elshad Guliyev <ell-shad@users.noreply.github.com>`. |
 | Inspect final `.deb` paths, caches, local paths and permissions | Done | No build paths/caches/vendor files/group-world-writable files detected; source `.py` files are included. |
 | Review screenshots/icons/sample data for private information | Done for supplied branding | No application screenshot or sample user data is bundled. The chosen icon and generated social-preview image were visually reviewed; no personal information is visible. |
@@ -103,7 +103,7 @@ approves publication.** This checklist is not authorization to publish.
 | Lintian `--pedantic` | Done | Clean on Ubuntu 26.04. |
 | Reproducible build | Done on one host | Two same-host builds had identical SHA-256; clean chroot/container and cross-architecture builds not proven. |
 | Install/upgrade/remove/purge test | Needs result confirmation | Owner reports successful app testing without issues; confirm whether package install, remove and purge were tested in a disposable Ubuntu VM. |
-| Package size | Pending final build | Measure after local-package review changes; previous icon-enabled package was about 365 KiB. |
+| Package size | Done | Final package is 375,874 bytes (about 367 KiB). |
 
 ## Phase 7 — GitHub repository and release setup
 
