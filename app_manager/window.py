@@ -97,23 +97,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.sidebar_toggle_btn.connect("toggled", self.on_sidebar_toggle_btn_toggled)
         header.pack_start(self.sidebar_toggle_btn)
 
-        # ------------------------------------------------------------
-        # Install menu (+)
-        # ------------------------------------------------------------
-        install_menu_model = Gio.Menu()
-        install_menu_model.append("Install…", "win.install")
-
-        if not hasattr(self, "install_menu_btn"):
-            self.install_menu_btn = Gtk.MenuButton()
-            self.install_menu_btn.set_icon_name("list-add-symbolic")
-            self.install_menu_btn.set_tooltip_text(
-                "Install apps or drop .deb/.flatpakref/.AppImage files"
-            )
-            header.pack_start(self.install_menu_btn)
-
-        self.install_menu_btn.set_menu_model(install_menu_model)
-
-        # Right: Refresh
+        # Keep display-mode controls beside navigation, separate from the main menu.
         self.table_view_button = Gtk.ToggleButton(
             icon_name="view-list-symbolic",
             tooltip_text="Table view",
@@ -135,8 +119,11 @@ class MainWindow(Adw.ApplicationWindow):
             self.on_view_mode_toggled,
             "grid",
         )
-        header.pack_end(self.grid_view_button)
-        header.pack_end(self.table_view_button)
+        view_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        view_controls.add_css_class("linked")
+        view_controls.append(self.table_view_button)
+        view_controls.append(self.grid_view_button)
+        header.pack_start(view_controls)
 
         self.reload_button = Gtk.Button(
             icon_name="view-refresh-symbolic", 
@@ -151,18 +138,25 @@ class MainWindow(Adw.ApplicationWindow):
         # ------------------------------------------------------------
         primary_menu_model = Gio.Menu()
 
+        install_section = Gio.Menu()
+        install_section.append("Install apps…", "win.install")
+        primary_menu_model.append_section("Applications", install_section)
+
         maintenance_section = Gio.Menu()
         maintenance_section.append("Cleanup & residuals…", "win.cleanup-residuals")
         primary_menu_model.append_section("Maintenance", maintenance_section)
 
         misc_section = Gio.Menu()
-        misc_section.append("Check for available updates", "win.check-updates")
+        misc_section.append("Check for installed app updates…", "win.check-updates")
         misc_section.append("Export installed app list as CSV…", "win.export-app-list")
         misc_section.append("Export installed app list as JSON…", "win.export-app-list-json")
         misc_section.append("Activity Log", "win.show-log")
         misc_section.append("Keyboard Shortcuts", "win.shortcuts")
-        misc_section.append("About Appector", "win.about")
         primary_menu_model.append_section(None, misc_section)
+
+        app_section = Gio.Menu()
+        app_section.append("About Appector", "win.about")
+        primary_menu_model.append_section("Appector", app_section)
 
         if not hasattr(self, "primary_menu_btn"):
             self.primary_menu_btn = Gtk.MenuButton()
@@ -554,10 +548,13 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.present()
 
     def on_check_updates_clicked(self, button=None):
-        self.progress_window = ProgressWindow(self, "Checking for updates")
+        self.progress_window = ProgressWindow(
+            self,
+            "Checking for installed app updates",
+        )
         self.progress_window.present()
         self.progress_window.start_indeterminate(
-            "Checking available APT, Flatpak, and Snap updates…"
+            "Checking available APT, Flatpak, and Snap package updates…"
         )
         threading.Thread(
             target=self.check_updates_worker,
@@ -2198,6 +2195,8 @@ class MainWindow(Adw.ApplicationWindow):
                 app.set_accels_for_action("win.mark-all", ["<Ctrl>a"])
                 app.set_accels_for_action("win.clear-marks", ["<Ctrl><Shift>a"])
                 app.set_accels_for_action("win.toggle-search", ["<Ctrl>f"])
+                app.set_accels_for_action("win.check-updates", ["<Ctrl>u"])
+                app.set_accels_for_action("win.export-app-list", ["<Ctrl><Shift>e"])
                 app.set_accels_for_action("win.remove-marked", ["Delete"])
             except Exception:
                 pass
@@ -2284,8 +2283,10 @@ class MainWindow(Adw.ApplicationWindow):
                 application_name="Appector",
                 version="1.0.0",
                 developer_name="Appector contributors",
-                copyright="© 2024 Appector contributors",
+                copyright="© 2026 Appector contributors",
+                website="https://github.com/ell-shad/appector",
             )
+            about.set_license_type(Gtk.License.GPL_3_0)
             about.present()
         else:
             about = Gtk.AboutDialog(
@@ -2295,6 +2296,8 @@ class MainWindow(Adw.ApplicationWindow):
             about.set_program_name("Appector")
             about.set_version("1.0.0")
             about.set_comments("Unified installed app inventory")
+            about.set_website("https://github.com/ell-shad/appector")
+            about.set_license_type(Gtk.License.GPL_3_0)
             about.present()
 
 
@@ -2345,6 +2348,18 @@ class MainWindow(Adw.ApplicationWindow):
                       <object class="GtkShortcutsShortcut">
                         <property name="title">Activity Log</property>
                         <property name="accelerator">&lt;Ctrl&gt;l</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkShortcutsShortcut">
+                        <property name="title">Check for installed app updates</property>
+                        <property name="accelerator">&lt;Ctrl&gt;u</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkShortcutsShortcut">
+                        <property name="title">Export installed app list as CSV</property>
+                        <property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;e</property>
                       </object>
                     </child>
                   </object>
@@ -2913,6 +2928,10 @@ class MainWindow(Adw.ApplicationWindow):
         )
         dialog.set_resizable(True)
         dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+        dialog.connect(
+            "response",
+            lambda current_dialog, _response: current_dialog.close(),
+        )
 
         content = dialog.get_content_area()
         content.set_spacing(12)
