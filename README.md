@@ -1,6 +1,6 @@
 # Appector
 
-Appector is a GTK 4/libadwaita desktop app for inspecting installed software
+Appector is a desktop app for listing, removing or installing software
 and performing package-management tasks on Linux. It can list APT, Snap,
 Flatpak, AppImage, and detected manual installs; install local `.deb`,
 `.flatpakref`, and AppImage files; and preview selected cleanup operations.
@@ -9,12 +9,20 @@ Flatpak, AppImage, and detected manual installs; install local `.deb`,
   <img src="assets/icons/hicolor/256x256/apps/com.appector.appector.png" width="160" alt="Appector app icon: a package box and magnifying glass">
 </p>
 
-Repository social-preview artwork is available at
-[`assets/github-social-preview.png`](assets/github-social-preview.png).
 
-Appector is not affiliated with or endorsed by Debian, Ubuntu, Canonical,
-Flathub, or the Snap Store.
 
+## Features
+
+- Uninstall existing apps those were installed form different sources, manually, APT, snap, AppiIage, FLatpak. Batch uninstall is also supported.
+- Install applications from .deb, .AppImage, .flatpakref files or directly from FlatHub URL/ID. Batch install is also supported, as well as drag & drop.
+- Find duplicate application in the system.
+- Export existing app list as CSV or JSON.
+- (EXPERIMENTAL)Remove APT, Flatpak residuals.
+
+## Limitations
+- Appector only supports Debian based distributions at the moment.
+- No fully back-up/restor functionality is implemented still, any modifications should be done with caution.
+  
 ## Download and install
 
 The source repository is public:
@@ -205,6 +213,9 @@ distributed under the GNU General Public License version 3; see
 currently bundled. Runtime libraries such as Python, PyGObject, GTK 4,
 libadwaita, and GdkPixbuf are system dependencies and retain their own
 licences.
+
+Appector is not affiliated with or endorsed by Debian, Ubuntu, Canonical,
+Flathub, or the Snap Store.
 
 For security issues, follow [`SECURITY.md`](./SECURITY.md). Do not include
 credentials or unredacted private logs in public reports.
