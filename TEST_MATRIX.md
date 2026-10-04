@@ -51,7 +51,7 @@ audit.
 | Public default-branch protection | GitHub public API | **Fail / not configured** | Repository has zero rulesets and `main` is reported as unprotected. |
 | Release environment tag restriction | GitHub public API | **Pass: `v*`** | `public-release` exists and permits tags matching `v*`; required reviewer is absent and administrators can bypass protection. |
 | GitHub artifact provenance workflow | Local workflow configuration | **Configured; not executed** | Release job requests OIDC/attestations permission and pins `actions/attest-build-provenance`; verify an attestation after the first approved release. |
-| Commit author email privacy | Published history / unpublished branch | **Pass for unpublished branch** | All 17 unpublished commits now use GitHub noreply; previously published `main` history was left untouched. |
+| Commit author email privacy | Published history / unpublished branch | **Pass for unpublished branch** | Every unpublished commit in this branch uses GitHub noreply; previously published `main` history was left untouched. |
 | Shell script syntax | POSIX shell parser | **Pass** | `sh -n scripts/build-deb.sh`. |
 | First deterministic `.deb` build | Ubuntu 26.04 amd64 | **Pass** | Produces `dist/appector_0.1.0_all.deb`. |
 | Repeated deterministic `.deb` build | Same host/checkout | **Pass** | Repeated builds had identical SHA-256; the clean-worktree package was byte-identical. Final package size is about 367 KiB. |
