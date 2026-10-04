@@ -1,0 +1,13 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Appector
+Source: https://github.com/ell-shad/appector
+
+Files: *
+Copyright: 2026 Appector contributors
+License: GPL-3
+ This package is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the
+ Free Software Foundation, version 3.
+ .
+ On Debian systems, the complete text of version 3 of the GNU General
+ Public License can be found in /usr/share/common-licenses/GPL-3.
