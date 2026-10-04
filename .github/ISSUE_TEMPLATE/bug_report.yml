@@ -1,0 +1,44 @@
+name: Bug report
+description: Report an Appector issue
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution and release
+      description: For example, Ubuntu 24.04 or Debian 13.
+    validations:
+      required: true
+  - type: input
+    id: architecture
+    attributes:
+      label: Architecture
+      placeholder: amd64 or arm64
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: Appector version
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs or error output
+      description: Remove usernames, home paths, tokens, and private app lists before posting.
+    validations:
+      required: false

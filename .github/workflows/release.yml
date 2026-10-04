@@ -1,0 +1,132 @@
+name: Build and publish Debian package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Install package validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            desktop-file-utils gir1.2-adw-1 gir1.2-gdkpixbuf-2.0 \
+            gir1.2-gtk-4.0 lintian python3-gi shellcheck
+
+      - name: Verify tag matches application version
+        run: |
+          version=$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' appector/__init__.py)
+          test "$GITHUB_REF_NAME" = "v$version" || {
+            echo "Tag $GITHUB_REF_NAME does not match application version v$version" >&2
+            exit 1
+          }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "Release tags must point to a commit already reachable from main." >&2
+            exit 1
+          }
+
+      - name: Run release checks
+        run: |
+          python3 -m unittest discover -s tests -v
+          python3 -m compileall -q appector
+          sh -n scripts/build-deb.sh
+          shellcheck scripts/build-deb.sh
+
+      - name: Build Debian package
+        run: ./scripts/build-deb.sh
+
+      - name: Validate package
+        run: |
+          package=$(find dist -maxdepth 1 -name '*.deb' -print -quit)
+          test -n "$package"
+          dpkg-deb --info "$package"
+          lintian --pedantic "$package"
+          desktop-file-validate build/appector_*/usr/share/applications/com.appector.appector.desktop
+
+      - name: Attest Debian package provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: dist/*.deb
+
+      - name: Generate release checksum and notes from changelog
+        run: |
+          cd dist
+          sha256sum ./*.deb > SHA256SUMS
+          python3 - "$GITHUB_REF_NAME" "$GITHUB_WORKSPACE/CHANGELOG.md" > release-notes.md <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          tag = sys.argv[1]
+          version = tag.removeprefix("v")
+          changelog = Path(sys.argv[2]).read_text(encoding="utf-8")
+          lines = changelog.splitlines()
+          heading = re.compile(rf"^## \[{re.escape(version)}\](?:\s+-.*)?$")
+          for index, line in enumerate(lines):
+              if heading.match(line):
+                  notes = []
+                  for item in lines[index + 1:]:
+                      if item.startswith("## "):
+                          break
+                      notes.append(item)
+                  rendered = "\n".join(notes).strip()
+                  if rendered:
+                      print(rendered)
+                      break
+                  raise SystemExit(f"No release notes found for {tag}.")
+          else:
+              raise SystemExit(f"No changelog section found for {tag}.")
+          PY
+
+      - name: Upload release assets for approval
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-assets
+          path: |
+            dist/*.deb
+            dist/SHA256SUMS
+            dist/release-notes.md
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: public-release
+    permissions:
+      contents: write
+    steps:
+      - name: Download reviewed release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Publish package to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          release_args=()
+          case "$GITHUB_REF_NAME" in
+            v0.*) release_args+=(--prerelease) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" dist/*.deb dist/SHA256SUMS \
+            --title "Appector $GITHUB_REF_NAME" \
+            --notes-file dist/release-notes.md \
+            "${release_args[@]}"

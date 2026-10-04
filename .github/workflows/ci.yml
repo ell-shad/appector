@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install package validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            desktop-file-utils gir1.2-adw-1 gir1.2-gdkpixbuf-2.0 \
+            gir1.2-gtk-4.0 lintian python3-gi shellcheck
+
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Compile application modules
+        run: python3 -m compileall -q appector
+
+      - name: Check packaging shell script
+        run: |
+          sh -n scripts/build-deb.sh
+          shellcheck scripts/build-deb.sh
+
+      - name: Build and inspect Debian package
+        run: |
+          ./scripts/build-deb.sh
+          package=$(find dist -maxdepth 1 -name '*.deb' -print -quit)
+          test -n "$package"
+          dpkg-deb --info "$package"
+          lintian --pedantic "$package"
+          desktop-file-validate build/appector_*/usr/share/applications/com.appector.appector.desktop

@@ -1,9 +1,12 @@
-import gi
-import shutil
-import json
-import subprocess
 import csv
+import json
+import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
+
+import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
@@ -18,6 +21,8 @@ from .models import mark_duplicate_apps
 from .app_item import AppItem
 from .details import DetailsWindow
 from .progress import ProgressWindow, InstallProgressWindow
+from . import __version__
+from .updater import check_for_update
 from .actions import (
     app_key,
     can_remove,
@@ -33,6 +38,7 @@ from .actions import (
     install_flatpak_app_id_batch,
     extract_flathub_app_id,
     parse_flatpak_app_inputs,
+    review_deb_batch,
     purge_leftover_configs,
     get_apt_autoremove_preview,
     execute_apt_autoremove,
@@ -54,6 +60,7 @@ class MainWindow(Adw.ApplicationWindow):
             default_width=1250,
             default_height=760,
         )
+        self.set_icon_name("com.appector.appector")
 
         self.search_text = ""
         self.marked_only = False
@@ -148,6 +155,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         misc_section = Gio.Menu()
         misc_section.append("Check for installed app updates…", "win.check-updates")
+        misc_section.append("Check for Appector updates…", "win.check-appector-updates")
         misc_section.append("Export installed app list as CSV…", "win.export-app-list")
         misc_section.append("Export installed app list as JSON…", "win.export-app-list-json")
         misc_section.append("Activity Log", "win.show-log")
@@ -837,13 +845,20 @@ class MainWindow(Adw.ApplicationWindow):
             }
             for app in self.current_apps
         ]
+        descriptor = None
+        temporary_path = None
         try:
-            with open(
-                path,
+            descriptor, temporary_path = tempfile.mkstemp(
+                prefix=".appector-export-",
+                dir=str(Path(path).parent),
+            )
+            with os.fdopen(
+                descriptor,
                 "w",
                 encoding="utf-8",
                 newline="" if file_format == "csv" else None,
             ) as output:
+                descriptor = None
                 if file_format == "json":
                     json.dump(rows, output, ensure_ascii=False, indent=2)
                     output.write("\n")
@@ -851,10 +866,28 @@ class MainWindow(Adw.ApplicationWindow):
                     writer = csv.DictWriter(output, fieldnames=fields)
                     writer.writeheader()
                     writer.writerows(rows)
-        except OSError as error:
+            os.replace(temporary_path, path)
+            temporary_path = None
+        except (OSError, csv.Error, TypeError) as error:
+            cleanup_note = ""
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as cleanup_error:
+                    cleanup_note = f"\nTemporary export descriptor could not be closed: {cleanup_error}"
+            if temporary_path:
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as cleanup_error:
+                    cleanup_note += (
+                        f"\nTemporary export file could not be removed: "
+                        f"{cleanup_error}"
+                    )
             self.show_message(
                 "Export failed",
-                f"Could not save the installed app list:\n{error}",
+                f"Could not save the installed app list:\n{error}{cleanup_note}",
                 Gtk.MessageType.ERROR,
             )
             return
@@ -885,6 +918,7 @@ class MainWindow(Adw.ApplicationWindow):
         appimage_paths=None,
         user_install=True,
         delete_source=False,
+        deb_review=None,
     ):
         appimage_paths = appimage_paths or []
         file_count = len(deb_paths) + len(flatpakref_paths) + len(appimage_paths)
@@ -906,6 +940,7 @@ class MainWindow(Adw.ApplicationWindow):
                 appimage_paths,
                 user_install,
                 delete_source,
+                deb_review,
             ),
             daemon=True,
         )
@@ -920,13 +955,22 @@ class MainWindow(Adw.ApplicationWindow):
         delete_source,
     ):
         def start_install():
-            self.start_install_files_batch(
-                deb_paths,
-                flatpakref_paths,
-                appimage_paths,
-                user_install,
-                delete_source,
-            )
+            if deb_paths:
+                self.start_deb_install_review(
+                    deb_paths,
+                    flatpakref_paths,
+                    appimage_paths,
+                    user_install,
+                    delete_source,
+                )
+            else:
+                self.start_install_files_batch(
+                    deb_paths,
+                    flatpakref_paths,
+                    appimage_paths,
+                    user_install,
+                    delete_source,
+                )
 
         if not appimage_paths:
             start_install()
@@ -953,6 +997,147 @@ class MainWindow(Adw.ApplicationWindow):
             start_install,
         )
 
+    def start_deb_install_review(
+        self,
+        deb_paths,
+        flatpakref_paths,
+        appimage_paths,
+        user_install,
+        delete_source,
+    ):
+        self.install_progress_window = InstallProgressWindow(
+            self,
+            "Reviewing Debian packages",
+        )
+        self.install_progress_window.present()
+        self.install_progress_window.start_pulse()
+        self.install_progress_window.set_status(
+            "Inspecting package metadata and simulating the APT transaction…"
+        )
+
+        thread = threading.Thread(
+            target=self.deb_install_review_worker,
+            args=(
+                deb_paths,
+                flatpakref_paths,
+                appimage_paths,
+                user_install,
+                delete_source,
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+    def deb_install_review_worker(
+        self,
+        deb_paths,
+        flatpakref_paths,
+        appimage_paths,
+        user_install,
+        delete_source,
+    ):
+        review, error = review_deb_batch(deb_paths)
+        GLib.idle_add(
+            self.on_deb_install_review_ready,
+            review,
+            error,
+            flatpakref_paths,
+            appimage_paths,
+            user_install,
+            delete_source,
+        )
+
+    def on_deb_install_review_ready(
+        self,
+        review,
+        error,
+        flatpakref_paths,
+        appimage_paths,
+        user_install,
+        delete_source,
+    ):
+        if self.install_progress_window:
+            self.install_progress_window.stop_pulse()
+            self.install_progress_window.close_window()
+            self.install_progress_window = None
+
+        if review is None:
+            self.show_message(
+                "Could not review Debian package",
+                error,
+                Gtk.MessageType.ERROR,
+            )
+            return False
+
+        warnings = (
+            "Publisher identity and signatures are not verified for locally "
+            "selected .deb files. The SHA-256 values identify these exact files; "
+            "they do not establish that the publisher is trustworthy.\n\n"
+            "Installing a Debian package can run its maintainer scripts with "
+            "administrator privileges. Review the publisher and package details "
+            "yourself before continuing. Appector will remain unprivileged; the "
+            "system authorization prompt applies only to the APT operation.\n\n"
+            "The APT simulation is a preview. Package sources or system state may "
+            "change before installation, so review any final APT prompt as well."
+        )
+        if delete_source:
+            warnings += (
+                "\n\nAfter a successful installation, the selected original .deb "
+                "files will be moved to Trash only if they are unchanged since "
+                "this review."
+            )
+        warnings += "\n\n" + review.summary
+
+        dialog = Gtk.Dialog(
+            transient_for=self,
+            modal=True,
+        )
+        dialog.set_title("Review Debian package installation")
+        dialog.set_default_size(720, 560)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        install_button = dialog.add_button(
+            "Install reviewed packages",
+            Gtk.ResponseType.OK,
+        )
+        install_button.add_css_class("suggested-action")
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+
+        content = dialog.get_content_area()
+        content.set_spacing(8)
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+
+        text_view = Gtk.TextView()
+        text_view.set_editable(False)
+        text_view.set_cursor_visible(False)
+        text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        text_view.get_buffer().set_text(warnings)
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_hexpand(True)
+        scrolled.set_vexpand(True)
+        scrolled.set_child(text_view)
+        content.append(scrolled)
+
+        def on_response(review_dialog, response):
+            review_dialog.close()
+            if response == Gtk.ResponseType.OK:
+                self.start_install_files_batch(
+                    review.staged_paths,
+                    flatpakref_paths,
+                    appimage_paths,
+                    user_install,
+                    delete_source,
+                    review,
+                )
+            else:
+                review.close()
+
+        dialog.connect("response", on_response)
+        dialog.present()
+        return False
+
     def install_files_batch_worker(
         self,
         deb_paths,
@@ -960,6 +1145,7 @@ class MainWindow(Adw.ApplicationWindow):
         appimage_paths,
         user_install,
         delete_source,
+        deb_review=None,
     ):
         def output_callback(line):
             if self.install_progress_window:
@@ -980,17 +1166,23 @@ class MainWindow(Adw.ApplicationWindow):
                     deb_paths,
                     output_callback=output_callback,
                     delete_source=delete_source,
+                    review=deb_review,
                 )
                 if success:
                     success_count += len(deb_paths)
+                    installed_paths = (
+                        deb_review.original_paths
+                        if deb_review is not None
+                        else deb_paths
+                    )
                     installed_names = "\n".join(
-                        f"  {Path(path).name}" for path in deb_paths
+                        f"  {Path(path).name}" for path in installed_paths
                     )
                     results.append(f"DEB packages installed:\n{installed_names}")
                     cleanup_lines = [
                         line for line in message.splitlines()
-                        if "Moved installation files to Trash:" in line
-                        or "Source files kept because they could not be moved to Trash:" in line
+                        if line.startswith("Moved to Trash:")
+                        or "Source file kept" in line
                         or "Could not move installation file to Trash" in line
                     ]
                     if cleanup_lines:
@@ -1021,6 +1213,8 @@ class MainWindow(Adw.ApplicationWindow):
             success_count += resolved_count
 
         success = success_count == total_count
+        if deb_review is not None:
+            deb_review.close()
         GLib.idle_add(
             self.on_install_files_batch_finished,
             success,
@@ -1045,21 +1239,6 @@ class MainWindow(Adw.ApplicationWindow):
 
         return False
 
-    def on_show_leftovers_toggled(self, button):
-        self.show_leftovers = button.get_active()
-        self._unmark_hidden_advanced_items()
-        self.rebuild_list()
-
-    def on_show_advanced_apps_toggled(self, button):
-        self.show_advanced_apps = button.get_active()
-        self._unmark_hidden_advanced_items()
-        self.rebuild_list()
-
-    def on_hide_basic_apps_toggled(self, button):
-        self.hide_basic_apps = button.get_active()
-        self._unmark_hidden_advanced_items()
-        self.rebuild_list()
-                    
     # ------------------------------------------------------------
     # Flatpak installation
     # ------------------------------------------------------------
@@ -2164,6 +2343,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         add_window_action("cleanup-residuals", "on_cleanup_residuals_clicked")
         add_window_action("check-updates", "on_check_updates_clicked")
+        add_window_action("check-appector-updates", "on_check_appector_updates")
         add_window_action("export-app-list", "on_export_app_list_clicked")
         add_window_action("export-app-list-json", "on_export_app_list_json_clicked")
 
@@ -2281,9 +2461,10 @@ class MainWindow(Adw.ApplicationWindow):
             about = Adw.AboutWindow(
                 transient_for=self,
                 application_name="Appector",
-                version="1.0.0",
-                developer_name="Appector contributors",
-                copyright="© 2026 Appector contributors",
+                version=__version__,
+                developer_name="Elshad Guliyev",
+                copyright="© 2026 Elshad Guliyev",
+                application_icon="com.appector.appector",
                 website="https://github.com/ell-shad/appector",
             )
             about.set_license_type(Gtk.License.GPL_3_0)
@@ -2294,11 +2475,65 @@ class MainWindow(Adw.ApplicationWindow):
                 modal=True,
             )
             about.set_program_name("Appector")
-            about.set_version("1.0.0")
+            about.set_version(__version__)
             about.set_comments("Unified installed app inventory")
             about.set_website("https://github.com/ell-shad/appector")
+            about.set_logo_icon_name("com.appector.appector")
             about.set_license_type(Gtk.License.GPL_3_0)
             about.present()
+
+    def on_check_appector_updates(self):
+        self.action_check_appector_updates.set_enabled(False)
+        self.show_toast("Checking for Appector updates…")
+        threading.Thread(
+            target=self._check_appector_updates_worker,
+            daemon=True,
+        ).start()
+
+    def _check_appector_updates_worker(self):
+        try:
+            result = check_for_update(__version__)
+            GLib.idle_add(self._show_appector_update_result, result, None)
+        except (RuntimeError, ValueError, OSError) as error:
+            GLib.idle_add(self._show_appector_update_result, None, str(error))
+
+    def _show_appector_update_result(self, result, error):
+        self.action_check_appector_updates.set_enabled(True)
+        if error:
+            self.show_message(
+                "Could not check for updates",
+                error,
+                Gtk.MessageType.ERROR,
+            )
+        elif result["available"]:
+            dialog = Gtk.MessageDialog(
+                transient_for=self,
+                modal=True,
+                message_type=Gtk.MessageType.INFO,
+                text=f"Appector {result['version']} is available",
+                secondary_text="Open the release page to download and install the update.",
+            )
+            dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+            dialog.add_button("Open Release", Gtk.ResponseType.OK)
+            dialog.connect("response", self._on_appector_update_dialog_response, result["url"])
+            dialog.present()
+        else:
+            self.show_toast("Appector is up to date.")
+        return GLib.SOURCE_REMOVE
+
+    def _on_appector_update_dialog_response(self, dialog, response, release_url):
+        dialog.close()
+        if response != Gtk.ResponseType.OK:
+            return
+
+        try:
+            Gio.AppInfo.launch_default_for_uri(release_url, None)
+        except GLib.Error as error:
+            self.show_message(
+                "Could not open release page",
+                str(error),
+                Gtk.MessageType.ERROR,
+            )
 
 
     def _focus_search(self):
@@ -3337,178 +3572,6 @@ class MainWindow(Adw.ApplicationWindow):
                 pass
 
     # ------------------------------------------------------------
-    # Leftover config helpers
-    # ------------------------------------------------------------
-
-    def get_marked_leftover_entries(self):
-        return [
-            app
-            for app in self.get_marked_entries()
-            if getattr(app, "manager", "") == "Leftover"
-        ]
-
-    def unmark_all_leftovers(self):
-        changed = False
-
-        for app in self.get_leftover_entries():
-            key = app_key(app)
-
-            if key and key in self.marked_keys:
-                self.marked_keys.remove(key)
-                changed = True
-
-        if changed:
-            self.save_marked_keys()
-            self.rebuild_list()
-
-    def on_select_all_leftovers_toggled(self, button):
-        if getattr(self, "_updating_select_all_leftovers", False):
-            return
-
-        if button.get_active():
-            self.mark_all_leftovers()
-        else:
-            self.unmark_all_leftovers()
-
-    # ------------------------------------------------------------
-    # Leftover purge
-    # ------------------------------------------------------------
-
-    def on_purge_leftovers_clicked(self, button=None):
-        leftovers = self.get_marked_leftover_entries()
-
-        if not leftovers:
-            self.show_toast("No leftovers selected")
-            return
-
-        package_ids = [
-            getattr(app, "package_id", "")
-            for app in leftovers
-            if getattr(app, "package_id", "")
-        ]
-
-        if not package_ids:
-            self.show_message(
-                "No valid leftovers selected",
-                "Selected leftover items do not have valid package IDs.",
-                Gtk.MessageType.WARNING,
-            )
-            return
-
-        lines = []
-
-        lines.append(
-            "These packages are already removed; purging deletes only their remaining "
-            "configuration files."
-        )
-        lines.append("")
-        lines.append("The following APT configurations will be purged:")
-        lines.append("")
-
-        for package_id in package_ids[:30]:
-            lines.append(f"• {package_id}")
-
-        if len(package_ids) > 30:
-            lines.append(f"• …and {len(package_ids) - 30} more")
-
-        message = "\n".join(lines)
-
-        dialog = Gtk.MessageDialog(
-            transient_for=self,
-            modal=True,
-        )
-
-        dialog.set_resizable(False)
-        dialog.set_property("message-type", Gtk.MessageType.WARNING)
-        dialog.set_property("text", f"Purge {len(package_ids)} leftover packages?")
-        dialog.set_property("secondary-text", message)
-
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-
-        purge_button = dialog.add_button("Purge", Gtk.ResponseType.OK)
-        purge_button.add_css_class("destructive-action")
-
-        dialog.connect(
-            "response",
-            self.on_purge_leftovers_confirm_response,
-            leftovers,
-        )
-
-        dialog.present()
-
-    def on_purge_leftovers_confirm_response(self, dialog, response, leftovers):
-        dialog.close()
-
-        if response != Gtk.ResponseType.OK:
-            return
-
-        self.start_purge_leftovers(leftovers)
-
-    def start_purge_leftovers(self, leftovers):
-        self._pending_leftover_keys = [app_key(app) for app in leftovers]
-
-        package_ids = [
-            getattr(app, "package_id", "")
-            for app in leftovers
-            if getattr(app, "package_id", "")
-        ]
-
-        self.install_progress_window = InstallProgressWindow(
-            self,
-            "Purging leftovers",
-        )
-
-        self.install_progress_window.present()
-        self.install_progress_window.start_pulse()
-        self.install_progress_window.set_status("Purging leftover configuration packages…")
-
-        thread = threading.Thread(
-            target=self.purge_leftover_worker,
-            args=(package_ids,),
-            daemon=True,
-        )
-
-        thread.start()
-
-    def purge_leftover_worker(self, package_ids):
-        def output_callback(line):
-            if self.install_progress_window:
-                GLib.idle_add(
-                    self.install_progress_window.append_output,
-                    line,
-                )
-
-        success, message = purge_leftover_configs(
-            package_ids,
-            output_callback=output_callback,
-        )
-
-        GLib.idle_add(
-            self.on_purge_leftovers_finished,
-            success,
-            message,
-        )
-
-    def on_purge_leftovers_finished(self, success, message):
-        if self.install_progress_window:
-            self.install_progress_window.stop_pulse()
-
-            if success:
-                self.install_progress_window.finish_batch_results(message)
-
-                for key in getattr(self, "_pending_leftover_keys", []):
-                    self.marked_keys.discard(key)
-
-                self.save_marked_keys()
-                self._pending_leftover_keys = []
-
-                self.reload()
-            else:
-                self.install_progress_window.finish_failure(message)
-
-        return False
-
-    # ------------------------------------------------------------
     # Icon + name column
     # ------------------------------------------------------------
 
@@ -4300,7 +4363,18 @@ class MainWindow(Adw.ApplicationWindow):
 
         lines = []
 
-        lines.append("The following leftover configuration packages will be purged:")
+        lines.append(
+            "These packages are already removed. Purging deletes only their "
+            "remaining dpkg-registered configuration files."
+        )
+        lines.append(
+            "Appector first creates a private backup under "
+            "~/.local/state/app-manager/purge-backups. If a file cannot be "
+            "safely backed up, the purge will not run. The backup is not "
+            "restored automatically."
+        )
+        lines.append("")
+        lines.append("The following APT configurations will be purged:")
         lines.append("")
 
         for package_id in package_ids[:30]:
@@ -4670,32 +4744,6 @@ class MainWindow(Adw.ApplicationWindow):
             daemon=True,
         )
         thread.start()
-    # ------------------------------------------------------------
-    # Leftover selection
-    # ------------------------------------------------------------
-    def unmark_all_leftovers(self):
-        changed = False
-
-        for app in self.get_leftover_entries():
-            key = app_key(app)
-
-            if key and key in self.marked_keys:
-                self.marked_keys.remove(key)
-                changed = True
-
-        if changed:
-            self.save_marked_keys()
-            self.rebuild_list()
-
-    def on_select_all_leftovers_toggled(self, button):
-        if getattr(self, "_updating_select_all_leftovers", False):
-            return
-
-        if button.get_active():
-            self.mark_all_leftovers()
-        else:
-            self.unmark_all_leftovers()
-
     def batch_worker(self, apps, purge=False):
         def progress_callback(current, total, message):
             if self.install_progress_window:
@@ -4788,35 +4836,6 @@ class MainWindow(Adw.ApplicationWindow):
 
         dialog.present()
         
-    # ------------------------------------------------------------
-    # Advanced visibility helpers
-    # ------------------------------------------------------------
-
-    def _entry_hidden_by_advanced_options(self, app):
-        manager = getattr(app, "manager", "")
-
-        is_leftover = manager == "Leftover"
-        is_advanced = is_leftover or not getattr(app, "is_gui_app", True)
-
-        if is_advanced:
-            if is_leftover:
-                return not self.show_leftovers
-
-            return not self.show_advanced_apps
-
-        return self.hide_basic_apps
-
-    def _unmark_hidden_advanced_items(self):
-        hidden_keys = set()
-
-        for app in self.current_apps:
-            if self._entry_hidden_by_advanced_options(app):
-                hidden_keys.add(app_key(app))
-
-        if hidden_keys:
-            self.marked_keys.difference_update(hidden_keys)
-            self.save_marked_keys()
-
     def _show_confirm_dialog(self, title, message, confirm_label, on_confirm_callback, *callback_args):
         if hasattr(Adw, "AlertDialog"):
             dialog = Adw.AlertDialog.new(title, message)

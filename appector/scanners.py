@@ -558,6 +558,7 @@ def get_snap_install_dates(revisions: Dict[str, str]) -> Dict[str, str]:
                 cmd,
                 text=True,
                 stderr=subprocess.DEVNULL,
+                env={**os.environ, "LC_ALL": "C"},
             )
         except Exception:
             continue
@@ -626,6 +627,7 @@ def scan_snap() -> List[AppEntry]:
             ["snap", "list"],
             text=True,
             stderr=subprocess.DEVNULL,
+            env={**os.environ, "LC_ALL": "C"},
         )
     except Exception:
         return []
