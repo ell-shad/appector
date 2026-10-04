@@ -79,11 +79,16 @@ Removal and cleanup can delete packages, package configuration, or files.
 Review each preview and confirmation carefully; package-manager transactions
 can affect dependencies beyond the selected app.
 
-The in-app local `.deb` installer currently does not display a complete
-package metadata/origin review or transaction preview, and it cannot verify a
-publisher signature. Treat selected `.deb` files as trusted executable code;
-the feature is a release-readiness item until that review is added or the
-feature is disabled for the first release.
+Before installing local `.deb` files, Appector stages an unchanged private
+copy, displays package name/version/architecture/maintainer/dependencies,
+file size and SHA-256, and shows an APT transaction simulation. Installation
+is blocked if metadata or the transaction preview cannot be produced, or if
+the package architecture does not match the system. The hash identifies the
+selected file but does not authenticate its publisher; local package
+signatures/origin are not verified. Installing a `.deb` can run maintainer
+scripts with administrator privileges. Only continue if you trust its source
+and approve the packages/actions shown. Review the final APT prompt too,
+because system state or package sources can change after the simulation.
 
 When Appector purges APT residual configurations it first backs up dpkg-listed
 conffiles under:
@@ -136,12 +141,18 @@ GitHub Actions' automatically provided token. The `public-release` Actions
 environment is a publication approval gate; configure a required reviewer
 before publishing. The first `0.x` release is marked as a pre-release.
 
-Release checksums are not signed yet. GitHub-generated source archives are
-available from the same tag and contain the source/build scripts for that
-binary version. A GitHub artifact provenance attestation is recommended
-before the first public binary release; it can let users verify that the
-published package was built by this repository's workflow. A signed APT
-repository (for example, GitHub Pages with aptly/reprepro, or a hosted package
+Release checksums are not signed. The release workflow is configured to
+generate GitHub build-provenance attestations for the `.deb`; an attestation
+will be available only after a release workflow succeeds. To verify a
+downloaded package with GitHub CLI, run:
+
+```bash
+gh attestation verify ./appector_<version>_all.deb --repo ell-shad/appector
+```
+
+GitHub-generated source archives are available from the same tag and contain
+the source/build scripts for that binary version. A signed APT repository
+(for example, GitHub Pages with aptly/reprepro, or a hosted package
 repository) is a possible later improvement; it is not configured here.
 
 ## Build from source

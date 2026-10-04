@@ -7,8 +7,10 @@ import shlex
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 from datetime import datetime
+from email.parser import Parser
 from pathlib import Path
 from uuid import uuid4
 from urllib.parse import urlsplit
@@ -752,55 +754,6 @@ def _run_command_raw(cmd, timeout=900, env_overrides=None):
         if uses_apt:
             APT_COMMAND_LOCK.release()
 
-def install_deb(path, output_callback=None, delete_source=False):
-    """
-    Installs a local .deb file using apt-get.
-
-    Returns:
-        success: bool
-        message: str
-    """
-
-    deb_path = Path(path).expanduser()
-
-    if not deb_path.is_file():
-        return False, "Selected file not found."
-
-    if deb_path.suffix.lower() != ".deb":
-        return False, "Selected file is not a .deb package."
-
-    apt_get_command = shutil.which("apt-get") or "/usr/bin/apt-get"
-    pkexec_command = shutil.which("pkexec")
-
-    if pkexec_command:
-        cmd = [
-            pkexec_command,
-            apt_get_command,
-            "install",
-            "-y",
-            str(deb_path),
-        ]
-    else:
-        cmd = [
-            apt_get_command,
-            "install",
-            "-y",
-            str(deb_path),
-        ]
-
-    _log_action(f"DEB_INSTALL_START cmd={shlex.join(cmd)}")
-
-    success, message = _run_command_stream(cmd, output_callback)
-
-    if success:
-        message = _maybe_delete_source_file(deb_path, delete_source, message)
-        _log_action(f"DEB_INSTALL_SUCCESS path={deb_path}")
-    else:
-        _log_action(f"DEB_INSTALL_FAILED path={deb_path} error={message}")
-
-    return success, message
-
-
 def _run_command(cmd):
     returncode, output = _run_command_raw(cmd)
 
@@ -1343,7 +1296,245 @@ def execute_available_updates(updates, output_callback=None):
 # Batch .deb installation
 # ------------------------------------------------------------
 
-def install_deb_batch(paths, output_callback=None, delete_source=False):
+class DebInstallReview:
+    def __init__(
+        self,
+        temporary_directory,
+        original_paths,
+        staged_paths,
+        hashes,
+        simulation,
+        summary,
+    ):
+        self._temporary_directory = temporary_directory
+        self.original_paths = original_paths
+        self.staged_paths = staged_paths
+        self.hashes = hashes
+        self.simulation = simulation
+        self.summary = summary
+        self._closed = False
+
+    def close(self):
+        if self._closed:
+            return
+        self._temporary_directory.cleanup()
+        self._closed = True
+
+    def trash_unchanged_sources(self):
+        results = []
+        for path, expected_hash in zip(self.original_paths, self.hashes):
+            digest = hashlib.sha256()
+            try:
+                source_fd = os.open(
+                    path,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                )
+                with os.fdopen(source_fd, "rb") as source:
+                    if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                        raise OSError("The selected file is no longer a regular file.")
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            except OSError as error:
+                results.append(
+                    f"Source file kept because it could not be safely checked: "
+                    f"{path} ({error})"
+                )
+                continue
+
+            if digest.hexdigest() != expected_hash:
+                results.append(
+                    f"Source file kept because it changed after review: {path}"
+                )
+                continue
+
+            result = _maybe_delete_source_file(path, True, "")
+            if "Moved installation file to Trash" in result:
+                results.append(f"Moved to Trash: {Path(path).name}")
+            else:
+                results.append(f"{Path(path).name}: {result}")
+        return "\n".join(results)
+
+
+def review_deb_batch(paths):
+    """Stage local packages, inspect metadata and simulate their APT transaction."""
+    if not paths:
+        return None, "No .deb files selected."
+
+    originals = []
+    seen = set()
+    for path in paths:
+        source = Path(path).expanduser()
+        if source.suffix.lower() != ".deb":
+            return None, f"Selected file is not a .deb package: {path}"
+        source = source.absolute()
+        if str(source) not in seen:
+            seen.add(str(source))
+            originals.append(source)
+
+    if not originals:
+        return None, "No valid .deb files selected."
+
+    dpkg_deb = shutil.which("dpkg-deb")
+    dpkg = shutil.which("dpkg")
+    apt_get = shutil.which("apt-get")
+    if not dpkg_deb or not dpkg or not apt_get:
+        return None, "dpkg-deb, dpkg, and apt-get are required to review local packages."
+
+    try:
+        temporary_directory = tempfile.TemporaryDirectory(
+            prefix="appector-deb-review-",
+        )
+    except OSError as error:
+        return None, f"Could not create private package-review storage: {error}"
+    staged_paths = []
+    hashes = []
+    package_summaries = []
+
+    def fail(message):
+        temporary_directory.cleanup()
+        return None, message
+
+    architecture_status, host_architecture = _run_command_raw(
+        [dpkg, "--print-architecture"],
+        timeout=30,
+        env_overrides={"LC_ALL": "C"},
+    )
+    if architecture_status != 0 or not host_architecture:
+        return fail(f"Could not determine the system architecture: {host_architecture}")
+    host_architecture = host_architecture.splitlines()[0].strip()
+
+    for index, source in enumerate(originals):
+        source_fd = None
+        staged_fd = None
+        try:
+            source_fd = os.open(
+                source,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            staged_path = Path(temporary_directory.name) / f"{index:04d}-{source.name}"
+            staged_fd = os.open(
+                staged_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            digest = hashlib.sha256()
+            with os.fdopen(source_fd, "rb") as source_file:
+                source_fd = None
+                with os.fdopen(staged_fd, "wb") as staged_file:
+                    staged_fd = None
+                    source_mode = os.fstat(source_file.fileno()).st_mode
+                    if not stat.S_ISREG(source_mode):
+                        return fail(f"Selected package is not a regular file: {source}")
+                    for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        staged_file.write(chunk)
+        except OSError as error:
+            for descriptor in (source_fd, staged_fd):
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+            return fail(f"Could not safely copy selected package {source}: {error}")
+
+        metadata_status, control = _run_command_raw(
+            [dpkg_deb, "--field", str(staged_path)],
+            timeout=60,
+            env_overrides={"LC_ALL": "C"},
+        )
+        if metadata_status != 0:
+            return fail(f"Could not read Debian package metadata for {source.name}:\n{control}")
+
+        metadata = Parser().parsestr(control)
+        package_name = metadata.get("Package", "").strip()
+        version = metadata.get("Version", "").strip()
+        architecture = metadata.get("Architecture", "").strip()
+        if not package_name or not version or not architecture:
+            return fail(
+                f"Package metadata is missing Package, Version, or Architecture: "
+                f"{source.name}"
+            )
+        if architecture not in {"all", host_architecture}:
+            return fail(
+                f"{source.name} is for architecture {architecture}, but this "
+                f"system is {host_architecture}."
+            )
+
+        staged_paths.append(staged_path)
+        hashes.append(digest.hexdigest())
+        fields = (
+            ("Package", package_name),
+            ("Version", version),
+            ("Architecture", architecture),
+            ("Maintainer", metadata.get("Maintainer", "Not specified").strip()),
+            ("Depends", metadata.get("Depends", "Not specified").strip()),
+            ("Pre-Depends", metadata.get("Pre-Depends", "Not specified").strip()),
+            ("Recommends", metadata.get("Recommends", "Not specified").strip()),
+        )
+        package_summary = "\n".join(f"{label}: {value}" for label, value in fields)
+        description = metadata.get("Description", "").strip().splitlines()
+        if description:
+            package_summary += "\nDescription: " + description[0][:400]
+        try:
+            staged_size = staged_path.stat().st_size
+        except OSError as error:
+            return fail(f"Could not inspect staged package {source.name}: {error}")
+        package_summary += (
+            f"\nFile size: {staged_size} bytes"
+            f"\nSHA-256: {digest.hexdigest()}"
+        )
+        package_summaries.append(package_summary)
+        try:
+            os.chmod(staged_path, 0o400)
+        except OSError as error:
+            return fail(
+                f"Could not protect staged package {source.name} from normal "
+                f"writes: {error}"
+            )
+
+    simulation_status, simulation = _run_command_raw(
+        [
+            apt_get,
+            "--simulate",
+            "install",
+            *(str(path) for path in staged_paths),
+        ],
+        timeout=120,
+        env_overrides={"LC_ALL": "C"},
+    )
+    if simulation_status != 0:
+        return fail(
+            "APT could not produce a transaction preview. Installation is blocked "
+            "until a preview can be shown:\n" + simulation
+        )
+
+    summary = (
+        "\n\n".join(package_summaries)
+        + "\n\nAPT transaction simulation (no changes made):\n"
+        + (simulation[:12000] or "APT reported no transaction details.")
+    )
+    if len(simulation) > 12000:
+        summary += "\n\n[APT output truncated for display.]"
+
+    return (
+        DebInstallReview(
+            temporary_directory,
+            [str(path) for path in originals],
+            staged_paths,
+            hashes,
+            simulation,
+            summary,
+        ),
+        "",
+    )
+
+
+def install_deb_batch(
+    paths,
+    output_callback=None,
+    delete_source=False,
+    review=None,
+):
     """
     Installs multiple local .deb files using one apt-get transaction.
 
@@ -1354,6 +1545,40 @@ def install_deb_batch(paths, output_callback=None, delete_source=False):
 
     if not paths:
         return False, "No .deb files selected."
+
+    if review is None:
+        return False, "A package metadata and transaction review is required."
+
+    staged_paths = [Path(path).absolute() for path in paths]
+    if staged_paths != [Path(path).absolute() for path in review.staged_paths]:
+        return False, "Selected Debian packages no longer match the reviewed files."
+    for path, expected_hash in zip(staged_paths, review.hashes):
+        digest = hashlib.sha256()
+        package_fd = None
+        try:
+            package_fd = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            with os.fdopen(package_fd, "rb") as package_file:
+                package_fd = None
+                if not stat.S_ISREG(os.fstat(package_file.fileno()).st_mode):
+                    return False, (
+                        f"Reviewed package is no longer a regular file: "
+                        f"{path.name}."
+                    )
+                for chunk in iter(lambda: package_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError as error:
+            return False, f"Could not verify reviewed package {path.name}: {error}"
+        finally:
+            if package_fd is not None:
+                os.close(package_fd)
+        if digest.hexdigest() != expected_hash:
+            return False, (
+                f"Reviewed package changed before installation: {path.name}. "
+                "Review the package again."
+            )
 
     deb_paths = []
     invalid_paths = []
@@ -1382,7 +1607,33 @@ def install_deb_batch(paths, output_callback=None, delete_source=False):
         return False, "No valid .deb files selected."
 
     apt_get_command = shutil.which("apt-get") or "/usr/bin/apt-get"
+    simulation_status, simulation = _run_command_raw(
+        [
+            apt_get_command,
+            "--simulate",
+            "install",
+            *(str(path) for path in deb_paths),
+        ],
+        timeout=120,
+        env_overrides={"LC_ALL": "C"},
+    )
+    if simulation_status != 0:
+        return False, (
+            "APT could not re-check the transaction after confirmation. "
+            "No package was installed:\n" + simulation
+        )
+    if simulation != review.simulation:
+        return False, (
+            "The APT transaction changed after you reviewed it. No package was "
+            "installed; select the files again to review the updated plan."
+        )
+
     pkexec_command = shutil.which("pkexec")
+    if os.geteuid() != 0 and not pkexec_command:
+        return False, (
+            "pkexec is required to authorize a system-wide Debian package "
+            "installation. Appector itself must not be run as root."
+        )
 
     cmd = [
         apt_get_command,
@@ -1399,22 +1650,9 @@ def install_deb_batch(paths, output_callback=None, delete_source=False):
 
     if success:
         if delete_source:
-            moved = []
-            cleanup_failures = []
-
-            for p in deb_paths:
-                result = _maybe_delete_source_file(p, True, "")
-                if "Moved installation file to Trash" in result:
-                    moved.append(p.name)
-                elif "Could not move installation file to Trash" in result:
-                    cleanup_failures.append(f"{p.name}: {result.splitlines()[-1]}")
-
-            if moved:
-                message += "\n\nMoved installation files to Trash:\n"
-                message += "\n".join(f"• {name}" for name in moved)
-            if cleanup_failures:
-                message += "\n\nSource files kept because they could not be moved to Trash:\n"
-                message += "\n".join(f"• {failure}" for failure in cleanup_failures)
+            results = review.trash_unchanged_sources()
+            if results:
+                message += "\n\n" + results
 
         _log_action(f"DEB_BATCH_INSTALL_SUCCESS count={len(deb_paths)}")
     else:

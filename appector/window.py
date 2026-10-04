@@ -38,6 +38,7 @@ from .actions import (
     install_flatpak_app_id_batch,
     extract_flathub_app_id,
     parse_flatpak_app_inputs,
+    review_deb_batch,
     purge_leftover_configs,
     get_apt_autoremove_preview,
     execute_apt_autoremove,
@@ -917,6 +918,7 @@ class MainWindow(Adw.ApplicationWindow):
         appimage_paths=None,
         user_install=True,
         delete_source=False,
+        deb_review=None,
     ):
         appimage_paths = appimage_paths or []
         file_count = len(deb_paths) + len(flatpakref_paths) + len(appimage_paths)
@@ -938,6 +940,7 @@ class MainWindow(Adw.ApplicationWindow):
                 appimage_paths,
                 user_install,
                 delete_source,
+                deb_review,
             ),
             daemon=True,
         )
@@ -952,13 +955,22 @@ class MainWindow(Adw.ApplicationWindow):
         delete_source,
     ):
         def start_install():
-            self.start_install_files_batch(
-                deb_paths,
-                flatpakref_paths,
-                appimage_paths,
-                user_install,
-                delete_source,
-            )
+            if deb_paths:
+                self.start_deb_install_review(
+                    deb_paths,
+                    flatpakref_paths,
+                    appimage_paths,
+                    user_install,
+                    delete_source,
+                )
+            else:
+                self.start_install_files_batch(
+                    deb_paths,
+                    flatpakref_paths,
+                    appimage_paths,
+                    user_install,
+                    delete_source,
+                )
 
         if not appimage_paths:
             start_install()
@@ -985,6 +997,147 @@ class MainWindow(Adw.ApplicationWindow):
             start_install,
         )
 
+    def start_deb_install_review(
+        self,
+        deb_paths,
+        flatpakref_paths,
+        appimage_paths,
+        user_install,
+        delete_source,
+    ):
+        self.install_progress_window = InstallProgressWindow(
+            self,
+            "Reviewing Debian packages",
+        )
+        self.install_progress_window.present()
+        self.install_progress_window.start_pulse()
+        self.install_progress_window.set_status(
+            "Inspecting package metadata and simulating the APT transaction…"
+        )
+
+        thread = threading.Thread(
+            target=self.deb_install_review_worker,
+            args=(
+                deb_paths,
+                flatpakref_paths,
+                appimage_paths,
+                user_install,
+                delete_source,
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+    def deb_install_review_worker(
+        self,
+        deb_paths,
+        flatpakref_paths,
+        appimage_paths,
+        user_install,
+        delete_source,
+    ):
+        review, error = review_deb_batch(deb_paths)
+        GLib.idle_add(
+            self.on_deb_install_review_ready,
+            review,
+            error,
+            flatpakref_paths,
+            appimage_paths,
+            user_install,
+            delete_source,
+        )
+
+    def on_deb_install_review_ready(
+        self,
+        review,
+        error,
+        flatpakref_paths,
+        appimage_paths,
+        user_install,
+        delete_source,
+    ):
+        if self.install_progress_window:
+            self.install_progress_window.stop_pulse()
+            self.install_progress_window.close_window()
+            self.install_progress_window = None
+
+        if review is None:
+            self.show_message(
+                "Could not review Debian package",
+                error,
+                Gtk.MessageType.ERROR,
+            )
+            return False
+
+        warnings = (
+            "Publisher identity and signatures are not verified for locally "
+            "selected .deb files. The SHA-256 values identify these exact files; "
+            "they do not establish that the publisher is trustworthy.\n\n"
+            "Installing a Debian package can run its maintainer scripts with "
+            "administrator privileges. Review the publisher and package details "
+            "yourself before continuing. Appector will remain unprivileged; the "
+            "system authorization prompt applies only to the APT operation.\n\n"
+            "The APT simulation is a preview. Package sources or system state may "
+            "change before installation, so review any final APT prompt as well."
+        )
+        if delete_source:
+            warnings += (
+                "\n\nAfter a successful installation, the selected original .deb "
+                "files will be moved to Trash only if they are unchanged since "
+                "this review."
+            )
+        warnings += "\n\n" + review.summary
+
+        dialog = Gtk.Dialog(
+            transient_for=self,
+            modal=True,
+        )
+        dialog.set_title("Review Debian package installation")
+        dialog.set_default_size(720, 560)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        install_button = dialog.add_button(
+            "Install reviewed packages",
+            Gtk.ResponseType.OK,
+        )
+        install_button.add_css_class("suggested-action")
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+
+        content = dialog.get_content_area()
+        content.set_spacing(8)
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+
+        text_view = Gtk.TextView()
+        text_view.set_editable(False)
+        text_view.set_cursor_visible(False)
+        text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        text_view.get_buffer().set_text(warnings)
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_hexpand(True)
+        scrolled.set_vexpand(True)
+        scrolled.set_child(text_view)
+        content.append(scrolled)
+
+        def on_response(review_dialog, response):
+            review_dialog.close()
+            if response == Gtk.ResponseType.OK:
+                self.start_install_files_batch(
+                    review.staged_paths,
+                    flatpakref_paths,
+                    appimage_paths,
+                    user_install,
+                    delete_source,
+                    review,
+                )
+            else:
+                review.close()
+
+        dialog.connect("response", on_response)
+        dialog.present()
+        return False
+
     def install_files_batch_worker(
         self,
         deb_paths,
@@ -992,6 +1145,7 @@ class MainWindow(Adw.ApplicationWindow):
         appimage_paths,
         user_install,
         delete_source,
+        deb_review=None,
     ):
         def output_callback(line):
             if self.install_progress_window:
@@ -1012,17 +1166,23 @@ class MainWindow(Adw.ApplicationWindow):
                     deb_paths,
                     output_callback=output_callback,
                     delete_source=delete_source,
+                    review=deb_review,
                 )
                 if success:
                     success_count += len(deb_paths)
+                    installed_paths = (
+                        deb_review.original_paths
+                        if deb_review is not None
+                        else deb_paths
+                    )
                     installed_names = "\n".join(
-                        f"  {Path(path).name}" for path in deb_paths
+                        f"  {Path(path).name}" for path in installed_paths
                     )
                     results.append(f"DEB packages installed:\n{installed_names}")
                     cleanup_lines = [
                         line for line in message.splitlines()
-                        if "Moved installation files to Trash:" in line
-                        or "Source files kept because they could not be moved to Trash:" in line
+                        if line.startswith("Moved to Trash:")
+                        or "Source file kept" in line
                         or "Could not move installation file to Trash" in line
                     ]
                     if cleanup_lines:
@@ -1053,6 +1213,8 @@ class MainWindow(Adw.ApplicationWindow):
             success_count += resolved_count
 
         success = success_count == total_count
+        if deb_review is not None:
+            deb_review.close()
         GLib.idle_add(
             self.on_install_files_batch_finished,
             success,

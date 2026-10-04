@@ -22,7 +22,10 @@ supported-version policy before declaring the first stable release.
 
 ## Release integrity
 
-The current release plan attaches Debian packages to GitHub Releases and does
-not yet publish signed checksums or a signing key. The in-app checker only
-opens a release page; it does not download or install package files. Verify
-release assets through a trusted channel before installation.
+The release workflow attaches Debian packages and SHA-256 checksums to GitHub
+Releases and generates GitHub build-provenance attestations for the package.
+Attestations are not available until a release workflow succeeds. The
+checksums are not separately signed. Users can verify package provenance with
+`gh attestation verify ./appector_<version>_all.deb --repo ell-shad/appector`.
+The in-app checker only opens a release page; it does not download or install
+package files.

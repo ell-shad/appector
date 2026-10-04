@@ -32,7 +32,7 @@ audit.
 
 | Scenario | Environment | Result | Evidence/notes |
 |---|---|---|---|
-| Safety and updater unit suite | Ubuntu 26.04, Python 3.14.4 | **Pass: 16 tests** | `python3 -m unittest discover -s tests -v`. |
+| Safety, package-review and updater unit suite | Ubuntu 26.04, Python 3.14.4 | **Pass: 25 tests** | `python3 -m unittest discover -s tests -v`. |
 | Application module compilation | Same | **Pass** | `python3 -m compileall -q appector`. |
 | GTK module import / CLI help | Same | **Pass** | `python3 run.py --help` imports the GUI modules and exits with help. |
 | CLI version/source consistency | Same | **Pass: `appector 0.1.0`** | `python3 run.py --version`; code version is the source of truth. |
@@ -44,22 +44,25 @@ audit.
 | APT removal simulation locale | Mocked command invocation | **Pass** | Test verifies `LC_ALL=C` for parsed APT output. |
 | Debian version ordering | `dpkg --compare-versions` via tests | **Pass** | Covers epoch, `+` suffix, tilde prerelease, Debian revision ordering and equal version. |
 | Update API invalid data / URL / 404 | Mocked API responses | **Pass** | Malformed response, unsafe URL and no stable release handled without crash. |
+| Local `.deb` review/staging | Mocked tests and built Appector package | **Pass: 9 tests + smoke check** | Metadata/hash display, private staging, incompatible architecture, simulation failure, symlink rejection, changed source, Trash safety, mandatory review and transaction-change block. The generated Appector `.deb` passed real metadata inspection and APT simulation; no package was installed or changed. |
 | Duplicate GUI method check | Source-integrity test | **Pass** | No duplicate methods remain in inspected GUI classes. |
 | Workflow YAML syntax | Local PyYAML parser | **Pass** | Both `.github/workflows/*.yml` parse. |
 | High-confidence secret patterns in public Git history | Public mirror of `ell-shad/appector` | **Pass: 0 matches** | Scanned all refs visible at audit time: 14 commits and 101 unique blobs. Manual patterns only; gitleaks/TruffleHog were unavailable. |
-| Public default-branch protection | GitHub repository metadata | **Fail / not configured** | Public API reports `main` is unprotected; configure branch rules before merging release setup or accepting public contributions. |
-| Commit author email privacy | Public `main` and local audit branch | **Needs owner decision** | Checked domains only: public and local commits use a Gmail-domain address. Actual addresses are not printed here; consider GitHub's private noreply address for future commits. |
+| Public default-branch protection | GitHub public API | **Fail / not configured** | Repository has zero rulesets and `main` is reported as unprotected. |
+| Release environment tag restriction | GitHub public API | **Pass: `v*`** | `public-release` exists and permits tags matching `v*`; required reviewer is absent and administrators can bypass protection. |
+| GitHub artifact provenance workflow | Local workflow configuration | **Configured; not executed** | Release job requests OIDC/attestations permission and pins `actions/attest-build-provenance`; verify an attestation after the first approved release. |
+| Commit author email privacy | Published history / unpublished branch | **Rewrite authorized** | GitHub private email is enabled; rewrite only the local audit branch to noreply before pushing. Published `main` history will remain unchanged. |
 | Shell script syntax | POSIX shell parser | **Pass** | `sh -n scripts/build-deb.sh`. |
 | First deterministic `.deb` build | Ubuntu 26.04 amd64 | **Pass** | Produces `dist/appector_0.1.0_all.deb`. |
-| Repeated deterministic `.deb` build | Same host/checkout | **Pass** | Two consecutive builds of the same source checkout had identical SHA-256: `98463af2f892c2f13b9d92f0d6de9544bb76f56c10fa48590ee76f37a583d51a`; package size 373,572 bytes. |
-| Clean-checkout tests/build | Isolated worktree at `7423502` | **Pass** | All 16 tests passed; package built, passed `lintian --pedantic` and desktop validation, and matched the worktree build byte-for-byte. |
+| Repeated deterministic `.deb` build | Same host/checkout | **Pass** | Two consecutive builds of the same source checkout had identical SHA-256; final hash and size will be recorded after the email-privacy rewrite and clean-checkout run. |
+| Clean-checkout tests/build | Isolated worktree after latest changes | **Pending** | Repeat all tests and package checks from the committed tree after commit-history rewrite. |
 | Debian package metadata / file list | `dpkg-deb` | **Pass** | Architecture `all`, dependency metadata, launcher, GTK desktop entry, man page and copyright present. |
 | Runtime dependency/source inventory | Source imports and Ubuntu package copyright notices | **Partial** | App imports use standard library and system GI bindings; no vendored app code/assets. PyGObject/GTK/libadwaita copyright notices list LGPL terms; full transitive SBOM/licence review remains. |
 | Lintian | lintian 2.129.0, `--pedantic` | **Pass: no diagnostics** | `lintian --pedantic dist/appector_0.1.0_all.deb`. |
 | Desktop entry validation | desktop-file-utils 0.28 | **Pass** | `desktop-file-validate` on staged desktop file. |
 | App icon package entries | Debian package contents and image dimensions | **Pass** | Desktop file references `com.appector.appector`; hicolor PNGs are packaged at 16, 24, 32, 48, 64, 128, 256 and 512 px; README/About/window use same icon ID. |
 | GitHub social-preview image | Generated local PNG | **Ready to upload** | `assets/github-social-preview.png` is 1200x630 and visually reviewed; upload manually in repository Settings → General → Social preview after merging the asset commit. |
-| Package contents/privacy/modes | Extracted package in temporary directory | **Pass** | 16 files; no `.git`, caches, vendor dirs, local home/temp paths, or group/world-writable files found. |
+| Package contents/privacy/modes | Extracted package in temporary directory | **Pending final build** | Recheck `.git`, caches, vendor dirs, local paths, and file modes after final code changes. |
 | Git whitespace check | Local branch | **Pass** | `git diff --check`. |
 
 ## Platform matrix
@@ -85,7 +88,7 @@ container. Do not run them against a user's host.
 | Snap install/remove | **Not run** | Snap-enabled disposable distro; unavailable host coverage. |
 | AppImage integrate/remove/delete-source | **Not run** | Safe sample file and disposable home; ensure delete-source uses Trash only after success. |
 | Batch mixed install (valid/invalid), failure policy, cancel/retry | **Not run** | Isolated test packages and remotes; inspect each per-file warning. |
-| `.deb` missing dependencies, downgrade, upgrade, already-installed, duplicate | **Not run** | Must include trust/metadata preview before release. |
+| `.deb` missing dependencies, downgrade, upgrade, already-installed, duplicate | **Not run** | Review UI implemented; exercise representative scenarios in the disposable target VM before release. |
 | Hostile/malformed `.deb`, `.flatpakref`, AppImage and Unicode/newline paths | **Not run** | Fuzzed samples in a disposable environment; no AppImage execution for metadata. |
 | Dpkg lock contention / unattended-upgrades-like activity | **Not run** | Disposable VM only; verify actionable error and retry behavior. |
 | Kill application/helper, fill disk, disconnect network, interrupt package install | **Not run** | Disposable VM with snapshot and recovery plan. |
