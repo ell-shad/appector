@@ -9,7 +9,19 @@ Flatpak, AppImage, and detected manual installs; install local `.deb`,
   <img src="assets/icons/hicolor/256x256/apps/com.appector.appector.png" width="160" alt="Appector app icon: a package box and magnifying glass">
 </p>
 
+## Screenshots
 
+<p align="center">
+  <img src="assets/screenshots/appector-grid-view.png" alt="Appector grid view" width="900">
+  <br><br>
+  <img src="assets/screenshots/appector-list-view.png" alt="Appector list view" width="900">
+  <br><br>
+  <img src="assets/screenshots/install-files.png" alt="Install apps from files dialog" width="900">
+  <br><br>
+  <img src="assets/screenshots/install-flathub.png" alt="Install apps from Flathub dialog" width="900">
+  <br><br>
+  <img src="assets/screenshots/cleanup-residuals.png" alt="Cleanup residuals dialog" width="900">
+</p>
 
 ## Features
 
