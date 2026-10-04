@@ -49,6 +49,7 @@ audit.
 | Shell script syntax | POSIX shell parser | **Pass** | `sh -n scripts/build-deb.sh`. |
 | First deterministic `.deb` build | Ubuntu 26.04 amd64 | **Pass** | Produces `dist/appector_0.1.0_all.deb`. |
 | Repeated deterministic `.deb` build | Same host/checkout | **Pass** | Two consecutive builds of the same source checkout had identical SHA-256; repeat after the final audit commit as part of clean-checkout validation. |
+| Clean-checkout tests/build | Local clone of committed audit tree | **Pass** | All 16 tests passed; package built, passed lintian/desktop validation, and was byte-identical to the worktree package. |
 | Debian package metadata / file list | `dpkg-deb` | **Pass** | Architecture `all`, dependency metadata, launcher, GTK desktop entry, man page and copyright present. |
 | Lintian | lintian 2.129.0, `--pedantic` | **Pass: no diagnostics** | `lintian --pedantic dist/appector_0.1.0_all.deb`. |
 | Desktop entry validation | desktop-file-utils 0.28 | **Pass** | `desktop-file-validate` on staged desktop file. |

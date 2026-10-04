@@ -12,7 +12,7 @@ approves publication.** This checklist is not authorization to publish.
 | Map privileged helper, polkit, D-Bus and system services | Done | `pkexec` and system package managers are used; no dedicated helper/action IDs, D-Bus service or systemd unit found. |
 | Document package/runtime prerequisites | Done | Debian runtime dependencies are declared; no pip distribution is required. |
 | Build from documented source commands | Done | `python3 -m unittest discover -s tests -v`; `./scripts/build-deb.sh`; package validation. |
-| Clean-checkout build after audit commits | Not done | Must be recorded before audit completion. |
+| Clean-checkout build after audit commits | Done | A clean local clone passed all 16 tests, built the package, passed lintian/desktop validation and matched the worktree package byte-for-byte; repeat after the final documentation commit. |
 | Confirm every user-visible/build/tag version agrees | Done | CLI/About/build/tag gate use `appector/__init__.py`; release tag must be `v0.1.0` for current version. |
 | Confirm runtime/build dependency versions and licences | Partial | Audit-host versions recorded; complete transitive licence/security review and cross-distro availability not done. |
 

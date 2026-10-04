@@ -28,6 +28,10 @@ automated tests pass. These results do **not** establish safe package
 installation/removal, GUI usability, support on the target distributions, or
 release readiness.
 
+The committed tree was cloned locally into a clean checkout: all 16 tests
+passed there, the package built and passed package/desktop validation, and its
+`.deb` bytes matched the working-tree build.
+
 Release is blocked until the local `.deb` trust/metadata preview is addressed,
 the public release destination and its protected credential are configured,
 license/copyright and maintainer metadata are confirmed, and the target
@@ -126,7 +130,7 @@ before commits were made.
 | Security | `d11201a` | Harden privileged/removal/log/export/update behavior. |
 | Tests | `1675ba4` | Add safety and updater regression tests. |
 | Packaging | `ba2eb39` | Build reproducible `.deb`; add package and release workflows. |
-| Documentation/audit | Pending | Add audit report, test matrix, release checklist and user/release guidance. |
+| Documentation/audit | `671d13e` (initial; verification follow-up pending) | Add audit report, test matrix, release checklist and user/release guidance. |
 
 ## Needs decision
 
