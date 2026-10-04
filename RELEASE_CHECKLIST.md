@@ -14,21 +14,21 @@ approves publication.** This checklist is not authorization to publish.
 | Build from documented source commands | Done | `python3 -m unittest discover -s tests -v`; `./scripts/build-deb.sh`; package validation. |
 | Clean-checkout build after audit commits | Done | A clean local clone passed all 16 tests, built the package, passed lintian/desktop validation and matched the worktree package byte-for-byte; the check is re-run after the final documentation commit. |
 | Confirm every user-visible/build/tag version agrees | Done | CLI/About/build/tag gate use `appector/__init__.py`; release tag must be `v0.1.0` for current version. |
-| Confirm runtime/build dependency versions and licences | Partial | Audit-host versions recorded; complete transitive licence/security review and cross-distro availability not done. |
+| Confirm runtime/build dependency versions and licences | Partial | Source inventory found standard-library and system GI imports, with no vendored application code/assets; review target archive dependency licences and vulnerabilities. |
 
 ## Phase 1 — Secrets and sensitive information
 
 | Item | Status | Notes |
 |---|---|---|
-| Scan working tree and locally reachable history for high-confidence secret patterns | Partial | Manual scan found none; gitleaks/TruffleHog unavailable and remote refs inaccessible. |
-| Scan all remote branches, tags and deleted history | Not done | Remote ref enumeration failed. |
-| Review commit author/committer metadata | Done, decision required | Local commit metadata uses a personal email-provider domain; exact identities are intentionally omitted from public report. |
-| Review Debian Maintainer identity | Partial | Uses GitHub noreply; owner must approve. |
+| Scan working tree and locally reachable history for high-confidence secret patterns | Partial | Manual pattern scan found no matches; gitleaks/TruffleHog unavailable. |
+| Scan all public remote refs/history for high-confidence secret patterns | Partial | Public mirror scan covered 14 commits and 101 blobs with no matches; dedicated scanners still unavailable. |
+| Review commit author/committer metadata | Decision required | Public history and local audit commits use a Gmail-domain email; review privacy before pushing the local branch. Actual addresses are omitted from audit files. |
+| Review Debian Maintainer identity | Done | Package metadata uses `Elshad Guliyev <ell-shad@users.noreply.github.com>`. |
 | Inspect final `.deb` paths, caches, local paths and permissions | Done | No build paths/caches/vendor files/group-world-writable files detected; source `.py` files are included. |
 | Review screenshots/icons/sample data for private information | Not applicable / incomplete | No screenshot or app icon is packaged; no screenshot-driven visual privacy review was possible. |
 | Ensure logs/exports are user-private | Done | Log `0700` directory/`0600` file; exports `0600` with symlink-target regression test. |
 | Identify direct network endpoints and telemetry | Partial | Direct update endpoint documented; package managers contact configured remotes; no telemetry client found by inspection, no sandbox capture. |
-| Decide source-history identity and GPL corresponding-source delivery | Not done | See Needs Decision in `AUDIT_REPORT.md`. |
+| Confirm copyright, GPLv3 intent, and corresponding source availability | Done | Owner confirmed original code and copyright; source repo is public and matching source/build scripts are included at each release tag. |
 
 ## Phase 2 — Code quality, cleanup and reliability
 
@@ -56,12 +56,12 @@ approves publication.** This checklist is not authorization to publish.
 | Preview equals executed transaction for all managers | Not done | APT simulations exist; Snap/Flatpak/file-install behavior is not fully previewed/reverified. |
 | APT autoremove/purge and Flatpak cleanup confirmation | Partial | Preview/confirmation exists; execution was not run. |
 | Residual scanner uses safe allow-list/quarantine/restore index | Not applicable to implemented scope | Only dpkg `rc` conffiles are surfaced; backups precede purge, but no restore UI. No general filesystem residual deletion engine. |
-| Local `.deb` metadata/trust/architecture/dependency/transaction preview | Not done — release blocker | Current path installs the selected file via `apt-get -y` without a metadata/signature/origin confirmation. |
+| Local `.deb` metadata/trust/architecture/dependency/transaction preview | Not done — release blocker | Concerns Appector's in-app install-local-`.deb` feature, not the generated release package; current UI runs `apt-get -y` without a complete review. |
 | `.flatpakref`/AppImage hostile input and architecture tests | Not done | Requires isolated integration tests. |
 | Update checker uses HTTPS, User-Agent, timeouts, safe URL/version parsing | Done | Unit tests cover Debian ordering and unsafe responses/URL. |
 | Update checker cache/ETag/daily limit/disable setting | Not done | Current check is manual-only; no background checks. |
 | Update checker only opens page, no auto-install | Done | Release URL is validated; app never downloads/executes updates. |
-| Download integrity signature/attestation | Not done | SHA256SUMS only; no signature or provenance. |
+| Download integrity signature/attestation | Not done | SHA256SUMS only; GitHub provenance is recommended, or explicitly accept checksum-only integrity for a pre-release. |
 
 ## Phase 4 — Test plan and platform verification
 
@@ -69,7 +69,7 @@ approves publication.** This checklist is not authorization to publish.
 |---|---|---|
 | Unit tests for safety, update versions and response parsing | Done | See `TEST_MATRIX.md`. |
 | Recorded fixtures for each source adapter, residual matching, batch queue/state | Not done | Existing suite does not cover these areas comprehensively. |
-| Disposable-distro install/use/remove lifecycle matrix | Not done — release blocker | No container runtime or configured VM image. |
+| Disposable Ubuntu 26.04 amd64 install/use/remove lifecycle | Not done — release blocker | This is the owner's initial target; no container runtime or configured VM image was available. |
 | Failure injection, package locks, disk-full and recovery | Not done | Must only run in disposable VMs. |
 | Residual dataset and zero user-data safe-tier criterion | Not done | General residual feature absent; no precision dataset. |
 | UI, accessibility, performance and memory tests | Not done | No visual/UI test execution. |
@@ -108,21 +108,21 @@ approves publication.** This checklist is not authorization to publish.
 
 | Item | Status | Notes |
 |---|---|---|
-| README install/update/privacy/known limitations/recovery | Partial | Drafted; no release link currently resolves and support channel/license decisions remain open. |
+| README install/update/privacy/known limitations/recovery | Partial | Updated for public source and same-repository releases; a release link will resolve after the first approved tag. |
 | SECURITY, CONTRIBUTING, CHANGELOG, issue/PR templates | Done as drafts | Verify repository security settings and public contact before publishing. |
 | CI tests/build/package validation | Done as workflow configuration | Workflow YAML parses; CI itself was not run. |
-| Pin actions and set least permissions | Done | Checkout is commit-pinned; workflows use `contents: read`. |
-| Release assets `*.deb` and `SHA256SUMS` | Partial | Workflow configured, not run; destination repository is currently 404. |
-| Detached signature/provenance | Not done | No signing secret/key or attestation. |
-| Protected public-release environment and scoped token | Not done — release blocker | Configure reviewers and a token scoped only to the assets repository. |
-| Branch protection, secret scanning/push protection, Dependabot, 2FA | Not verified | Repository settings need owner review. |
+| Pin actions and set least permissions | Done | Checkout is commit-pinned; release workflow grants `contents: write` only to the release job; CI is read-only. |
+| Release assets `*.deb` and `SHA256SUMS` | Partial | Workflow now targets this public source repository with `GITHUB_TOKEN`; no release upload was run. |
+| Detached signature/provenance | Not done | Add GitHub artifact provenance; no detached signature/attestation yet. |
+| Protected `public-release` environment | Not done — release blocker | Configure required reviewer and tag restrictions; no PAT secret or second repository is needed. |
+| Branch protection, secret scanning/push protection, Dependabot, 2FA | Not done | GitHub reports `main` unprotected; require PRs and CI, prevent force-push/deletion, and review security settings. |
 | APT repository recommendation and direct-deb limitation | Done | README explains release `.deb` does not update via `apt upgrade`; signed APT repository deferred. |
 
 ## Phase 8 — Additional release readiness
 
 | Item | Status | Notes |
 |---|---|---|
-| Licence compatibility, artwork, trademarks and name collision | Partial | GPL-3 metadata provisional; no artwork/license or broad name/trademark collision search completed. |
+| Licence compatibility, artwork, trademarks and name collision | Partial | Owner confirmed copyright/GPLv3; source inventory found no bundled third-party application assets. No broad trademark/name search or full dependency licence audit. |
 | Unaffiliated-with-distributions notice | Done | README includes Debian/Ubuntu/Canonical/Flathub/Snap Store notice. |
 | Privacy/network statement | Done with limitation | README documents local state and direct update endpoint; no sandbox network capture. |
 | Man page and recovery instructions | Partial | Man page and basic dpkg recovery documentation exist; no user guide/restore UI. |
@@ -134,26 +134,43 @@ approves publication.** This checklist is not authorization to publish.
 
 ## Owner decisions and prerequisites
 
-1. Confirm project copyright/licence grant, GPL source-delivery approach and
-   package maintainer identity.
-2. Decide whether to defer local `.deb` installation until a trustworthy
-   metadata/origin/transaction preview exists.
-3. Decide on the privileged helper/polkit architecture and checksum signing.
-4. Create the public assets repository; configure a narrowly scoped token,
-   protected environment, required human reviewer and tag restrictions.
-5. Approve the supported distro/architecture matrix, support/security contact,
-   initial pre-release scope, rollback policy and any identity/history changes.
-6. Complete the disposable integration matrix in `TEST_MATRIX.md`.
+1. Before pushing this local branch, review the commit email privacy finding.
+   Changing GitHub email settings protects future commits only; it does not
+   edit commits already created. If you do not want the address in the local
+   audit branch, explicitly authorize a local-only history rewrite.
+2. Protect `main` in Settings → Rules → Rulesets: require pull requests,
+   require the CI `test-and-package` status check, and block force pushes and
+   branch deletion. GitHub currently reports `main` as unprotected.
+3. After the email decision, push `pre-release-audit` and open a PR into
+   `main` for code review. This is only a source branch/PR, not a release or
+   tag.
+4. In Settings → Environments, create/open `public-release`. Add a required
+   reviewer, restrict deployment to version tags (`v*`), and confirm GitHub
+   pauses a test deployment for approval. Do not create the real release tag
+   as a test.
+5. Decide whether to add local `.deb` metadata/trust/transaction review before
+   including that in-app feature in the first release, or disable local `.deb`
+   installation for the initial release.
+6. Add GitHub artifact provenance attestation (recommended) and document
+   verification, or explicitly accept checksum-only integrity for a
+   pre-release.
+7. Review secret scanning/push protection, Dependabot and 2FA settings.
+8. Complete the Ubuntu 26.04 amd64 install/launch/upgrade/remove/purge tests in
+   a disposable VM.
+9. Decide whether generic `pkexec` package operations are acceptable for an
+   initial release or require a dedicated helper/polkit policy.
 
 ## Exact commands to tag and publish (do not run without explicit approval)
 
 The following are **instructions only**. They will create and push a release
-tag, triggering publication to the separate public repository. First replace
+tag, triggering publication to this public source repository. First merge the
+reviewed changes into `main`, switch to that updated branch, and replace
 `v0.1.0` if the approved version changes, ensure all blocking items above are
 closed, and obtain explicit owner approval.
 
 ```sh
-git switch pre-release-audit
+git switch main
+git pull --ff-only origin main
 git status --short
 git diff --check
 python3 -m unittest discover -s tests -v
@@ -164,4 +181,7 @@ git tag -a v0.1.0 -m "Appector 0.1.0"
 git push origin v0.1.0
 ```
 
-No tag, push, or release was created during this audit.
+The first `0.x` tag is created as a pre-release. After the tag push, inspect
+the Actions run and approve the `public-release` environment only after
+reviewing the build/artifacts and release notes. No tag, push, or release was
+created during this audit.

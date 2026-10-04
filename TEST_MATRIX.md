@@ -46,11 +46,15 @@ audit.
 | Update API invalid data / URL / 404 | Mocked API responses | **Pass** | Malformed response, unsafe URL and no stable release handled without crash. |
 | Duplicate GUI method check | Source-integrity test | **Pass** | No duplicate methods remain in inspected GUI classes. |
 | Workflow YAML syntax | Local PyYAML parser | **Pass** | Both `.github/workflows/*.yml` parse. |
+| High-confidence secret patterns in public Git history | Public mirror of `ell-shad/appector` | **Pass: 0 matches** | Scanned all refs visible at audit time: 14 commits and 101 unique blobs. Manual patterns only; gitleaks/TruffleHog were unavailable. |
+| Public default-branch protection | GitHub repository metadata | **Fail / not configured** | Public API reports `main` is unprotected; configure branch rules before merging release setup or accepting public contributions. |
+| Commit author email privacy | Public `main` and local audit branch | **Needs owner decision** | Checked domains only: public and local commits use a Gmail-domain address. Actual addresses are not printed here; consider GitHub's private noreply address for future commits. |
 | Shell script syntax | POSIX shell parser | **Pass** | `sh -n scripts/build-deb.sh`. |
 | First deterministic `.deb` build | Ubuntu 26.04 amd64 | **Pass** | Produces `dist/appector_0.1.0_all.deb`. |
 | Repeated deterministic `.deb` build | Same host/checkout | **Pass** | Two consecutive builds of the same source checkout had identical SHA-256. |
 | Clean-checkout tests/build | Local clone of committed audit tree | **Pass** | All 16 tests passed; package built, passed lintian/desktop validation, and was byte-identical to the worktree package. Re-run after the final documentation commit. |
 | Debian package metadata / file list | `dpkg-deb` | **Pass** | Architecture `all`, dependency metadata, launcher, GTK desktop entry, man page and copyright present. |
+| Runtime dependency/source inventory | Source imports and Ubuntu package copyright notices | **Partial** | App imports use standard library and system GI bindings; no vendored app code/assets. PyGObject/GTK/libadwaita copyright notices list LGPL terms; full transitive SBOM/licence review remains. |
 | Lintian | lintian 2.129.0, `--pedantic` | **Pass: no diagnostics** | `lintian --pedantic dist/appector_0.1.0_all.deb`. |
 | Desktop entry validation | desktop-file-utils 0.28 | **Pass** | `desktop-file-validate` on staged desktop file. |
 | Package contents/privacy/modes | Extracted package in temporary directory | **Pass** | 16 files; no `.git`, caches, vendor dirs, local home/temp paths, or group/world-writable files found. |
@@ -60,14 +64,10 @@ audit.
 
 | Distribution / architecture | Build | Install/launch | Package lifecycle | Result |
 |---|---|---|---|---|
-| Ubuntu 26.04 amd64 (audit host) | `.deb` built twice | Not run | Not run | Build/static validation only. |
-| Ubuntu 24.04 amd64 (CI target) | Workflow configured, not executed in this audit | Not run | Not run | Pending CI run. |
-| Debian stable amd64 | Not run | Not run | Not run | Pending disposable environment. |
-| Ubuntu LTS amd64 | Not run | Not run | Not run | Pending disposable environment. |
-| Linux Mint amd64 | Not run | Not run | Not run | Pending disposable environment. |
-| Pop!_OS amd64 | Not run | Not run | Not run | Pending disposable environment. |
-| Raspberry Pi OS arm64 | Not run | Not run | Not run | Pending arm64 device/VM. |
-| Any arm64 target | Architecture-independent package only | Not run | Not run | `Architecture: all` is not compatibility evidence. |
+| Ubuntu 26.04 amd64 (initial target/audit host) | `.deb` built twice | Not run | Not run | Build/static validation only; disposable install/lifecycle test remains. |
+| Debian stable amd64 | Not claimed/tested | Not run | Not run | Future support requires a separate disposable test. |
+| Other Ubuntu releases, Mint, Pop!_OS | Not claimed/tested | Not run | Not run | Future support requires per-release compatibility/install testing. |
+| Raspberry Pi OS / arm64 | Not claimed/tested | Not run | Not run | `Architecture: all` is not compatibility evidence. |
 
 ## Required integration and failure scenarios (not run)
 
@@ -94,15 +94,16 @@ container. Do not run them against a user's host.
 | Appector install/upgrade/remove/purge/reinstall lifecycle | **Not run** | Verify no orphaned service, file, state, or desktop entry; self-removal refusal is unit-tested only. |
 | Keyboard, Orca, contrast, large text, HiDPI, themes, narrow UI, Wayland/X11 | **Not run** | GUI visual/accessibility audit pending. |
 | 1,500+ package performance, scan responsiveness and memory | **Not run** | Record first-scan time and peak memory on supported target systems. |
-| Offline/rate-limited GitHub update API and live release page | **Not run** | Mock tests cover malformed data and 404; no live release repository exists. |
+| Offline/rate-limited GitHub update API and live release page | **Not run** | Mock tests cover malformed data and 404; the public source repository currently has no published application release. |
 | APT install with missing dependency and maintainer-script prompts | **Not run** | Must first decide/implement local package metadata and transaction confirmation. |
-| Public release upload / rollback / yank | **Not run** | Explicitly prohibited without owner approval; destination currently returns 404. |
+| Public release upload / rollback / yank | **Not run** | Explicitly not run; requires a protected environment approval and explicit publication approval. |
 
 ## Tool coverage and limitations
 
 ShellCheck, Ruff, mypy, pytest, gitleaks and TruffleHog were unavailable on the
-host and were not installed into the host environment. CI is configured to
-install ShellCheck; secret scanning still needs a trusted environment. Docker,
+host and were not installed into the host environment. The public history was
+scanned with manual high-confidence patterns, not a dedicated secret scanner.
+CI is configured to install ShellCheck. Docker,
 Podman and LXD were unavailable and no QEMU guest image was configured, so no
 disposable integration environment could be created. AppStream metainfo is
 absent, so no AppStream validation result is available. Test coverage

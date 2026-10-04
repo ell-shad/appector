@@ -1,7 +1,7 @@
 # Contributing
 
-Appector's source repository is currently private. This guide describes the
-expected workflow for authorized contributors.
+Appector's source repository is public. Contributions should be proposed as
+pull requests against `main`.
 
 ## Development setup
 
@@ -28,6 +28,7 @@ credentials, local logs, installed-app exports, build products, or user data.
 ## Releases
 
 The app version in `appector/__init__.py` is the source version. Use a matching
-`v<version>` tag only after release approval and after the public release
-repository, publishing credential, maintainer contact, and release-integrity
-policy have been configured.
+`v<version>` tag only after release approval, the `public-release` environment
+has a required reviewer, and the release-integrity policy has been configured.
+The release workflow publishes to this repository using GitHub's automatically
+provided Actions token; no publishing PAT should be added.

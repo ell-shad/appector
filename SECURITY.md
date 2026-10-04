@@ -4,11 +4,11 @@
 
 Please do not report an exploitable vulnerability in a public issue.
 
-The Appector source repository is private. If GitHub private vulnerability
+The Appector source repository is public. If GitHub private vulnerability
 reporting is enabled for `ell-shad/appector`, use the repository's **Report a
 vulnerability** flow. If it is not enabled, contact the repository owner
 privately through GitHub and ask for a secure reporting channel. Do not send
-credentials, personal logs, or exploit details through an untrusted channel.
+credentials, personal logs, or exploit details through a public issue.
 
 Include the affected Appector version, distribution and architecture, impact,
 and minimal reproduction steps. Redact usernames, home paths, tokens, and

@@ -10,19 +10,15 @@ Flathub, or the Snap Store.
 
 ## Download and install
 
-The source repository is private. User-facing binary releases are intended to
-be published in the separate public
-[`ell-shad/appector-releases`](https://github.com/ell-shad/appector-releases)
-repository. That repository currently returns 404 and must be created before
-publishing; until then, there is no public release to download.
-
-The `.deb` includes Appector's Python source files. Keeping the Git repository
-private does not keep the application's implementation private, and the
-license's corresponding-source requirements must be met for distributed
-packages.
+The source repository is public:
+[`ell-shad/appector`](https://github.com/ell-shad/appector). Binary `.deb`
+packages will be attached to that same repository's GitHub Releases; there is
+not yet a published application release. The matching source is available from
+the same public repository and release tag (including GitHub's source archive).
+The `.deb` also contains Appector's Python source files.
 
 After a release is available, download `appector_<version>_all.deb` and
-`SHA256SUMS` from its GitHub Releases page. Verify the checksum in the same
+`SHA256SUMS` from the GitHub Releases page. Verify the checksum in the same
 directory, then install:
 
 ```bash
@@ -59,11 +55,14 @@ These commands do not remove Appector's per-user state or AppImages.
 
 ## Supported systems
 
-The package is architecture-independent Python (`Architecture: all`), but it
-has not yet been integration-tested on Debian stable, Ubuntu LTS, Linux Mint,
-Pop!_OS, Raspberry Pi OS, or both amd64 and arm64. Package availability and
-GTK/libadwaita versions must be checked on each supported distribution before
-claiming support. The current audit host is Ubuntu 26.04.
+The initial target is Ubuntu 26.04 amd64, matching the audit host. The package
+was built and statically validated on that host, but it has not yet been
+installed or integration-tested there, so this is a target rather than a
+verified support claim. `Architecture: all` means the Python files are
+architecture-independent; it does not establish compatibility with arm64 or
+other distributions. Debian stable, older Ubuntu releases, Linux Mint,
+Pop!_OS, and Raspberry Pi OS need their own compatibility and install tests
+before support is claimed.
 
 ## Usage and destructive actions
 
@@ -72,6 +71,12 @@ and use the main menu for installation, exports, update checks, and maintenance.
 Removal and cleanup can delete packages, package configuration, or files.
 Review each preview and confirmation carefully; package-manager transactions
 can affect dependencies beyond the selected app.
+
+The in-app local `.deb` installer currently does not display a complete
+package metadata/origin review or transaction preview, and it cannot verify a
+publisher signature. Treat selected `.deb` files as trusted executable code;
+the feature is a release-readiness item until that review is added or the
+feature is disabled for the first release.
 
 When Appector purges APT residual configurations it first backs up dpkg-listed
 conffiles under:
@@ -103,7 +108,7 @@ Review both before sharing.
 
 **Check for Appector updates…** is a manual menu action. It requests the latest
 stable release metadata from
-`https://api.github.com/repos/ell-shad/appector-releases/releases/latest`.
+`https://api.github.com/repos/ell-shad/appector/releases/latest`.
 GitHub's `latest` endpoint excludes drafts and pre-releases. Beta-channel
 updates are not currently offered. When a newer release is found, Appector
 opens that release page; it never downloads or installs the update itself.
@@ -117,16 +122,18 @@ Flathub may contact `https://dl.flathub.org/repo/flathub.flatpakrepo`.
 The GitHub Releases API is the only direct Appector update-check endpoint.
 
 A `.deb` installed from a GitHub Release does **not** configure an APT
-repository and will not receive upgrades through `apt upgrade`. Release
-publication requires creating a public `ell-shad/appector-releases`
-repository, configuring its write-scoped `APPECTOR_RELEASES_TOKEN` as a secret
-in a GitHub Actions `public-release` environment, and protecting that
-environment with a required human reviewer. The source repository stays
-private. A tag matching the version in `appector/__init__.py` then builds the
-package, creates `SHA256SUMS`, and publishes a release to the public assets
-repository. The first `0.x` release is marked as a pre-release.
+repository and will not receive upgrades through `apt upgrade`. A tag matching
+the version in `appector/__init__.py` builds the package, creates
+`SHA256SUMS`, and publishes the assets as a release in this repository using
+GitHub Actions' automatically provided token. The `public-release` Actions
+environment is a publication approval gate; configure a required reviewer
+before publishing. The first `0.x` release is marked as a pre-release.
 
-Checksums are not signed yet. A signed APT
+Release checksums are not signed yet. GitHub-generated source archives are
+available from the same tag and contain the source/build scripts for that
+binary version. A GitHub artifact provenance attestation is recommended
+before the first public binary release; it can let users verify that the
+published package was built by this repository's workflow. A signed APT
 repository (for example, GitHub Pages with aptly/reprepro, or a hosted package
 repository) is a possible later improvement; it is not configured here.
 
@@ -169,16 +176,17 @@ python3 -m unittest discover -s tests -v
 
 Report bugs at
 <https://github.com/ell-shad/appector/issues> with the distribution/release,
-architecture, Appector version, and a redacted error or log excerpt. The source
-repository is private, so public issue reporting still needs a maintainer-
-approved public support channel.
+architecture, Appector version, and a redacted error or log excerpt. Do not
+post credentials, private logs, or personal installed-app exports.
 
 ## License and security
 
-The repository contains the text of the GNU General Public License version 3
-in [`LICENSE`](./LICENSE). The project's explicit copyright-holder/license
-grant should be confirmed before a public release; Debian metadata currently
-assumes GPL-3-only provisionally.
+Copyright © 2026 Elshad Guliyev. Appector's original application code is
+distributed under the GNU General Public License version 3; see
+[`LICENSE`](./LICENSE). No third-party application source or artwork is
+currently bundled. Runtime libraries such as Python, PyGObject, GTK 4,
+libadwaita, and GdkPixbuf are system dependencies and retain their own
+licences.
 
 For security issues, follow [`SECURITY.md`](./SECURITY.md). Do not include
 credentials or unredacted private logs in public reports.
