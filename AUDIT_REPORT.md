@@ -82,8 +82,8 @@ dependency vulnerability scan were not independently verified.
 
 ## Security, privacy and history results
 
-- The working tree and 80 locally available commits (354 unique blobs in the
-  earlier audit pass) had no high-confidence secret-pattern matches. This was
+- A final targeted scan of the working tree and all locally reachable Git
+  blobs found no high-confidence secret-pattern matches. This was
   a manual pattern scan, **not** equivalent to gitleaks/TruffleHog; those
   scanners were unavailable. Remote refs could not be enumerated, so this is
   not a claim about unseen remote branches or tags. No live credential was
