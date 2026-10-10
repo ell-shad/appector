@@ -2666,12 +2666,24 @@ class MainWindow(Adw.ApplicationWindow):
                 Gtk.MessageType.ERROR,
             )
         elif result["available"]:
+            version = result["version"]
             dialog = Gtk.MessageDialog(
                 transient_for=self,
                 modal=True,
                 message_type=Gtk.MessageType.INFO,
-                text=f"Appector {result['version']} is available",
-                secondary_text="Open the release page to download and install the update.",
+                text=f"Appector {version} is available",
+                secondary_text=(
+                    f"Open the release page to download "
+                    f"appector_{version}_all.deb and SHA256SUMS.\n\n"
+                    "Install the upgrade with:\n"
+                    f"    sudo apt install ./appector_{version}_all.deb\n\n"
+                    "Use apt rather than Ubuntu Software Center: a release .deb "
+                    "is not registered as an APT source, so Software Center "
+                    "reports the installed Appector as \"already installed\" "
+                    "instead of offering the upgrade.\n\n"
+                    "Verify the download first:\n"
+                    "    sha256sum --check SHA256SUMS"
+                ),
             )
             dialog.add_button("Close", Gtk.ResponseType.CLOSE)
             dialog.add_button("Open Release", Gtk.ResponseType.OK)
