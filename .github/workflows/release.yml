@@ -76,19 +76,32 @@ jobs:
           version = tag.removeprefix("v")
           changelog = Path(sys.argv[2]).read_text(encoding="utf-8")
           lines = changelog.splitlines()
-          heading = re.compile(rf"^## \[{re.escape(version)}\](?:\s+-.*)?$")
+          heading = re.compile(
+              rf"^## \[{re.escape(version)}\](?:\s+-\s*(?P<suffix>.*))?$"
+          )
           for index, line in enumerate(lines):
-              if heading.match(line):
-                  notes = []
-                  for item in lines[index + 1:]:
-                      if item.startswith("## "):
-                          break
-                      notes.append(item)
-                  rendered = "\n".join(notes).strip()
-                  if rendered:
-                      print(rendered)
+              match = heading.match(line)
+              if not match:
+                  continue
+              notes = []
+              for item in lines[index + 1:]:
+                  if item.startswith("## "):
                       break
+                  notes.append(item)
+              rendered = "\n".join(notes).strip()
+              if not rendered:
                   raise SystemExit(f"No release notes found for {tag}.")
+              # The heading suffix decides whether GitHub marks the release as
+              # a pre-release. This matters: /releases/latest excludes
+              # pre-releases, so a pre-release is invisible to Appector's
+              # in-app update check.
+              suffix = (match.group("suffix") or "").strip().lower()
+              Path("prerelease").write_text(
+                  "1\n" if "prerelease" in suffix else "0\n",
+                  encoding="utf-8",
+              )
+              print(rendered)
+              break
           else:
               raise SystemExit(f"No changelog section found for {tag}.")
           PY
@@ -101,6 +114,7 @@ jobs:
             dist/*.deb
             dist/SHA256SUMS
             dist/release-notes.md
+            dist/prerelease
           if-no-files-found: error
           retention-days: 30
 
@@ -122,10 +136,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          # Prerelease status comes from the changelog heading suffix, not from
+          # the version number. /releases/latest excludes pre-releases, so this
+          # flag decides whether Appector's in-app update check can see the
+          # release at all.
           release_args=()
-          case "$GITHUB_REF_NAME" in
-            v0.*) release_args+=(--prerelease) ;;
-          esac
+          if [ -f dist/prerelease ] && [ "$(cat dist/prerelease)" = "1" ]; then
+            release_args+=(--prerelease)
+            echo "Publishing as a pre-release (invisible to /releases/latest)."
+          else
+            echo "Publishing as a full release (visible to /releases/latest)."
+          fi
           gh release create "$GITHUB_REF_NAME" dist/*.deb dist/SHA256SUMS \
             --title "Appector $GITHUB_REF_NAME" \
             --notes-file dist/release-notes.md \

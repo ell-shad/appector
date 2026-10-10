@@ -175,6 +175,9 @@ def scan_leftover_configs() -> List[AppEntry]:
         ],
         text=True,
         stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        timeout=30,
+        env={**os.environ, "LC_ALL": "C"},
     )
 
     for line in out.splitlines():
@@ -187,6 +190,10 @@ def scan_leftover_configs() -> List[AppEntry]:
         package_name = parts[1].strip()
 
         if status[:2] == "rc" and package_name:
+            # Defense-in-depth: dpkg package names are constrained; skip
+            # anything unexpected rather than turning it into UI state.
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+:-]*", package_name):
+                continue
             apps.append(
                 AppEntry(
                     name=package_name,

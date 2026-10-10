@@ -9,6 +9,17 @@ dist/
 .venv/
 venv/
 .DS_Store
+
+# Local development notes; never part of a release.
 AUDIT_REPORT.md
 RELEASE_CHECKLIST.md
 TEST_MATRIX.md
+
+# Third-party agent tooling checked out for reference; not part of Appector.
+agent-skills-*/
+
+# Credentials must never be committed.
+.env
+.env.*
+*.pem
+*.key
