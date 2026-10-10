@@ -72,6 +72,23 @@ sha256sum --check SHA256SUMS
 sudo apt install ./appector_<version>_all.deb
 ```
 
+### Upgrading an existing installation
+
+Use `sudo apt install ./appector_<version>_all.deb` to upgrade. It performs a
+normal versioned upgrade, exactly like installing the first time.
+
+Do **not** rely on Ubuntu Software Center (GNOME Software) to apply an update
+from a downloaded release `.deb`. Release packages are not published through
+an APT repository, so there is no configured source offering a newer candidate
+version. Software Center resolves a local `.deb` by package name and, finding
+`appector` already installed, reports it as *already installed* rather than
+offering the upgrade. This is a property of how PackageKit handles local
+packages, not a defect in the package.
+
+If Software Center should be able to upgrade Appector like any other
+application, Appector needs to be published to an APT repository that appears
+in `/etc/apt/sources.list.d`. See the roadmap note below.
+
 ### Upgrading from an earlier version
 
 Appector checks for updates on demand from **Check for Appector updates…** in
@@ -227,9 +244,14 @@ gh attestation verify ./appector_<version>_all.deb --repo ell-shad/appector
 ```
 
 GitHub-generated source archives are available from the same tag and contain
-the source/build scripts for that binary version. A signed APT repository
-(for example, GitHub Pages with aptly/reprepro, or a hosted package
-repository) is a possible later improvement; it is not configured here.
+the source/build scripts for that binary version.
+
+A signed APT repository (for example, GitHub Pages with aptly/reprepro, or a
+hosted package repository) is a planned improvement; it is not configured
+today. That is the only way Ubuntu Software Center could offer Appector
+updates on its own, and it is what the release workflow would need to publish
+a `Packages` index alongside the `.deb`. Until then, upgrade with
+`sudo apt install ./appector_<version>_all.deb`.
 
 ## Build from source
 

@@ -1,4 +1,5 @@
 import hashlib
+import shutil
 import stat
 import tempfile
 import unittest
@@ -167,6 +168,111 @@ class DebInstallReviewTests(unittest.TestCase):
 
         self.assertFalse(success)
         self.assertIn("transaction changed", message)
+        install.assert_not_called()
+
+
+class DebReviewResilienceTests(unittest.TestCase):
+    """A swept-away staging directory must not fail an otherwise valid review.
+
+    Staging used to live in /tmp, where a system-wide tmpfiles cleaner could
+    remove it between the review dialog and the install. That surfaced as
+    "Could not verify reviewed package ...: No such file or directory".
+    """
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+
+    def _make_package(self, name="appector_0.2.0_all.deb", contents=b"package bytes"):
+        package = self.root / name
+        package.write_bytes(contents)
+        return package
+
+    def _which(self):
+        return patch(
+            "appector.actions.shutil.which",
+            side_effect=lambda name: f"/usr/bin/{name}",
+        )
+
+    def _field(self):
+        return patch(
+            "appector.actions._run_command_raw",
+            side_effect=lambda command, **kwargs: (
+                (0, "amd64")
+                if command[1:] == ["--print-architecture"]
+                else (
+                    0,
+                    "Package: appector\nVersion: 0.2.0\nArchitecture: all\n"
+                    "Maintainer: Example Publisher\nDescription: Example\n",
+                )
+                if command[1:2] == ["--field"]
+                else (0, "Inst appector [0.2.0]")
+            ),
+        )
+
+    def _review(self, contents=b"package bytes"):
+        package = self._make_package(contents=contents)
+        with patch.object(Path, "home", return_value=self.root), self._which(), self._field():
+            review, error = actions.review_deb_batch([str(package)])
+        self.assertEqual(error, "")
+        self.assertIsNotNone(review)
+        self.addCleanup(review.close)
+        return review
+
+    def test_staging_is_not_in_system_tmp(self):
+        review = self._review()
+        scratch = Path(review.staged_paths[0]).parent
+        self.assertTrue(
+            str(scratch).startswith(str(self.root)),
+            f"staging should live under the per-user cache, got {scratch}",
+        )
+
+    def test_vanished_staging_is_restored_and_install_proceeds(self):
+        review = self._review()
+        staged = Path(review.staged_paths[0])
+
+        # Simulate the staging area being swept away after the review.
+        shutil.rmtree(staged.parent)
+        self.assertFalse(staged.exists())
+
+        with self._which(), self._field(), patch(
+            "appector.actions._run_command_stream", return_value=(True, "ok")
+        ) as install:
+            success, message = actions.install_deb_batch(
+                review.staged_paths, review=review
+            )
+        self.assertTrue(success, message)
+        install.assert_called_once()
+
+    def test_changed_original_refuses_instead_of_installing(self):
+        review = self._review(contents=b"original bytes")
+        shutil.rmtree(Path(review.staged_paths[0]).parent)
+
+        # The review no longer describes these bytes, so refuse rather than
+        # silently install different content.
+        Path(review.original_paths[0]).write_bytes(b"tampered bytes")
+
+        with self._which(), patch("appector.actions._run_command_stream") as install:
+            success, message = actions.install_deb_batch(
+                review.staged_paths, review=review
+            )
+        self.assertFalse(success)
+        self.assertIn("Review the file again", message)
+        self.assertIn("No package was installed", message)
+        install.assert_not_called()
+
+    def test_missing_original_refuses_clearly(self):
+        review = self._review()
+        shutil.rmtree(Path(review.staged_paths[0]).parent)
+        Path(review.original_paths[0]).unlink()
+
+        with self._which(), patch("appector.actions._run_command_stream") as install:
+            success, message = actions.install_deb_batch(
+                review.staged_paths, review=review
+            )
+        self.assertFalse(success)
+        self.assertIn("Review the file again", message)
         install.assert_not_called()
 
 

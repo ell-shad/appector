@@ -12,6 +12,27 @@ therefore cannot see pre-releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- Installing a reviewed `.deb` no longer fails with a bare "no such file"
+  when the staging area disappears between the review and the install.
+  Staging moved from `/tmp` to a per-user cache directory that system-wide
+  tmpfiles cleaners do not touch, and a vanished staged copy is rebuilt from
+  the original file only when that file still hashes to the reviewed value.
+  A changed or missing original is still refused, so the review continues to
+  guarantee that only reviewed bytes are installed.
+- The Appector update dialog now names the exact package file and shows the
+  `sudo apt install ./appector_<version>_all.deb` command, so upgrading no
+  longer depends on the user knowing the procedure.
+- Documented that Ubuntu Software Center cannot upgrade a release `.deb`,
+  because release packages are not published through an APT repository, and
+  documented `sudo apt install ./<file>.deb` as the upgrade path.
+
+### Changed
+
+- Updated screenshots for the new sidebar scope selector, backup browser, and
+  menu layout.
+
 ## [0.2.0] - 2026-10-10
 
 ### Added

@@ -742,6 +742,76 @@ class DebInstallReview:
         self._temporary_directory.cleanup()
         self._closed = True
 
+    def ensure_staged(self):
+        """Re-create any staged copy that disappeared before installation.
+
+        The review exists to bind the install to exact reviewed bytes. That
+        guarantee survives a vanished staging file as long as the *original*
+        file still hashes to the reviewed value, so the copy is simply made
+        again from those bytes. If the original changed, the review is no
+        longer valid and installation is refused rather than silently
+        proceeding with different content.
+        """
+        missing = [
+            index
+            for index, path in enumerate(self.staged_paths)
+            if not Path(path).is_file()
+        ]
+        if not missing:
+            return
+
+        scratch = Path(self._temporary_directory.name)
+        for index in missing:
+            original = self.original_paths[index]
+            expected = self.hashes[index]
+            digest = hashlib.sha256()
+            try:
+                source_fd = os.open(
+                    original, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                )
+                with os.fdopen(source_fd, "rb") as source:
+                    if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                        raise OSError("The selected file is no longer a regular file.")
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            except OSError as error:
+                raise OSError(
+                    f"The reviewed copy of {Path(original).name} is gone and the "
+                    f"original could not be re-read ({error}). Review the file "
+                    "again."
+                ) from error
+
+            if digest.hexdigest() != expected:
+                raise OSError(
+                    f"The reviewed copy of {Path(original).name} is gone and the "
+                    "original file has changed since the review. Review the "
+                    "file again."
+                )
+
+            destination = Path(self.staged_paths[index])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            destination_fd = os.open(destination, flags, 0o400)
+            try:
+                copy_fd = os.open(
+                    original, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                )
+                with os.fdopen(copy_fd, "rb") as source, os.fdopen(
+                    destination_fd, "wb"
+                ) as output:
+                    destination_fd = None
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        output.write(chunk)
+            finally:
+                if destination_fd is not None:
+                    os.close(destination_fd)
+
+        _log_action(
+            f"DEB_REVIEW_RESTAGED count={len(missing)}"
+        )
+
     def trash_unchanged_sources(self):
         results = []
         for path, expected_hash in zip(self.original_paths, self.hashes):
@@ -777,6 +847,25 @@ class DebInstallReview:
         return "\n".join(results)
 
 
+def _deb_review_scratch_dir():
+    """Private scratch space for staged .deb reviews.
+
+    Deliberately not /tmp: system-wide tmpfiles cleaners can remove a staging
+    directory between the review dialog and the install, which turned a valid
+    review into a spurious "no such file" failure. The per-user cache is only
+    ever touched by this user.
+    """
+    root = Path.home() / ".cache" / "app-manager" / "deb-review"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    home = Path.home().resolve()
+    if root.is_symlink() or not root.resolve().is_relative_to(home):
+        raise OSError(
+            f"Package-review scratch directory is outside the home folder: {root}"
+        )
+    os.chmod(root, 0o700)
+    return root
+
+
 def review_deb_batch(paths):
     """Stage local packages, inspect metadata and simulate their APT transaction."""
     if not paths:
@@ -805,6 +894,7 @@ def review_deb_batch(paths):
     try:
         temporary_directory = tempfile.TemporaryDirectory(
             prefix="appector-deb-review-",
+            dir=_deb_review_scratch_dir(),
         )
     except OSError as error:
         return None, f"Could not create private package-review storage: {error}"
@@ -974,6 +1064,19 @@ def install_deb_batch(
     staged_paths = [Path(path).absolute() for path in paths]
     if staged_paths != [Path(path).absolute() for path in review.staged_paths]:
         return False, "Selected Debian packages no longer match the reviewed files."
+
+    # The staging area can be swept away between the review dialog and this
+    # call. Re-create it from the reviewed bytes rather than failing with a
+    # bare "no such file"; this refuses if the original has changed, so the
+    # review's guarantee is unchanged.
+    try:
+        review.ensure_staged()
+    except OSError as error:
+        return False, (
+            "The reviewed copy of the selected package is no longer "
+            f"available. No package was installed.\n\n{error}"
+        )
+
     for path, expected_hash in zip(staged_paths, review.hashes):
         digest = hashlib.sha256()
         package_fd = None
