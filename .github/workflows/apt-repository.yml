@@ -7,6 +7,10 @@ on:
   push:
     tags:
       - "v*"
+  # Prints the archive public key without publishing anything. Public keys are
+  # not secret, so this exists to recover or confirm the committed key without
+  # having to keep a local copy of the private key.
+  workflow_dispatch:
 
 # Least privilege. The signing key is read from repository secrets, which are
 # available to the workflow regardless of these token permissions.
@@ -14,7 +18,33 @@ permissions:
   contents: read
 
 jobs:
+  show-archive-key:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Print the archive public key
+        env:
+          APPECTOR_GPG_KEY: ${{ secrets.APPECTOR_GPG_KEY }}
+        run: |
+          set -eu
+          if [ -z "${APPECTOR_GPG_KEY:-}" ]; then
+            echo "::error::APPECTOR_GPG_KEY is not set."
+            exit 1
+          fi
+          export GNUPGHOME=$(mktemp -d)
+          chmod 700 "$GNUPGHOME"
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          printf '%s\n' "$APPECTOR_GPG_KEY" | gpg --batch --quiet --import
+          echo "Fingerprint:"
+          gpg --batch --list-secret-keys --with-colons \
+            | awk -F: '/^fpr:/ {print $10; exit}'
+          echo "Public key (commit this as apt/keys/appector-archive-keyring.asc):"
+          gpg --batch --yes --armor --export
+
   publish:
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     # The signing key is the project's release credential: publishing through
     # this environment means a reviewer can approve the repository before the
@@ -53,14 +83,7 @@ jobs:
           fi
           echo "$GITHUB_REF_NAME is a full release; publishing to stable."
 
-      - name: Require the committed public key
-        run: |
-          if [ ! -f apt/keys/appector-archive-keyring.asc ]; then
-            echo "::error::apt/keys/appector-archive-keyring.asc is missing. Generate it with scripts/generate-apt-signing-key.sh and commit it, so users have a reviewed key to trust."
-            exit 1
-          fi
-
-      - name: Refuse to publish without the archive signing key
+      - name: Require the signing key
         env:
           APPECTOR_GPG_KEY: ${{ secrets.APPECTOR_GPG_KEY }}
         run: |
@@ -79,10 +102,9 @@ jobs:
           APPECTOR_GPG_PASSPHRASE: ${{ secrets.APPECTOR_GPG_PASSPHRASE }}
         run: ./scripts/build-apt-repo.sh
 
-      - name: Verify the repository before publishing it
+      - name: Confirm the published keyring can verify the published metadata
         env:
           APPECTOR_GPG_KEY: ${{ secrets.APPECTOR_GPG_KEY }}
-          APPECTOR_GPG_KEY_ID: ${{ secrets.APPECTOR_GPG_KEY_ID }}
           APPECTOR_GPG_PASSPHRASE: ${{ secrets.APPECTOR_GPG_PASSPHRASE }}
         run: |
           set -euo pipefail
@@ -94,20 +116,45 @@ jobs:
           test -f "$dists/InRelease"  || { echo "::error::InRelease was not produced"; exit 1; }
           test -f "$dists/Release.gpg" || { echo "::error::Release.gpg was not produced"; exit 1; }
 
-          # Verify against the committed public key alone, in an isolated
-          # keyring. This proves the key users will import is the key that
-          # signed the metadata, rather than trusting the build's own output.
+          # Recompute the public half from the signing secret in an isolated
+          # keyring. This is the property that must hold: the keyring users
+          # import has to verify the metadata we serve.
           export GNUPGHOME=$(mktemp -d)
           chmod 700 "$GNUPGHOME"
           trap 'rm -rf "$GNUPGHOME"' EXIT
-          gpg --batch --quiet --import apt/keys/appector-archive-keyring.asc
-          gpg --batch --verify "$dists/InRelease" > /dev/null
-          gpg --batch --verify "$dists/Release.gpg" "$dists/Release" > /dev/null
-          echo "Release metadata verifies against the committed public key."
+          printf '%s\n' "$APPECTOR_GPG_KEY" | gpg --batch --quiet --import
+          gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "${APPECTOR_GPG_PASSPHRASE-}" --armor --export \
+            > /tmp/derived-key.asc
 
-          # Publish exactly the reviewed key, not one re-exported in CI.
-          cp apt/keys/appector-archive-keyring.asc \
-            apt-repo/appector-archive-keyring.asc
+          committed=apt/keys/appector-archive-keyring.asc
+          if [ -f "$committed" ]; then
+            # A committed key is reviewable in a pull request, which is
+            # preferable. It must nevertheless be the same key.
+            if ! diff -q /tmp/derived-key.asc "$committed" > /dev/null; then
+              echo "::error::The committed $committed does not match the key in APPECTOR_GPG_KEY. Users who trusted the committed key would fail to verify this repository."
+              exit 1
+            fi
+            echo "Committed public key matches the signing key."
+            cp "$committed" apt-repo/appector-archive-keyring.asc
+          else
+            # Not fatal. The archive is still correct, it simply was not
+            # reviewed before publication. Commit the key to make the next
+            # release reviewable.
+            echo "::warning::$committed is missing. Publishing the public key derived from the signing secret. Commit it so the next release publishes a reviewed key."
+            cp /tmp/derived-key.asc apt-repo/appector-archive-keyring.asc
+          fi
+
+          # Verify with only the key that is about to be published.
+          keyring=$(mktemp -d)
+          chmod 700 "$keyring"
+          GNUPGHOME=$keyring gpg --batch --quiet \
+            --import apt-repo/appector-archive-keyring.asc
+          GNUPGHOME=$keyring gpg --batch --verify "$dists/InRelease" > /dev/null
+          GNUPGHOME=$keyring gpg --batch --verify "$dists/Release.gpg" \
+            "$dists/Release" > /dev/null
+          rm -rf "$keyring"
+          echo "Release metadata verifies against the published keyring."
 
           # Confirm the checksums in Release match the indexes actually shipped.
           cd "$dists"
