@@ -393,5 +393,141 @@ class AptRepositorySigningTests(unittest.TestCase):
         self.assertIn("no secret (signing) key", result.stderr)
 
 
+class ArchiveKeyGenerationTests(unittest.TestCase):
+    """scripts/generate-apt-signing-key.sh must yield a usable signing key.
+
+    The passphrase path previously exported an empty file, because the secret
+    key also needs the passphrase to be unwrapped by the agent and the
+    passphrase file had already been deleted by then. A test that only checked
+    the file existed would have passed while shipping a broken signing key.
+    """
+
+    SCRIPT = REPO_ROOT / "scripts" / "generate-apt-signing-key.sh"
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("gpg") is None:
+            raise unittest.SkipTest("gpg is required")
+
+    def setUp(self):
+        self._scratch = tempfile.TemporaryDirectory()
+        self.root = Path(self._scratch.name)
+        self.addCleanup(self._scratch.cleanup)
+
+        # Run from a scratch copy so the script writes its keys there. The
+        # script derives the repository root from its own location, so copying
+        # it into <tmp>/scripts is enough to redirect every output path.
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        self.script = scripts / self.SCRIPT.name
+        shutil.copy2(self.SCRIPT, self.script)
+
+        self.secret = self.root / "secret.asc"
+        self.public = self.root / "apt" / "keys" / "appector-archive-keyring.asc"
+
+    def _generate(self, *arguments, stdin=None):
+        return subprocess.run(
+            ["sh", str(self.script), *arguments],
+            capture_output=True,
+            text=True,
+            input=stdin,
+            env={
+                **os.environ,
+                "APPECTOR_SECRET_KEY_FILE": str(self.secret),
+                "APPECTOR_KEY_NAME": "Appector Test <test@appector.invalid>",
+            },
+        )
+
+    def _assert_usable_key(self, passphrase=""):
+        """The exported key must be complete and able to sign.
+
+        Checking only that the file exists is not enough: the secret export
+        once produced an empty file, which would be stored as the release
+        signing secret and break every later release.
+        """
+        secret = self.secret.read_text()
+        self.assertIn("BEGIN PGP PRIVATE KEY BLOCK", secret)
+        self.assertIn("END PGP PRIVATE KEY BLOCK", secret)
+        self.assertIn("BEGIN PGP PUBLIC KEY BLOCK", self.public.read_text())
+
+        keyring = self.root / "signing-gpg"
+        keyring.mkdir(mode=0o700)
+        env = dict(os.environ, GNUPGHOME=str(keyring))
+
+        imported = subprocess.run(
+            ["gpg", "--batch", "--quiet", "--import", str(self.secret)],
+            env=env,
+            capture_output=True,
+        )
+        self.assertEqual(imported.returncode, 0, imported.stderr.decode())
+        listed = subprocess.run(
+            ["gpg", "--batch", "--list-secret-keys", "--with-colons"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn("sec:", listed.stdout, "no usable secret key was imported")
+
+        message = self.root / "data.txt"
+        message.write_text("appector\n")
+        signature = subprocess.run(
+            [
+                "gpg", "--batch", "--quiet", "--pinentry-mode", "loopback",
+                "--passphrase", passphrase, "--armor", "--detach-sign",
+                "--output", "-", str(message),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(signature.returncode, 0, signature.stderr)
+        self.assertIn("BEGIN PGP SIGNATURE", signature.stdout)
+
+    def test_generates_a_usable_key_without_a_passphrase(self):
+        result = self._generate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.secret.is_file())
+        self.assertTrue(self.public.is_file())
+        self._assert_usable_key(passphrase="")
+
+    def test_generates_a_usable_key_with_a_passphrase(self):
+        passphrase = "a passphrase with spaces"
+        result = self._generate("--passphrase", stdin=f"{passphrase}\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self._assert_usable_key(passphrase=passphrase)
+
+    def test_secret_key_is_never_written_inside_the_repository(self):
+        result = self._generate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        produced = sorted(
+            path.relative_to(self.root).as_posix()
+            for path in self.root.rglob("*")
+            if path.is_file()
+        )
+        self.assertNotIn(
+            "apt/keys/appector-archive-keyring.asc.secret",
+            produced,
+        )
+        # The only files produced are the intended ones.
+        self.assertEqual(
+            produced,
+            ["apt/keys/appector-archive-keyring.asc", "scripts/" + self.SCRIPT.name,
+             "secret.asc"],
+        )
+
+    def test_refuses_to_overwrite_an_existing_public_key(self):
+        self.public.parent.mkdir(parents=True, exist_ok=True)
+        self.public.write_text("existing key\n")
+        result = self._generate()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already exists", result.stderr)
+        self.assertEqual(self.public.read_text(), "existing key\n")
+
+    def test_rejects_an_unknown_argument(self):
+        result = self._generate("--not-a-flag")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown argument", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
