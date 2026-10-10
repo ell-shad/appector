@@ -67,44 +67,19 @@ jobs:
         run: |
           cd dist
           sha256sum ./*.deb > SHA256SUMS
-          python3 - "$GITHUB_REF_NAME" "$GITHUB_WORKSPACE/CHANGELOG.md" > release-notes.md <<'PY'
-          import re
-          import sys
-          from pathlib import Path
-
-          tag = sys.argv[1]
-          version = tag.removeprefix("v")
-          changelog = Path(sys.argv[2]).read_text(encoding="utf-8")
-          lines = changelog.splitlines()
-          heading = re.compile(
-              rf"^## \[{re.escape(version)}\](?:\s+-\s*(?P<suffix>.*))?$"
-          )
-          for index, line in enumerate(lines):
-              match = heading.match(line)
-              if not match:
-                  continue
-              notes = []
-              for item in lines[index + 1:]:
-                  if item.startswith("## "):
-                      break
-                  notes.append(item)
-              rendered = "\n".join(notes).strip()
-              if not rendered:
-                  raise SystemExit(f"No release notes found for {tag}.")
-              # The heading suffix decides whether GitHub marks the release as
-              # a pre-release. This matters: /releases/latest excludes
-              # pre-releases, so a pre-release is invisible to Appector's
-              # in-app update check.
-              suffix = (match.group("suffix") or "").strip().lower()
-              Path("prerelease").write_text(
-                  "1\n" if "prerelease" in suffix else "0\n",
-                  encoding="utf-8",
-              )
-              print(rendered)
-              break
-          else:
-              raise SystemExit(f"No changelog section found for {tag}.")
-          PY
+          python3 "$GITHUB_WORKSPACE/scripts/release-notes.py" \
+            "$GITHUB_REF_NAME" "$GITHUB_WORKSPACE/CHANGELOG.md" \
+            release-notes.md prerelease > /dev/null
+          # The changelog heading suffix, not the version number, decides
+          # whether GitHub marks this a pre-release. /releases/latest excludes
+          # pre-releases, so this decides whether Appector's in-app update
+          # check can see the release at all. scripts/release-notes.py is
+          # shared with the APT repository workflow so both agree.
+          if [ "$(cat prerelease)" = "1" ]; then
+            echo "Changelog marks $GITHUB_REF_NAME as a pre-release."
+          else
+            echo "Changelog marks $GITHUB_REF_NAME as a full release."
+          fi
 
       - name: Upload release assets for approval
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

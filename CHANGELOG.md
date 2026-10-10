@@ -10,7 +10,29 @@ published as a GitHub pre-release, which GitHub excludes from
 `/releases/latest`; Appector's in-app update check reads that endpoint and
 therefore cannot see pre-releases.
 
-## [Unreleased]
+## [0.2.1] - 2026-10-10
+
+### Added
+
+- Appector is now published to a signed APT repository, so `apt upgrade` and
+  Ubuntu Software Center can offer Appector updates. Adding the repository is
+  a one-time setup; see "Installing from the APT repository" in the README.
+  The repository is signed with a dedicated OpenPGP archive key whose public
+  half is committed to the repository and can be reviewed in a pull request.
+  Releases are published from GitHub Pages by a workflow that refuses to
+  publish an unsigned repository, refuses to publish a pre-release into the
+  stable channel, and verifies the signature against the committed public key
+  before deploying.
+- `scripts/generate-apt-signing-key.sh` creates the archive keypair. It runs
+  in a throwaway keyring, so it cannot disturb existing personal keys, and
+  it never writes the private key into the working tree.
+- `scripts/build-apt-repo.sh` builds the repository layout, the `Packages`
+  index, the `Release` metadata, and both the clearsigned `InRelease` and the
+  detached `Release.gpg` signature.
+- `scripts/release-notes.py` renders release notes and decides pre-release
+  status from the changelog heading. The GitHub Release and APT repository
+  workflows share it so they cannot disagree about whether a tag is a
+  pre-release, which is what keeps a pre-release out of the stable channel.
 
 ### Fixed
 
@@ -24,9 +46,6 @@ therefore cannot see pre-releases.
 - The Appector update dialog now names the exact package file and shows the
   `sudo apt install ./appector_<version>_all.deb` command, so upgrading no
   longer depends on the user knowing the procedure.
-- Documented that Ubuntu Software Center cannot upgrade a release `.deb`,
-  because release packages are not published through an APT repository, and
-  documented `sudo apt install ./<file>.deb` as the upgrade path.
 
 ### Changed
 

@@ -18,8 +18,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
-            desktop-file-utils gir1.2-adw-1 gir1.2-gdkpixbuf-2.0 \
-            gir1.2-gtk-4.0 lintian python3-gi shellcheck
+            desktop-file-utils dpkg-dev gir1.2-adw-1 gir1.2-gdkpixbuf-2.0 \
+            gir1.2-gtk-4.0 gnupg lintian python3-gi shellcheck
 
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -v
@@ -32,6 +32,13 @@ jobs:
           sh -n scripts/build-deb.sh
           shellcheck scripts/build-deb.sh
 
+      - name: Check APT repository shell scripts
+        run: |
+          sh -n scripts/build-apt-repo.sh
+          shellcheck scripts/build-apt-repo.sh
+          sh -n scripts/generate-apt-signing-key.sh
+          shellcheck scripts/generate-apt-signing-key.sh
+
       - name: Build and inspect Debian package
         run: |
           ./scripts/build-deb.sh
@@ -40,3 +47,14 @@ jobs:
           dpkg-deb --info "$package"
           lintian --pedantic "$package"
           desktop-file-validate build/appector_*/usr/share/applications/com.appector.appector.desktop
+
+      - name: Build the APT repository
+        run: |
+          ./scripts/build-apt-repo.sh
+          test -f apt-repo/dists/stable/Release
+          test -f apt-repo/dists/stable/main/binary-all/Packages
+          test -f apt-repo/dists/stable/main/binary-all/Packages.gz
+          test -f "$(find apt-repo/pool -name '*.deb' -print -quit)"
+          # No signing key exists in CI. The release workflow is what must
+          # produce signatures; publishing unsigned metadata would be
+          # rejected by apt, so it is guarded there instead.
