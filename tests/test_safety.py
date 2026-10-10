@@ -7,7 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from appector import actions
+from appector import __version__
+from appector import _proc, actions
 from appector import main as main_module
 
 
@@ -34,7 +35,10 @@ class RemovalSafetyTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as exit_info:
                 main_module.main(["--version"])
         self.assertEqual(exit_info.exception.code, 0)
-        self.assertEqual(stdout.getvalue(), "appector 0.1.0\n")
+        self.assertEqual(
+                stdout.getvalue(),
+                f"appector {__version__}\n",
+            )
         application.assert_not_called()
 
     def test_appector_and_legacy_package_cannot_be_removed(self):
@@ -73,7 +77,7 @@ class RemovalSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             with patch.object(Path, "home", return_value=home):
-                actions._log_action("TEST event")
+                _proc._log_action("TEST event")
 
             log_dir = home / ".local/state/app-manager"
             log_file = log_dir / "actions.log"
@@ -133,9 +137,9 @@ class RemovalSafetyTests(unittest.TestCase):
 
             with (
                 patch.object(Path, "home", return_value=home),
-                self.assertLogs("appector.actions", level="WARNING"),
+                self.assertLogs("appector._proc", level="WARNING"),
             ):
-                actions._log_action("TEST event")
+                _proc._log_action("TEST event")
 
             self.assertFalse((outside / "actions.log").exists())
 

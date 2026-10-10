@@ -31,6 +31,25 @@ Flatpak, AppImage, and detected manual installs; install local `.deb`,
 - Check for application updates in one place. (Except manually installed apps)
 - Export existing app list as CSV or JSON.
 - (EXPERIMENTAL)Remove APT, Flatpak residuals.
+- Filter the app list by scope: all items, applications only, or system items only.
+
+## Architecture
+
+Behavior-changing decisions are recorded in `docs/decisions/`:
+
+- [ADR-0001: Gate every APT residual purge behind a full pre-flight](docs/decisions/0001-gate-apt-residual-purge.md)
+- [ADR-0002: Split safety policy, process execution, and the residual subsystem](docs/decisions/0002-split-safety-policy-and-residual.md)
+
+Module layout:
+
+| Module | Responsibility |
+|---|---|
+| `appector/policy.py` | Removal safety decisions. No I/O. |
+| `appector/_proc.py` | Command execution, apt lock, activity log. |
+| `appector/residual.py` | APT residual-configuration purge end to end. |
+| `appector/actions.py` | Install/update/remove across apt, snap, Flatpak, AppImage. |
+| `appector/scanners.py` | Discovery of installed apps. |
+| `appector/window.py` | GTK/libadwaita user interface. |
 
 ## Limitations
 - Appector only supports Debian based distributions at the moment.
@@ -40,19 +59,29 @@ Flatpak, AppImage, and detected manual installs; install local `.deb`,
 
 The source repository is public:
 [`ell-shad/appector`](https://github.com/ell-shad/appector). Binary `.deb`
-packages will be attached to that same repository's GitHub Releases; there is
-not yet a published application release. The matching source is available from
-the same public repository and release tag (including GitHub's source archive).
-The `.deb` also contains Appector's Python source files.
+packages are attached to that same repository's GitHub Releases, and the
+matching source is available from the same public repository and release tag
+(including GitHub's source archive). The `.deb` also contains Appector's
+Python source files.
 
-After a release is available, download `appector_<version>_all.deb` and
-`SHA256SUMS` from the GitHub Releases page. Verify the checksum in the same
-directory, then install:
+Download `appector_<version>_all.deb` and `SHA256SUMS` from the GitHub
+Releases page. Verify the checksum in the same directory, then install:
 
 ```bash
 sha256sum --check SHA256SUMS
 sudo apt install ./appector_<version>_all.deb
 ```
+
+### Upgrading from an earlier version
+
+Appector checks for updates on demand from **Check for Appector updates…** in
+the main menu. It contacts only GitHub's Releases API and opens the release
+page; it never downloads or installs anything by itself. Install the `.deb`
+manually as shown above.
+
+Note that GitHub does not return pre-releases from the "latest release"
+endpoint, so a version published as a pre-release will not be offered by the
+in-app check even though it appears on the Releases page.
 
 Launch **Appector** from the applications menu or run `appector`. The package
 declares GTK 4, libadwaita, PyGObject, and GdkPixbuf introspection packages as
@@ -118,33 +147,52 @@ conffiles under:
 ~/.local/state/app-manager/purge-backups/
 ```
 
-The backup includes a `manifest.json` and copies under `files/`. There is no
-in-app restore action yet. To restore a file, inspect its manifest record,
-confirm the target is safe, and restore the saved copy to the recorded absolute
-path with appropriate ownership and mode; system paths require administrator
-privileges. Do not blindly copy an entire backup tree over the filesystem.
-If the backup is incomplete, Appector refuses to start the purge.
+The backup includes a `manifest.json` and copies under `files/`. Appector
+keeps only the 10 most recent purge backups and prunes older ones; use
+**Cleanup & residuals… → Browse…** to inspect the saved manifests and file
+records. There is no in-app restore action. To restore a file, inspect its
+manifest record, confirm the target is safe, and restore the saved copy to the
+recorded absolute path with appropriate ownership and mode; system paths
+require administrator privileges. Do not blindly copy an entire backup tree
+over the filesystem. If the backup is incomplete, Appector refuses to start
+the purge.
+
+Residual purging is gated before anything is removed: package names are
+validated, dpkg residual (`rc`) state is verified, `apt-get --simulate purge`
+must confirm the exact selection, and the backup must complete. The `rc` state
+is re-checked after the backup so a package that was reinstalled in the
+meantime is not purged as if it were only residual configuration. Appector
+blocks a purge whose simulation touches packages beyond the selection, and
+only covers dpkg-registered conffiles: maintainer `postrm` scripts can delete
+additional files, which is why the simulation is the authoritative preview.
 
 App data and activity state are stored per user:
 
 - `~/.local/share/app-manager/appimages/` — managed AppImage copies.
 - `~/.local/share/applications/` — Appector-created AppImage launchers.
 - `~/.local/state/app-manager/actions.log` — activity log.
+- `~/.local/state/app-manager/marked.json` — staged removal marks.
+- `~/.local/state/app-manager/ui.json` — window and view preferences.
 - `~/.local/state/app-manager/purge-backups/` — pre-purge conffile backups.
 
-The activity log and newly generated CSV/JSON exports are written with
-user-only permissions. The activity log can contain package names, operation
-results, and local paths; exports can reveal software installed on the machine.
-Review both before sharing.
+The activity log, staged removal marks, purge backups, and newly generated
+CSV/JSON exports are written with user-only permissions. The activity log can
+contain package names, operation results, and local paths; exports can reveal
+software installed on the machine. Review both before sharing.
+
+Staged removal marks are a to-do list, not a scheduled operation: they are
+restored between sessions so an unfinished selection survives a restart, but
+removal never happens without a fresh preview and confirmation.
 
 ## Appector updates and network use
 
 **Check for Appector updates…** is a manual menu action. It requests the latest
 stable release metadata from
 `https://api.github.com/repos/ell-shad/appector/releases/latest`.
-GitHub's `latest` endpoint excludes drafts and pre-releases. Beta-channel
-updates are not currently offered. When a newer release is found, Appector
-opens that release page; it never downloads or installs the update itself.
+GitHub's `latest` endpoint excludes drafts and pre-releases, so versions
+published as pre-releases are not offered here. When a newer release is found,
+Appector opens that release page; it never downloads or installs the update
+itself.
 Install a downloaded package with `apt install ./file.deb` after reviewing the
 release and package.
 
@@ -160,7 +208,14 @@ the version in `appector/__init__.py` builds the package, creates
 `SHA256SUMS`, and publishes the assets as a release in this repository using
 GitHub Actions' automatically provided token. The `public-release` Actions
 environment is a publication approval gate; configure a required reviewer
-before publishing. The first `0.x` release is marked as a pre-release.
+before publishing.
+
+Whether a version is published as a pre-release is decided by its changelog
+heading, not by the version number: a heading suffixed with `Prerelease` is
+published as a GitHub pre-release, and any other heading is published as a
+full release. Only full releases appear on `/releases/latest`, so a version
+meant to be offered by the in-app update check must not be marked
+`Prerelease`.
 
 Release checksums are not signed. The release workflow is configured to
 generate GitHub build-provenance attestations for the `.deb`; an attestation

@@ -15,235 +15,32 @@ from pathlib import Path
 from uuid import uuid4
 from urllib.parse import urlsplit
 
-# ------------------------------------------------------------
-# ANSI escape code stripper
-# ------------------------------------------------------------
-ANSI_ESCAPE_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-APT_COMMAND_LOCK = threading.Lock()
-APT_COMMAND_NAMES = {"apt", "apt-get", "dpkg"}
-
-
-def _command_uses_apt(cmd) -> bool:
-    for argument in map(str, cmd):
-        if Path(argument).name in APT_COMMAND_NAMES:
-            return True
-        if re.search(r"(?<![\w.-])(?:apt-get|dpkg)(?=\s)", argument):
-            return True
-    return False
-
-
-def _format_apt_lock_error(output: str) -> str:
-    lowered = output.lower()
-    lock_messages = (
-        "could not get lock",
-        "unable to acquire",
-        "is locked by another process",
-        "dpkg frontend lock",
-        "dpkg is locked",
-    )
-    if any(message in lowered for message in lock_messages):
-        return (
-            "Another package-management operation is using APT/dpkg. "
-            "Wait for it to finish, then try again.\n\n"
-            f"{output}"
-        )
-    return output
-
-def _strip_ansi(text: str) -> str:
-    """Removes terminal color and cursor control codes from text."""
-    if not text:
-        return ""
-    return ANSI_ESCAPE_RE.sub('', text)
-
-BATCH_REMOVABLE_MANAGERS = {
-    "Snap",
-    "Flatpak",
-    "AppImage",
-    "Manual",
-    "APT",
-}
-
-SINGLE_REMOVABLE_MANAGERS = {
-    "Snap",
-    "Flatpak",
-    "AppImage",
-    "Manual",
-    "APT",
-}
-
-BLOCKED_PACKAGE_IDS = {
-    "appector",
-    "app-manager",
-    "snapd",
-    "core",
-    "core18",
-    "core20",
-    "core22",
-    "core24",
-    "bare",
-    "gtk-common-themes",
-    "snapd-desktop-integration",
-    "ubuntu-desktop",
-    "ubuntu-desktop-minimal",
-    "kubuntu-desktop",
-    "xubuntu-desktop",
-    "lubuntu-desktop",
-    "ubuntu-budgie-desktop",
-    "ubuntu-mate-desktop",
-    "ubuntu-studio-desktop",
-    "gnome-shell",
-    "gnome-session",
-    "gnome-session-bin",
-    "gdm3",
-    "lightdm",
-    "sddm",
-    "systemd",
-    "init",
-    "init-system-helpers",
-    "apt",
-    "dpkg",
-    "bash",
-    "dash",
-    "coreutils",
-    "procps",
-    "util-linux",
-    "e2fsprogs",
-    "kmod",
-    "module-init-tools",
-    "linux-base",
-    "plymouth",
-    "policykit-1",
-    "polkitd",
-    "sudo",
-    "ca-certificates",
-    "ubuntu-keyring",
-    "network-manager",
-    "xorg",
-    "xserver-xorg-core",
-}
-
-BLOCKED_PACKAGE_IDS_LOWER = {
-    package.lower()
-    for package in BLOCKED_PACKAGE_IDS
-}
-
-FLATPAK_BLOCKED_PREFIXES = (
-    "org.freedesktop.platform",
-    "org.gnome.platform",
-    "org.kde.platform",
-    "org.electronjs.electron",
-    "org.qtproject.qt",
-    "com.github.libui",
+from ._proc import (
+    _log_action,
+    _run_command,
+    _run_command_raw,
+    _run_command_stream,
 )
-
-APT_CRITICAL_PACKAGES = {
-    "appector",
-    "app-manager",
-    "apt",
-    "bash",
-    "ca-certificates",
-    "coreutils",
-    "dash",
-    "dpkg",
-    "e2fsprogs",
-    "gdm3",
-    "gnome-shell",
-    "gnome-session",
-    "gnome-session-bin",
-    "grub-common",
-    "grub-pc",
-    "grub-efi-amd64",
-    "grub-efi-amd64-signed",
-    "init",
-    "init-system-helpers",
-    "kmod",
-    "lightdm",
-    "linux-base",
-    "linux-firmware",
-    "linux-image-generic",
-    "linux-generic",
-    "linux-generic-hwe-22.04",
-    "linux-generic-hwe-24.04",
-    "module-init-tools",
-    "network-manager",
-    "plymouth",
-    "policykit-1",
-    "polkitd",
-    "procps",
-    "sddm",
-    "snapd",
-    "sudo",
-    "systemd",
-    "systemd-sysv",
-    "ubuntu-desktop",
-    "ubuntu-desktop-minimal",
-    "ubuntu-keyring",
-    "ubuntu-drivers-common",
-    "util-linux",
-    "xorg",
-    "xserver-xorg-core",
-    "xserver-xorg",
-    "mutter",
-    "kwin-wayland",
-    "kwin-x11",
-}
-
-APT_CRITICAL_PACKAGES_LOWER = {
-    package.lower()
-    for package in APT_CRITICAL_PACKAGES
-}
-
-APT_CRITICAL_PREFIXES = (
-    "grub",
-    "gnome-shell",
-    "gnome-session",
-    "linux-generic",
-    "linux-headers",
-    "linux-image",
-    "linux-lowlatency",
-    "linux-modules",
-    "linux-firmware",
-    "libsystemd",
-    "systemd",
-    "ubuntu-desktop",
-    "xorg",
-    "xserver",
-    "init",
-    "initramfs",
+from .policy import (
+    APT_MAX_REMOVALS,
+    BATCH_REMOVABLE_MANAGERS,
+    SINGLE_REMOVABLE_MANAGERS,
+    _base_package_name,
+    _deduplicate_package_ids,
+    _is_safe_package_id,
+    _normalize_package_id,
+    _split_safe_package_ids,
+    can_remove,
+    can_remove_single,
+    get_removal_risk,
+    is_blocked,
+    is_critical_apt_package_name,
 )
-
-APT_CRITICAL_PREFIXES_LOWER = tuple(
-    prefix.lower()
-    for prefix in APT_CRITICAL_PREFIXES
+from .residual import (
+    CONFFILE_LINE_RE,
+    _backup_residual_conffiles,
+    _purge_backup_note,
 )
-
-APT_HIGH_RISK_SUBSTRINGS = (
-    "desktop",
-    "session",
-    "shell",
-    "display-manager",
-    "login",
-    "gdm",
-    "lightdm",
-    "sddm",
-    "xorg",
-    "wayland",
-    "gnome",
-    "kde",
-    "xfce",
-    "cinnamon",
-    "mate",
-    "budgie",
-    "kernel",
-    "firmware",
-    "bootloader",
-    "grub",
-)
-
-APT_MAX_REMOVALS = 100
-
-SAFE_PACKAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:-]*$")
-
 
 def app_key(app) -> str:
     manager = str(getattr(app, "manager", "") or "").strip()
@@ -251,233 +48,6 @@ def app_key(app) -> str:
 
     return f"{manager}::{package_id}"
 
-
-def _log_action(message: str):
-    log_dir = Path.home() / ".local" / "state" / "app-manager"
-    log_file = log_dir / "actions.log"
-    descriptor = None
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        home_dir = Path.home().resolve()
-        if log_dir.is_symlink() or not log_dir.resolve().is_relative_to(home_dir):
-            raise OSError("Action log directory is not a private directory in the home folder.")
-        os.chmod(log_dir, 0o700)
-        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(log_file, flags, 0o600)
-        file_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise OSError("Action log path is not a regular file.")
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "a", encoding="utf-8") as f:
-            descriptor = None
-            f.write(f"{datetime.now().isoformat()} {message}\n")
-    except OSError:
-        logging.getLogger(__name__).warning("Appector could not write its private action log.")
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-
-
-def _normalize_package_id(name: str) -> str:
-    return str(name or "").strip().split(":")[0].lower()
-
-
-def _base_package_name(name: str) -> str:
-    return str(name or "").split(":", 1)[0]
-
-
-def _is_safe_package_id(name: str) -> bool:
-    name = str(name or "").strip()
-
-    if not name:
-        return False
-
-    return bool(SAFE_PACKAGE_ID_RE.match(name))
-
-
-def is_critical_apt_package_name(name: str) -> bool:
-    base = _base_package_name(name).lower()
-
-    if base in APT_CRITICAL_PACKAGES_LOWER:
-        return True
-
-    for prefix in APT_CRITICAL_PREFIXES_LOWER:
-        if base.startswith(prefix):
-            return True
-
-    return False
-
-def install_flatpak(app_id: str, user_install: bool = True):
-    """
-    Installs a Flatpak app by searching configured remotes.
-    """
-    app_id = app_id.strip()
-
-    if not app_id:
-        return False, "Flatpak app ID is empty."
-
-    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", app_id):
-        return False, "Invalid Flatpak app ID.\n\nExample: org.gimp.GIMP"
-
-    flatpak_command = shutil.which("flatpak")
-
-    if not flatpak_command:
-        return False, "flatpak command not found."
-
-    scope = "--user" if user_install else "--system"
-
-    # IMPORTANT: We intentionally omit the remote name (like "flathub").
-    # If the remote isn't configured for the specific scope, Flatpak treats 
-    # the remote name as an app ID and fails. By omitting it, Flatpak 
-    # automatically searches all configured remotes for the app_id.
-    cmd = [
-        flatpak_command,
-        "install",
-        "-y",
-        scope,
-        app_id,
-    ]
-
-    # System installations require privilege escalation
-    if not user_install:
-        pkexec_command = shutil.which("pkexec")
-        if pkexec_command:
-            cmd = [
-                pkexec_command,
-                flatpak_command,
-                "install",
-                "-y",
-                scope,
-                app_id,
-            ]
-
-    _log_action(f"FLATPAK_INSTALL_START cmd={shlex.join(cmd)}")
-
-    success, message = _run_command(cmd)
-
-    if success:
-        _log_action(f"FLATPAK_INSTALL_SUCCESS app_id={app_id}")
-    else:
-        # Provide a helpful hint if it fails due to missing remote/app
-        if "No refs found" in message or "No remote refs" in message:
-            scope_name = "user" if user_install else "system"
-            message += (
-                f"\n\nHint: The app was not found in your configured Flatpak remotes "
-                f"for the {scope_name} scope.\n\n"
-                "If you haven't added the Flathub repository yet, you can add it via terminal:\n"
-                "flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo"
-            )
-        _log_action(f"FLATPAK_INSTALL_FAILED app_id={app_id} error={message}")
-
-    return success, message
-
-def is_blocked(app) -> bool:
-    manager = str(getattr(app, "manager", "") or "").strip()
-    package_id = str(getattr(app, "package_id", "") or "").strip()
-
-    if not package_id:
-        return True
-
-    normalized = _normalize_package_id(package_id)
-
-    if normalized in BLOCKED_PACKAGE_IDS_LOWER:
-        return True
-
-    if manager == "Snap":
-        if normalized.startswith("core"):
-            return True
-
-    if manager == "Flatpak":
-        for prefix in FLATPAK_BLOCKED_PREFIXES:
-            if normalized.startswith(prefix.lower()):
-                return True
-
-    if manager == "APT":
-        if is_critical_apt_package_name(package_id):
-            return True
-
-    return False
-
-
-def can_remove(app) -> bool:
-    """
-    Used for batch removal.
-    """
-    manager = str(getattr(app, "manager", "") or "").strip()
-
-    return manager in BATCH_REMOVABLE_MANAGERS and not is_blocked(app)
-
-
-def can_remove_single(app) -> bool:
-    """
-    Used for single-app removal from the details window.
-    """
-    manager = str(getattr(app, "manager", "") or "").strip()
-
-    return manager in SINGLE_REMOVABLE_MANAGERS and not is_blocked(app)
-
-def get_removal_risk(app):
-    """
-    Returns:
-
-        risk_level, reason
-
-    risk_level:
-        "low"
-        "normal"
-        "medium"
-        "high"
-        "blocked"
-    """
-
-    if is_blocked(app):
-        return "blocked", "Blocked by safety policy."
-
-    manager = str(getattr(app, "manager", "") or "").strip()
-    package_id = str(getattr(app, "package_id", "") or "").strip()
-    normalized = _normalize_package_id(package_id)
-
-    if manager == "Leftover":
-        return "low", "Leftover configuration cleanup."
-
-    if manager == "AppImage":
-        if getattr(app, "removal_paths", None):
-            return "low", "Removes the launcher and managed AppImage copy; app data is kept."
-        return "low", "Removes a standalone AppImage file."
-
-    if manager == "Manual":
-        return "normal", "Removes the detected launcher and executable files only; app data is kept."
-
-    if manager == "Flatpak":
-        return "low", "Removes a Flatpak application."
-
-    if manager == "Snap":
-        if normalized.startswith("core"):
-            return "blocked", "Snap runtime/base snaps are blocked."
-        return "normal", ""
-
-    if manager == "APT":
-        if is_critical_apt_package_name(package_id):
-            return "blocked", "Critical APT package."
-
-        for substring in APT_HIGH_RISK_SUBSTRINGS:
-            if substring in normalized:
-                return (
-                    "high",
-                    "This package may affect your desktop session or core system.",
-                )
-
-        if normalized.startswith("lib"):
-            return (
-                "medium",
-                "Shared library removal may affect other applications.",
-            )
-
-        return "normal", ""
-
-    return "normal", ""
 
 def get_removal_preview(app) -> str:
     manager = getattr(app, "manager", "")
@@ -576,26 +146,27 @@ def get_removal_size_estimate(
         if manager == "APT":
             apt_ids.append(package_id)
         elif manager == "Leftover":
+            if not _is_safe_package_id(package_id):
+                continue
             try:
                 result = subprocess.run(
                     [
                         "dpkg-query",
                         "-W",
                         "-f=${Conffiles}\n",
+                        "--",
                         package_id,
                     ],
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
                     timeout=20,
+                    env={**os.environ, "LC_ALL": "C"},
                 )
                 if result.returncode == 0:
                     residual_conf_files.extend(
                         match.group(1)
-                        for match in re.finditer(
-                            r"(?m)^\s*(/\S+)\s+[0-9a-f]{32}\s*$",
-                            result.stdout,
-                        )
+                        for match in CONFFILE_LINE_RE.finditer(result.stdout)
                     )
             except (OSError, subprocess.TimeoutExpired):
                 pass
@@ -635,12 +206,13 @@ def get_removal_size_estimate(
                 total_bytes += size
                 measured = True
 
-    apt_ids = list(dict.fromkeys(package_id for package_id in apt_ids if package_id))
+    apt_ids = list(dict.fromkeys(package_id for package_id in apt_ids if _is_safe_package_id(package_id)))
     if apt_ids:
         command = [
             "dpkg-query",
             "-W",
             "-f=${binary:Package}\t${Installed-Size}\n",
+            "--",
             *apt_ids,
         ]
         try:
@@ -650,6 +222,7 @@ def get_removal_size_estimate(
                 capture_output=True,
                 text=True,
                 timeout=30,
+                env={**os.environ, "LC_ALL": "C"},
             )
             if result.returncode == 0 or result.stdout:
                 for line in result.stdout.splitlines():
@@ -711,157 +284,6 @@ def get_removal_size_estimate(
 # Basic command execution helpers
 # ------------------------------------------------------------
 
-def _run_command_raw(cmd, timeout=900, env_overrides=None):
-    uses_apt = _command_uses_apt(cmd)
-    if uses_apt and not APT_COMMAND_LOCK.acquire(blocking=False):
-        return 1, (
-            "Another APT/dpkg operation is already running in Appector. "
-            "Wait for it to finish, then try again."
-        )
-
-    env = os.environ.copy()
-    env["DEBIAN_FRONTEND"] = "noninteractive"
-    env["PAGER"] = "cat"
-    if env_overrides:
-        env.update(env_overrides)
-
-    try:
-        result = subprocess.run(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-
-        stdout = _strip_ansi(result.stdout).strip()
-        stderr = _strip_ansi(result.stderr).strip()
-
-        if stdout and stderr:
-            output = f"{stdout}\n{stderr}"
-        else:
-            output = stdout if stdout else stderr
-
-        if result.returncode:
-            output = _format_apt_lock_error(output)
-        return result.returncode, output
-    except subprocess.TimeoutExpired:
-        return 124, "Command timed out."
-    except Exception as e:
-        return 1, str(e)
-    finally:
-        if uses_apt:
-            APT_COMMAND_LOCK.release()
-
-def _run_command(cmd):
-    returncode, output = _run_command_raw(cmd)
-
-    if returncode == 0:
-        return True, output if output else "Command completed successfully."
-
-    return False, output if output else "Command failed."
-
-def _run_command_stream(cmd, output_callback=None, timeout=900):
-    """
-    Runs a command and streams output line-by-line.
-    Prevents hanging by closing stdin and forces non-interactive mode for APT/dpkg.
-    """
-    env = os.environ.copy()
-    env["DEBIAN_FRONTEND"] = "noninteractive"
-    env["PAGER"] = "cat"
-    uses_apt = _command_uses_apt(cmd)
-    if uses_apt and not APT_COMMAND_LOCK.acquire(blocking=False):
-        return False, (
-            "Another APT/dpkg operation is already running in Appector. "
-            "Wait for it to finish, then try again."
-        )
-
-    process = None
-    timer = None
-    timed_out = threading.Event()
-
-    try:
-        command = list(cmd)
-        if (
-            timeout
-            and command
-            and Path(command[0]).name == "pkexec"
-        ):
-            timeout_command = shutil.which("timeout")
-            if timeout_command:
-                command = [
-                    command[0],
-                    timeout_command,
-                    "--signal=TERM",
-                    "--kill-after=10s",
-                    str(timeout),
-                    *command[1:],
-                ]
-
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,  # Prevents scripts from hanging waiting for input
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            env=env,
-        )
-
-        if timeout:
-            def terminate_process():
-                if process.poll() is None:
-                    timed_out.set()
-                    try:
-                        process.kill()
-                    except (PermissionError, ProcessLookupError, OSError):
-                        pass
-
-            timer = threading.Timer(timeout, terminate_process)
-            timer.start()
-
-        lines = []
-
-        if process.stdout:
-            for line in process.stdout:
-                # Strip weird terminal escape codes
-                clean_line = _strip_ansi(line).rstrip()
-                
-                if output_callback:
-                    try:
-                        output_callback(clean_line)
-                    except Exception:
-                        pass
-
-                lines.append(clean_line)
-
-        process.wait()
-
-        returncode = process.returncode
-        output = "\n".join(lines).strip()
-
-        if timed_out.is_set() or returncode == 124:
-            return False, output if output else "Command timed out."
-
-        if returncode == 0:
-            return True, output if output else "Command completed successfully."
-
-        output = output or f"Command failed with exit code {returncode}."
-        return False, _format_apt_lock_error(output)
-
-    except Exception as e:
-        return False, str(e)
-    finally:
-        if timer:
-            timer.cancel()
-            if timer.is_alive():
-                timer.join(timeout=1)
-        if uses_apt:
-            APT_COMMAND_LOCK.release()
-        
 def _maybe_delete_source_file(path, delete_source, message):
     if not delete_source:
         return message
@@ -1250,7 +672,7 @@ def execute_available_updates(updates, output_callback=None):
             if not command:
                 failures.append("APT: apt-get is not available.")
                 continue
-            cmd = [command, "install", "--only-upgrade", "-y", *package_ids]
+            cmd = [command, "install", "--only-upgrade", "-y", "--", *package_ids]
         elif manager == "Flatpak":
             command = shutil.which("flatpak")
             if not command:
@@ -1268,7 +690,7 @@ def execute_available_updates(updates, output_callback=None):
             if not command:
                 failures.append("Snap: snap is not available.")
                 continue
-            cmd = [command, "refresh", *package_ids]
+            cmd = [command, "refresh", "--", *package_ids]
 
         if (manager == "APT" or manager == "Snap" or scope == "system") and os.geteuid() != 0:
             pkexec_command = shutil.which("pkexec")
@@ -1612,6 +1034,7 @@ def install_deb_batch(
             apt_get_command,
             "--simulate",
             "install",
+            "--",
             *(str(path) for path in deb_paths),
         ],
         timeout=120,
@@ -1628,6 +1051,37 @@ def install_deb_batch(
             "installed; select the files again to review the updated plan."
         )
 
+    # Re-hash after the second simulation: the staged files could have been
+    # swapped between the first hash check and the simulation above. Checking
+    # again here closes the window before the privileged install runs.
+    for path, expected_hash in zip(staged_paths, review.hashes):
+        digest = hashlib.sha256()
+        package_fd = None
+        try:
+            package_fd = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            with os.fdopen(package_fd, "rb") as package_file:
+                package_fd = None
+                if not stat.S_ISREG(os.fstat(package_file.fileno()).st_mode):
+                    return False, (
+                        "Reviewed package is no longer a regular file: "
+                        f"{path.name}."
+                    )
+                for chunk in iter(lambda: package_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError as error:
+            return False, f"Could not verify reviewed package {path.name}: {error}"
+        finally:
+            if package_fd is not None:
+                os.close(package_fd)
+        if digest.hexdigest() != expected_hash:
+            return False, (
+                f"Reviewed package changed before installation: {path.name}. "
+                "Review the package again."
+            )
+
     pkexec_command = shutil.which("pkexec")
     if os.geteuid() != 0 and not pkexec_command:
         return False, (
@@ -1639,6 +1093,7 @@ def install_deb_batch(
         apt_get_command,
         "install",
         "-y",
+        "--",
     ] + [str(p) for p in deb_paths]
 
     if pkexec_command:
@@ -1776,16 +1231,18 @@ def execute_removal(app):
                 Path.home() / ".local/share/app-manager/appimages",
                 Path.home() / ".local/share/applications",
             ]
+            resolved_roots = _resolve_allowed_roots(allowed_roots)
             validated_paths = []
             for raw_path in removal_paths:
-                path = Path(os.path.abspath(Path(raw_path).expanduser()))
-                if (
-                    not path.is_file()
-                    or not any(path.is_relative_to(root) for root in allowed_roots)
-                ):
+                try:
+                    lexical_str = _validate_removal_file(
+                        raw_path, allowed_roots, resolved_roots
+                    )
+                except OSError:
                     message = f"Refusing to remove an invalid AppImage installation file: {raw_path}"
                     _log_action(f"REMOVE_BLOCKED {key} manager=AppImage reason=invalid-managed-path")
                     return False, message
+                path = Path(lexical_str)
                 if path.parent == allowed_roots[1] and (
                     not path.name.startswith("app-manager-appimage-")
                     or path.suffix != ".desktop"
@@ -1877,18 +1334,24 @@ def execute_removal(app):
             Path("/usr/local/bin"),
             Path("/opt"),
         ]
+        resolved_roots = _resolve_allowed_roots(allowed_roots)
         validated_paths = []
         for value in paths:
-            path = Path(os.path.abspath(Path(value).expanduser()))
-            if not path.is_absolute() or not path.is_file():
-                message = f"Manual app file no longer exists or is not a regular file: {value}"
-                _log_action(f"REMOVE_FAILED {key} manager=Manual reason=invalid-path path={value}")
+            try:
+                validated_paths.append(
+                    _validate_removal_file(value, allowed_roots, resolved_roots)
+                )
+            except OSError as error:
+                message = str(error)
+                reason = (
+                    "outside-allowed-path"
+                    if "outside known manual-install" in message
+                    else "invalid-path"
+                )
+                _log_action(f"REMOVE_FAILED {key} manager=Manual reason={reason} path={value}")
+                if reason == "outside-allowed-path":
+                    _log_action(f"REMOVE_BLOCKED {key} manager=Manual reason=outside-allowed-path")
                 return False, message
-            if not any(path.is_relative_to(root) for root in allowed_roots):
-                message = f"Refusing to remove a file outside known manual-install locations: {value}"
-                _log_action(f"REMOVE_BLOCKED {key} manager=Manual reason=outside-allowed-path")
-                return False, message
-            validated_paths.append(str(path))
 
         requires_privilege = any(
             not os.access(str(Path(path).parent), os.W_OK)
@@ -1944,6 +1407,92 @@ def _manual_removal_paths(app):
     ))
 
 
+def _resolve_allowed_roots(roots):
+    """Resolve allowed roots once so parent-symlink escapes are detected."""
+    resolved = []
+    for root in roots:
+        try:
+            resolved.append(Path(root).expanduser().resolve())
+        except OSError:
+            resolved.append(Path(os.path.abspath(Path(root).expanduser())))
+    return resolved
+
+
+def _validate_removal_file(value, allowed_roots, resolved_roots):
+    """Validate one manual/AppImage file before it is unlinked.
+
+    A path shape check proves well-formedness, not authorization, so this
+    requires all three properties of a destructive-path target:
+
+    1. **Allowlisted root** - the symlink-resolved path sits under one of the
+       allowed roots, and is at least one level below it (so the root itself
+       can never be the deletion target).
+    2. **Ownership evidence** - the target is owned by the current user. This
+       mirrors the kernel's sticky-directory rule and stops Appector from
+       deleting files it does not own.
+    3. **Regular file or symlink** - directories, FIFOs, sockets and devices are
+       refused outright.
+
+    Returns the lexical absolute path string. Symlinks are permitted because
+    unlinking removes only the link; their resolved target is never followed.
+    """
+    lexical = Path(os.path.abspath(Path(value).expanduser()))
+    if not lexical.is_absolute():
+        raise OSError(f"Manual app file is not an absolute path: {value}")
+    if not any(lexical.is_relative_to(root) for root in allowed_roots):
+        raise OSError(
+            f"Refusing to remove a file outside known manual-install locations: {value}"
+        )
+
+    try:
+        file_stat = lexical.lstat()
+    except FileNotFoundError:
+        raise OSError(
+            f"Manual app file no longer exists or is not a regular file: {value}"
+        )
+
+    is_symlink = stat.S_ISLNK(file_stat.st_mode)
+    if not is_symlink and not stat.S_ISREG(file_stat.st_mode):
+        raise OSError(
+            f"Refusing to remove a file that is not a regular file: {value}"
+        )
+
+    # Ownership evidence, read before the deletion decision. Root-owned files
+    # in user-writable directories (sticky dirs, world-writable roots) are
+    # never ours to remove.
+    current_uid = os.getuid() if hasattr(os, "getuid") else None
+    if current_uid is not None and file_stat.st_uid != current_uid:
+        raise OSError(
+            f"Refusing to remove a file that is not owned by the current user: "
+            f"{value}"
+        )
+
+    # Symlinks are deleted by unlinking the link itself; the link already
+    # passed the allowlisted-root check, and its target is never followed.
+    if is_symlink:
+        return str(lexical)
+
+    try:
+        resolved = lexical.resolve()
+    except (OSError, RuntimeError) as error:
+        raise OSError(f"Could not resolve manual app file {value}: {error}")
+
+    for root in resolved_roots:
+        if not resolved.is_relative_to(root):
+            continue
+        # At least one level below the root, so the root can never be the
+        # deletion target itself.
+        if len(resolved.relative_to(root).parts) < 1:
+            raise OSError(
+                f"Refusing to remove an allowed root itself: {value}"
+            )
+        return str(lexical)
+
+    raise OSError(
+        f"Refusing to remove a file outside known manual-install locations: {value}"
+    )
+
+
 # ------------------------------------------------------------
 # APT simulation helpers
 # ------------------------------------------------------------
@@ -1965,6 +1514,7 @@ def simulate_apt_remove_multiple(package_ids, purge=False):
         apt_get_command,
         "-s",
         apt_action,
+        "--",
     ] + list(package_ids)
 
     _log_action(f"APT_SIMULATION cmd={shlex.join(cmd)}")
@@ -2174,6 +1724,7 @@ def execute_apt_removal(app, purge=False):
             apt_get_command,
             apt_action,
             "-y",
+            "--",
             package_id,
         ]
     else:
@@ -2181,6 +1732,7 @@ def execute_apt_removal(app, purge=False):
             apt_get_command,
             apt_action,
             "-y",
+            "--",
             package_id,
         ]
 
@@ -3419,6 +2971,7 @@ def _build_privileged_script(
                 shlex.quote(apt_get_exe),
                 apt_action,
                 "-y",
+                "--",
                 quoted_packages,
             ]
         )
@@ -3548,347 +3101,6 @@ def _format_package_list(packages, limit=50):
     return "\n".join(lines)
 
 
-def _write_json_private(path, data):
-    encoded = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags, 0o600)
-    try:
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(encoded)
-            output.write(b"\n")
-    except Exception:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        raise
-
-
-def _backup_residual_conffiles(package_ids):
-    """Securely copy dpkg-authoritative conffiles before irreversible purge."""
-    state_dir = Path.home() / ".local" / "state" / "app-manager"
-    backup_root = state_dir / "purge-backups"
-    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    home_dir = Path.home().resolve()
-    if (
-        state_dir.is_symlink()
-        or not state_dir.resolve().is_relative_to(home_dir)
-    ):
-        raise OSError(f"Backup state directory is outside the home directory: {state_dir}")
-    backup_root.mkdir(mode=0o700, exist_ok=True)
-    if backup_root.is_symlink() or not backup_root.resolve().is_relative_to(home_dir):
-        raise OSError(f"Backup directory is outside the home directory: {backup_root}")
-    os.chmod(state_dir, 0o700)
-    os.chmod(backup_root, 0o700)
-
-    backup_dir = backup_root / (
-        datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + uuid4().hex
-    )
-    backup_dir.mkdir(mode=0o700)
-    files_dir = backup_dir / "files"
-    files_dir.mkdir(mode=0o700)
-    manifest = {
-        "created_at": datetime.now().astimezone().isoformat(),
-        "status": "incomplete",
-        "packages": list(package_ids),
-        "files": [],
-    }
-    manifest_path = backup_dir / "manifest.json"
-    _write_json_private(manifest_path, manifest)
-    records_by_path = {}
-
-    try:
-        for package_id in package_ids:
-            result = subprocess.run(
-                ["dpkg-query", "-W", "-f=${Conffiles}\\n", package_id],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if result.returncode != 0:
-                raise OSError(
-                    result.stderr.strip()
-                    or f"Could not list configuration files for {package_id}."
-                )
-
-            for line in result.stdout.splitlines():
-                match = re.match(r"^\s*(/\S+)\s+([0-9a-f]{32})(?:\s+.*)?$", line)
-                if not match:
-                    if line.lstrip().startswith("/"):
-                        raise OSError(
-                            f"Could not safely parse dpkg conffile entry for "
-                            f"{package_id}: {line}"
-                        )
-                    continue
-                source_value = match.group(1)
-                source_path = Path(source_value)
-                if (
-                    not source_path.is_absolute()
-                    or ".." in source_path.parts
-                    or os.path.normpath(source_value) != source_value
-                    or source_path == Path("/")
-                ):
-                    raise OSError(
-                        f"Refusing unsafe dpkg conffile path: {source_value}"
-                    )
-                if source_value in records_by_path:
-                    if package_id not in records_by_path[source_value]["packages"]:
-                        records_by_path[source_value]["packages"].append(package_id)
-                    continue
-
-                try:
-                    source_stat = source_path.lstat()
-                except FileNotFoundError:
-                    manifest["files"].append({
-                        "package": package_id,
-                        "packages": [package_id],
-                        "path": source_value,
-                        "status": "missing",
-                    })
-                    records_by_path[source_value] = manifest["files"][-1]
-                    continue
-
-                destination = files_dir / source_value.lstrip("/")
-                destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                record = {
-                    "package": package_id,
-                    "packages": [package_id],
-                    "path": source_value,
-                    "mode": stat.S_IMODE(source_stat.st_mode),
-                    "uid": source_stat.st_uid,
-                    "gid": source_stat.st_gid,
-                    "mtime_ns": source_stat.st_mtime_ns,
-                    "size": source_stat.st_size,
-                }
-
-                if stat.S_ISLNK(source_stat.st_mode):
-                    link_target = os.readlink(source_path)
-                    current_stat = source_path.lstat()
-                    if (
-                        current_stat.st_ino != source_stat.st_ino
-                        or current_stat.st_dev != source_stat.st_dev
-                        or not stat.S_ISLNK(current_stat.st_mode)
-                    ):
-                        raise OSError(
-                            f"Configuration symlink changed during backup: {source_path}"
-                        )
-                    os.symlink(link_target, destination)
-                    record.update(type="symlink", link_target=link_target)
-                elif stat.S_ISREG(source_stat.st_mode):
-                    flags = os.O_RDONLY
-                    if hasattr(os, "O_NOFOLLOW"):
-                        flags |= os.O_NOFOLLOW
-                    source_fd = os.open(source_path, flags)
-                    destination_fd = None
-                    try:
-                        opened_stat = os.fstat(source_fd)
-                        if (
-                            not stat.S_ISREG(opened_stat.st_mode)
-                            or opened_stat.st_ino != source_stat.st_ino
-                            or opened_stat.st_dev != source_stat.st_dev
-                        ):
-                            raise OSError(
-                                f"Configuration file changed during backup: {source_path}"
-                            )
-                        destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                        if hasattr(os, "O_NOFOLLOW"):
-                            destination_flags |= os.O_NOFOLLOW
-                        destination_fd = os.open(
-                            destination,
-                            destination_flags,
-                            0o600,
-                        )
-                        digest = hashlib.sha256()
-                        with os.fdopen(source_fd, "rb") as source:
-                            source_fd = -1
-                            with os.fdopen(destination_fd, "wb") as output:
-                                destination_fd = None
-                                while True:
-                                    chunk = source.read(1024 * 1024)
-                                    if not chunk:
-                                        break
-                                    digest.update(chunk)
-                                    output.write(chunk)
-                        final_stat = os.stat(source_path, follow_symlinks=False)
-                        if (
-                            final_stat.st_ino != opened_stat.st_ino
-                            or final_stat.st_dev != opened_stat.st_dev
-                            or final_stat.st_size != opened_stat.st_size
-                            or final_stat.st_mtime_ns != opened_stat.st_mtime_ns
-                        ):
-                            raise OSError(
-                                f"Configuration file changed during backup: {source_path}"
-                            )
-                        record.update(
-                            type="file",
-                            sha256=digest.hexdigest(),
-                            backup=str(destination.relative_to(backup_dir)),
-                        )
-                    finally:
-                        if source_fd >= 0:
-                            os.close(source_fd)
-                        if destination_fd is not None:
-                            os.close(destination_fd)
-                else:
-                    raise OSError(
-                        f"Refusing to purge unsupported configuration file type: "
-                        f"{source_path}"
-                    )
-                manifest["files"].append(record)
-                _write_json_private_update(manifest_path, manifest)
-
-        manifest["status"] = "complete"
-        _write_json_private_update(manifest_path, manifest)
-    except Exception as error:
-        manifest["error"] = str(error)
-        try:
-            _write_json_private_update(manifest_path, manifest)
-        except OSError:
-            pass
-        raise OSError(
-            f"Configuration backup is incomplete at {backup_dir}; purge was not run. "
-            f"{error}"
-        ) from error
-
-    return backup_dir, sum(
-        1 for record in manifest["files"] if record.get("type") in {"file", "symlink"}
-    )
-
-
-def _write_json_private_update(path, data):
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    _write_json_private(temporary, data)
-    os.replace(temporary, path)
-    os.chmod(path, 0o600)
-
-
-def _purge_backup_note(backup_dir, file_count):
-    noun = "file" if file_count == 1 else "files"
-    return (
-        f"Pre-purge configuration backup retained at {backup_dir} "
-        f"({file_count} existing {noun})."
-    )
-
-
-def purge_leftover_configs(package_ids, output_callback=None):
-    """
-    Purges leftover APT configuration packages.
-
-    These packages are already removed, but their configuration files remain.
-
-    Uses:
-
-        pkexec apt-get purge -y package1 package2 ...
-    """
-
-    if not package_ids:
-        return True, "No leftover packages selected."
-
-    # Safety validation: allow only normal package-name characters.
-    safe_package_regex = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:-]*$")
-
-    invalid_packages = [
-        package_id
-        for package_id in package_ids
-        if not safe_package_regex.match(package_id)
-    ]
-
-    if invalid_packages:
-        return False, (
-            "Blocked unsafe or invalid package names:\n\n"
-            + "\n".join(invalid_packages)
-        )
-
-    try:
-        status_result = subprocess.run(
-            [
-                "dpkg-query",
-                "-W",
-                "-f=${db:Status-Abbrev}\t${Package}\n",
-            ],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return False, f"Could not verify residual APT configurations: {error}"
-
-    if status_result.returncode != 0:
-        return False, (
-            status_result.stderr.strip()
-            or "Could not verify residual APT configurations."
-        )
-
-    residual_packages = set()
-    for line in status_result.stdout.splitlines():
-        status, separator, package = line.partition("\t")
-        if separator and status[:2] == "rc":
-            residual_packages.add(package.strip())
-
-    packages_to_purge = [
-        package_id
-        for package_id in dict.fromkeys(package_ids)
-        if package_id in residual_packages
-    ]
-    skipped_packages = [
-        package_id
-        for package_id in dict.fromkeys(package_ids)
-        if package_id not in residual_packages
-    ]
-    if not packages_to_purge:
-        return False, (
-            "None of the selected packages are currently in dpkg's "
-            "residual-configuration state. No packages were purged."
-        )
-
-    apt_get_command = shutil.which("apt-get") or "/usr/bin/apt-get"
-    pkexec_command = shutil.which("pkexec")
-
-    try:
-        backup_dir, backed_up_count = _backup_residual_conffiles(packages_to_purge)
-    except OSError as error:
-        _log_action(f"LEFTOVER_PURGE_BLOCKED backup_error={error}")
-        return False, (
-            "Purge was not started because Appector could not securely back up "
-            f"the remaining configuration files.\n\n{error}"
-        )
-
-    cmd = [
-        apt_get_command,
-        "purge",
-        "-y",
-    ] + packages_to_purge
-
-    if pkexec_command:
-        cmd = [pkexec_command] + cmd
-
-    _log_action(f"LEFTOVER_PURGE_START cmd={shlex.join(cmd)}")
-
-    try:
-        success, message = _run_command_stream(cmd, output_callback)
-    except NameError:
-        success, message = _run_command(cmd)
-
-    if success:
-        _log_action("LEFTOVER_PURGE_SUCCESS")
-        message += f"\n\n{_purge_backup_note(backup_dir, backed_up_count)}"
-        if skipped_packages:
-            message += (
-                "\n\nSkipped packages no longer in residual-configuration state:\n"
-                + "\n".join(skipped_packages)
-            )
-    else:
-        _log_action(f"LEFTOVER_PURGE_FAILED backup={backup_dir} error={message}")
-        message += (
-            f"\n\n{_purge_backup_note(backup_dir, backed_up_count)}"
-        )
-
-    return success, message
-    
 # ------------------------------------------------------------
 # APT Autoremove
 # ------------------------------------------------------------
@@ -3973,9 +3185,19 @@ def execute_apt_autoremove(output_callback=None):
 # Flatpak Unused Runtimes
 # ------------------------------------------------------------
 
+FLATPAK_PROMPT_RE = re.compile(
+    r"(\[(?:y/n|Y/n|n/Y|n/y)\])|(proceed with these changes)",
+    re.IGNORECASE,
+)
+
+
 def get_flatpak_unused_preview():
     """
     Asks Flatpak for its unused-removal plan and declines the confirmation.
+
+    The preview is produced by answering "n" to Flatpak's confirmation prompt,
+    so nothing is removed. If the prompt cannot be recognised the check fails
+    instead of showing a preview that may not match the real transaction.
 
     Returns:
         success: bool
@@ -4023,20 +3245,19 @@ def get_flatpak_unused_preview():
         if result.returncode == 0 and "Nothing unused to uninstall" in output:
             continue
 
-        if result.returncode != 0:
-            declined_prompt = (
-                not result.stderr.strip()
-                and (
-                    "[Y/n]" in output
-                    or "[y/N]" in output
-                    or "Proceed with these changes" in output
-                )
+        # Flatpak exits non-zero when the confirmation is declined. Treat that
+        # as a valid preview only when the prompt is clearly recognised and
+        # nothing was written to stderr.
+        declined_prompt = (
+            bool(FLATPAK_PROMPT_RE.search(output))
+            and not result.stderr.strip()
+        )
+
+        if result.returncode != 0 and not declined_prompt:
+            error = output or (
+                f"Flatpak unused-runtime check failed with exit code {result.returncode}."
             )
-            if not declined_prompt:
-                error = output or (
-                    f"Flatpak unused-runtime check failed with exit code {result.returncode}."
-                )
-                return False, "", f"{scope}: {error}"
+            return False, "", f"{scope}: {error}"
 
         if output:
             refs = list(dict.fromkeys(re.findall(
@@ -4048,17 +3269,12 @@ def get_flatpak_unused_preview():
             preview = "\n".join(
                 line
                 for line in output.splitlines()
-                if not any(
-                    prompt in line.lower()
-                    for prompt in (
-                        "proceed with these changes",
-                        "[y/n]",
-                        "[n/y]",
-                    )
-                )
+                if not FLATPAK_PROMPT_RE.search(line)
             ).strip()
             if preview:
-                previews.append(f"{scope.removeprefix('--').title()} installation:\n{preview}")
+                previews.append(
+                    f"{scope.removeprefix('--').title()} installation:\n{preview}"
+                )
 
     if refs_by_scope:
         size_estimate = get_removal_size_estimate(

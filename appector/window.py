@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -25,8 +26,6 @@ from . import __version__
 from .updater import check_for_update
 from .actions import (
     app_key,
-    can_remove,
-    is_blocked,
     execute_batch_removal,
     prepare_apt_batch_preview,
     add_flathub_remote,
@@ -39,17 +38,103 @@ from .actions import (
     extract_flathub_app_id,
     parse_flatpak_app_inputs,
     review_deb_batch,
-    purge_leftover_configs,
     get_apt_autoremove_preview,
     execute_apt_autoremove,
     get_flatpak_unused_preview,
     execute_flatpak_unused_cleanup,
     check_available_updates,
     execute_available_updates,
-    get_removal_risk,
     get_removal_size_estimate,
 
 )
+from ._proc import state_dir
+from .policy import can_remove, get_removal_risk, is_blocked, is_critical_apt_package_name
+from .residual import (
+    get_purge_backup_summaries,
+    get_residual_conffile_details,
+    list_purge_backups,
+    prune_old_purge_backups,
+    purge_leftover_configs,
+    simulate_leftover_purge,
+)
+from .residual import RESIDUAL_PURGE_BACKUP_KEEP
+
+
+# Single source of truth for keyboard shortcuts. The accelerators registered
+# with the application and the shortcuts window are both generated from this
+# table, so the help can never drift from the real bindings.
+SHORTCUT_ACCELERATORS = (
+    # (action name, accelerators)
+    ("win.toggle-search", ["<Ctrl>f"]),
+    ("win.refresh", ["<Ctrl>r"]),
+    ("win.install", ["<Ctrl>o"]),
+    ("win.cleanup-residuals", ["<Ctrl><Shift>k"]),
+    ("win.show-log", ["<Ctrl>l"]),
+    ("win.check-updates", ["<Ctrl>u"]),
+    ("win.check-appector-updates", ["<Ctrl><Shift>u"]),
+    ("win.export-app-list", ["<Ctrl><Shift>e"]),
+    ("win.export-app-list-json", ["<Ctrl><Shift>j"]),
+    ("win.shortcuts", ["<Ctrl>question"]),
+    ("win.mark-all", ["<Ctrl>a"]),
+    ("win.clear-marks", ["<Ctrl><Shift>a"]),
+    ("win.remove-marked", ["Delete"]),
+)
+
+# Grouped for the shortcuts window, in the order the groups are shown.
+SHORTCUT_GROUPS = (
+    (
+        "General",
+        (
+            ("Search apps", "win.toggle-search"),
+            ("Refresh installed app list", "win.refresh"),
+            ("Install apps", "win.install"),
+            ("Cleanup and residuals", "win.cleanup-residuals"),
+            ("Activity Log", "win.show-log"),
+            ("Check for installed app updates", "win.check-updates"),
+            ("Check for Appector updates", "win.check-appector-updates"),
+            ("Export installed app list as CSV", "win.export-app-list"),
+            ("Export installed app list as JSON", "win.export-app-list-json"),
+            ("Keyboard shortcuts", "win.shortcuts"),
+        ),
+    ),
+    (
+        "Sidebar scope",
+        (
+            ("All items", "win.scope-all"),
+            ("Applications only", "win.scope-apps"),
+            ("System items only", "win.scope-system"),
+        ),
+    ),
+    (
+        "Selection",
+        (
+            ("Mark all visible", "win.mark-all"),
+            ("Clear marks", "win.clear-marks"),
+            ("Remove marked", "win.remove-marked"),
+        ),
+    ),
+)
+
+_SCOPE_ACTIONS = {
+    "all": ("scope-all", "<Ctrl>1"),
+    "apps": ("scope-apps", "<Ctrl>2"),
+    "system": ("scope-system", "<Ctrl>3"),
+}
+
+
+def _set_accessible_label(widget, label):
+    """Give an icon-only control a name for screen readers.
+
+    GTK tooltips are not exposed as an accessible name, so an icon-only button
+    is announced as just "button" without this.
+    """
+    try:
+        widget.update_property(
+            [Gtk.AccessibleProperty.LABEL], [label]
+        )
+    except Exception:
+        # Older GTK bindings may lack the property; the tooltip still helps.
+        pass
 
 
 class MainWindow(Adw.ApplicationWindow):
@@ -65,12 +150,16 @@ class MainWindow(Adw.ApplicationWindow):
         self.search_text = ""
         self.marked_only = False
         self.duplicates_only = False
-        self.show_leftovers = False
-        self.show_advanced_apps = False
+        self.scope = "all"
+        # Scope-derived visibility flags, kept in sync by
+        # `_sync_legacy_scope_flags`.
+        self.show_leftovers = True
+        self.show_advanced_apps = True
         self.hide_basic_apps = False
-        self._updating_select_all_leftovers = False
         self.current_apps = []
-        self.marked_keys = set()
+        # Staged removal marks survive restarts; keys that no longer match a
+        # scanned app are pruned on the first scan.
+        self.marked_keys = self.load_marked_keys()
         self.context_item = None
         self.selected_count = 0
         self.selected_marked_count = 0
@@ -97,9 +186,10 @@ class MainWindow(Adw.ApplicationWindow):
 
         # Left: Sidebar toggle
         self.sidebar_toggle_btn = Gtk.ToggleButton(
-            icon_name="sidebar-show-symbolic", 
-            tooltip_text="Toggle Sidebar"
+            icon_name="sidebar-show-symbolic",
+            tooltip_text="Toggle Sidebar",
         )
+        _set_accessible_label(self.sidebar_toggle_btn, "Toggle sidebar")
         self.sidebar_toggle_btn.set_active(True)
         self.sidebar_toggle_btn.connect("toggled", self.on_sidebar_toggle_btn_toggled)
         header.pack_start(self.sidebar_toggle_btn)
@@ -132,10 +222,18 @@ class MainWindow(Adw.ApplicationWindow):
         view_controls.append(self.grid_view_button)
         header.pack_start(view_controls)
 
+        # Header count label: shows what is actually on screen, so the
+        # subtitle is never stale after filtering.
+        self.count_label = Gtk.Label(label="")
+        self.count_label.add_css_class("dim-label")
+        self.count_label.set_valign(Gtk.Align.CENTER)
+        header.pack_end(self.count_label)
+
         self.reload_button = Gtk.Button(
-            icon_name="view-refresh-symbolic", 
-            tooltip_text="Refresh"
+            icon_name="view-refresh-symbolic",
+            tooltip_text="Refresh",
         )
+        _set_accessible_label(self.reload_button, "Refresh installed app list")
         self.reload_button.add_css_class("flat")
         self.reload_button.set_action_name("win.refresh")
         header.pack_end(self.reload_button)
@@ -145,31 +243,41 @@ class MainWindow(Adw.ApplicationWindow):
         # ------------------------------------------------------------
         primary_menu_model = Gio.Menu()
 
-        install_section = Gio.Menu()
-        install_section.append("Install apps…", "win.install")
-        primary_menu_model.append_section("Applications", install_section)
+        # Install: only one entry today, so it stays directly at the top
+        # level instead of creating a one-item section.
+        primary_menu_model.append("Install apps…", "win.install")
 
+        # Maintenance
         maintenance_section = Gio.Menu()
         maintenance_section.append("Cleanup & residuals…", "win.cleanup-residuals")
         primary_menu_model.append_section("Maintenance", maintenance_section)
 
-        misc_section = Gio.Menu()
-        misc_section.append("Check for installed app updates…", "win.check-updates")
-        misc_section.append("Check for Appector updates…", "win.check-appector-updates")
-        misc_section.append("Export installed app list as CSV…", "win.export-app-list")
-        misc_section.append("Export installed app list as JSON…", "win.export-app-list-json")
-        misc_section.append("Activity Log", "win.show-log")
-        misc_section.append("Keyboard Shortcuts", "win.shortcuts")
-        primary_menu_model.append_section(None, misc_section)
+        # Updates: both update checks belong together.
+        updates_section = Gio.Menu()
+        updates_section.append("Installed app updates…", "win.check-updates")
+        updates_section.append("Appector updates…", "win.check-appector-updates")
+        primary_menu_model.append_section("Updates", updates_section)
 
-        app_section = Gio.Menu()
-        app_section.append("About Appector", "win.about")
-        primary_menu_model.append_section("Appector", app_section)
+        # Export: CSV and JSON share a parent instead of two loose items.
+        export_section = Gio.Menu()
+        export_section.append("Export as CSV…", "win.export-app-list")
+        export_section.append("Export as JSON…", "win.export-app-list-json")
+        primary_menu_model.append_section("Export", export_section)
+
+        # Tools / help
+        tools_section = Gio.Menu()
+        tools_section.append("Activity Log", "win.show-log")
+        tools_section.append("Keyboard Shortcuts", "win.shortcuts")
+        primary_menu_model.append_section("Tools", tools_section)
+
+        # About last, unlabelled so it renders as a plain trailing item.
+        primary_menu_model.append("About Appector", "win.about")
 
         if not hasattr(self, "primary_menu_btn"):
             self.primary_menu_btn = Gtk.MenuButton()
             self.primary_menu_btn.set_icon_name("open-menu-symbolic")
             self.primary_menu_btn.set_tooltip_text("Main Menu")
+            _set_accessible_label(self.primary_menu_btn, "Main menu")
             header.pack_end(self.primary_menu_btn)
 
         self.primary_menu_btn.set_menu_model(primary_menu_model)
@@ -215,6 +323,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.restore_ui_state()
         self.connect("close-request", self.on_close_request)
+        # A window of the right size should open at that size, not just hint it.
+        self.connect("map", self._on_map_once)
 
         try:
             self.column_view.sort_by_column(name_column, Gtk.SortType.ASCENDING)
@@ -312,6 +422,13 @@ class MainWindow(Adw.ApplicationWindow):
         self.empty_page.set_icon_name("edit-find-symbolic")
         self.empty_page.set_title("No apps found")
         self.empty_page.set_description("Try changing your search or filters.")
+        # An empty state should offer the next step, not just state the
+        # problem. The button only appears when a filter is actually active.
+        self.clear_filters_button = Gtk.Button(label="Clear filters")
+        self.clear_filters_button.add_css_class("pill")
+        self.clear_filters_button.set_visible(False)
+        self.clear_filters_button.connect("clicked", self.on_clear_filters_clicked)
+        self.empty_page.set_child(self.clear_filters_button)
 
         self.main_stack.add_named(self.view_stack, "list")
         self.main_stack.add_named(self.empty_page, "empty")
@@ -349,10 +466,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_content(self.toast_overlay)
         self._add_file_drop_target(self, self.on_main_files_dropped)
 
-        # Initial scan
-        self.on_reload_clicked(self.reload_button)
-
-        # Initial scan
+        # Initial scan (single call; a duplicate call previously spawned two
+        # concurrent scan threads and toggled button sensitivity twice).
         self.on_reload_clicked(self.reload_button)
 
     def _ui_state_path(self):
@@ -429,6 +544,39 @@ class MainWindow(Adw.ApplicationWindow):
                     except Exception:
                         continue
 
+    def _on_map_once(self, *_args):
+        """Re-assert the saved window size the first time the window is shown.
+
+        `restore_ui_state` runs during construction, before the window
+        manager has applied its constraints, so the requested size is usually
+        ignored. Re-applying it after the first map fixes that.
+        """
+        if getattr(self, "_map_size_applied", False):
+            return
+        self._map_size_applied = True
+        GLib.idle_add(self._apply_window_size_on_map)
+
+    def _apply_window_size_on_map(self):
+        """Apply the stored window size; runs from the main loop."""
+        state = self.load_ui_state()
+        size = state.get("window_size")
+
+        if not (isinstance(size, list) and len(size) == 2):
+            return False
+
+        try:
+            width = int(size[0])
+            height = int(size[1])
+        except (TypeError, ValueError):
+            return False
+
+        if width > 0 and height > 0:
+            try:
+                self.set_default_size(width, height)
+            except Exception:
+                pass
+        return False
+
     def on_close_request(self, *args):
         self.save_ui_state()
         return False
@@ -452,6 +600,18 @@ class MainWindow(Adw.ApplicationWindow):
         self._empty_state_pending = True
         GLib.idle_add(self._update_empty_state_idle)
 
+    def _update_count_label(self, visible_count):
+        """Show the on-screen item count next to the refresh button."""
+        if not hasattr(self, "count_label"):
+            return
+
+        total = len(getattr(self, "current_apps", []) or [])
+        if visible_count == total:
+            text = f"{total} item{'' if total == 1 else 's'}"
+        else:
+            text = f"{visible_count} of {total}"
+        self.count_label.set_label(text)
+
     def _update_empty_state_idle(self):
         self._empty_state_pending = False
 
@@ -471,6 +631,8 @@ class MainWindow(Adw.ApplicationWindow):
         except Exception:
             return
 
+        self._update_count_label(visible_count)
+
         if visible_count > 0:
             self.main_stack.set_visible_child_name("list")
             return
@@ -482,23 +644,77 @@ class MainWindow(Adw.ApplicationWindow):
             title = "No results"
             description = f"No apps match “{self.search_text}”."
 
-        elif getattr(self, "duplicates_only", False):
-            title = "No duplicates found"
-            description = "Your installed apps do not appear to have duplicates."
-
         elif getattr(self, "marked_only", False):
             title = "No marked apps"
             description = "Mark apps to see them here."
 
-        elif getattr(self, "show_leftovers", False):
-            title = "No leftover APT configurations"
+        elif getattr(self, "duplicates_only", False):
+            title = "No duplicates found"
+            description = "Your installed apps do not appear to have duplicates."
+
+        elif getattr(self, "scope", "all") == "system" and not getattr(
+            self, "show_leftovers", False
+        ):
+            title = "No system items found"
             description = (
-                "No removed APT packages with remaining configuration files were detected."
+                "No runtimes, components, or leftover APT configurations were "
+                "detected."
             )
+
+        elif getattr(self, "scope", "all") == "apps":
+            title = "No applications found"
+            description = "No installed applications match the current filters."
 
         self.empty_page.set_title(title)
         self.empty_page.set_description(description)
+
+        # Offer a way out only when a filter is actually narrowing the list.
+        can_clear = bool(
+            getattr(self, "search_text", "")
+            or getattr(self, "marked_only", False)
+            or getattr(self, "duplicates_only", False)
+            or getattr(self, "scope", "all") != "all"
+        )
+        if hasattr(self, "clear_filters_button"):
+            self.clear_filters_button.set_visible(can_clear)
+
         self.main_stack.set_visible_child_name("empty")
+
+    def on_clear_filters_clicked(self, _button=None):
+        """Reset every active filter so the full list is visible again."""
+        self.search_text = ""
+        if hasattr(self, "search_entry"):
+            self.search_entry.set_text("")
+        self.marked_only = False
+        self.duplicates_only = False
+        if hasattr(self, "marked_only_toggle"):
+            self.marked_only_toggle.set_active(False)
+        if hasattr(self, "duplicates_only_toggle"):
+            self.duplicates_only_toggle.set_active(False)
+        self.set_scope("all")
+        self.custom_filter.changed(Gtk.FilterChange.DIFFERENT)
+        self.update_empty_state()
+
+    def set_scope(self, scope):
+        """Switch the sidebar scope selector, keeping state consistent."""
+        if scope not in ("all", "apps", "system"):
+            return
+        if scope == self.scope:
+            return
+
+        self.scope = scope
+        self._sync_legacy_scope_flags()
+        hidden_count = self._unmark_hidden_advanced_items()
+
+        if hidden_count:
+            self.show_toast(
+                f"{hidden_count} marked item(s) hidden by the scope filter "
+                "were unmarked"
+            )
+
+        button = getattr(self, "scope_buttons", {}).get(scope)
+        if button is not None and not button.get_active():
+            button.set_active(True)
 
     def on_show_log_clicked(self, button=None):
         log_path = self._state_dir() / "actions.log"
@@ -2163,71 +2379,6 @@ class MainWindow(Adw.ApplicationWindow):
     # Flatpak .flatpakref batch installation
     # ------------------------------------------------------------
 
-    def start_flatpak_ref_batch_install(self, paths, user_install, delete_source=False):
-        label = f"{len(paths)} .flatpakref file(s)"
-
-        self.install_progress_window = InstallProgressWindow(
-            self,
-            "Installing Flatpak references",
-        )
-
-        self.install_progress_window.present()
-        self.install_progress_window.start_pulse()
-        self.install_progress_window.set_status(f"Installing {label}…")
-
-        thread = threading.Thread(
-            target=self.flatpak_ref_batch_install_worker,
-            args=(
-                paths,
-                user_install,
-                delete_source,
-            ),
-            daemon=True,
-        )
-
-        thread.start()
-
-    def flatpak_ref_batch_install_worker(self, paths, user_install, delete_source):
-        def output_callback(line):
-            if self.install_progress_window:
-                GLib.idle_add(
-                    self.install_progress_window.append_output,
-                    line,
-                )
-
-        success, message, success_count = install_flatpak_ref_batch(
-            paths,
-            user_install,
-            output_callback=output_callback,
-            delete_source=delete_source,
-        )
-
-        GLib.idle_add(
-            self.on_flatpak_ref_batch_install_finished,
-            success,
-            message,
-            success_count,
-        )
-
-    def on_flatpak_ref_batch_install_finished(self, success, message, _success_count):
-        if self.install_progress_window:
-            self.install_progress_window.stop_pulse()
-
-            if success:
-                self.install_progress_window.close_window()
-                self.install_progress_window = None
-                self.reload()
-
-                self.show_message(
-                    "Installation finished",
-                    message,
-                    Gtk.MessageType.INFO,
-                )
-            else:
-                self.reload()
-                self.install_progress_window.finish_batch_results(message)
-
-        return False
     # ------------------------------------------------------------
     # Actions for context menu
     # ------------------------------------------------------------
@@ -2357,6 +2508,18 @@ class MainWindow(Adw.ApplicationWindow):
         add_window_action("shortcuts", "show_shortcuts_window")
         add_window_action("about", "show_about_dialog")
 
+        # Scope shortcuts need a distinct action per scope, because an
+        # accelerator is bound to an action rather than to a parameter.
+        for scope, (action_name, _accel) in _SCOPE_ACTIONS.items():
+            action = Gio.SimpleAction.new(action_name, None)
+            action.connect(
+                "activate",
+                lambda _a, _p, selected=scope: self.set_scope(selected),
+            )
+            action.set_enabled(True)
+            self.action_group.add_action(action)
+            setattr(self, f"action_{action_name.replace('-', '_')}", action)
+
         # ------------------------------------------------------------
         # Insert action group
         # ------------------------------------------------------------
@@ -2369,15 +2532,12 @@ class MainWindow(Adw.ApplicationWindow):
 
         if app:
             try:
-                app.set_accels_for_action("win.install", ["<Ctrl>o"])
-                app.set_accels_for_action("win.show-log", ["<Ctrl>l"])
-                app.set_accels_for_action("win.refresh", ["<Ctrl>r"])
-                app.set_accels_for_action("win.mark-all", ["<Ctrl>a"])
-                app.set_accels_for_action("win.clear-marks", ["<Ctrl><Shift>a"])
-                app.set_accels_for_action("win.toggle-search", ["<Ctrl>f"])
-                app.set_accels_for_action("win.check-updates", ["<Ctrl>u"])
-                app.set_accels_for_action("win.export-app-list", ["<Ctrl><Shift>e"])
-                app.set_accels_for_action("win.remove-marked", ["Delete"])
+                for action_name, accelerators in SHORTCUT_ACCELERATORS:
+                    app.set_accels_for_action(action_name, accelerators)
+                for _scope, (action_name, accelerator) in _SCOPE_ACTIONS.items():
+                    # The action lives in the "win" group, but accelerators
+                    # are registered against the fully qualified name.
+                    app.set_accels_for_action(f"win.{action_name}", [accelerator])
             except Exception:
                 pass
 
@@ -2551,82 +2711,58 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def show_shortcuts_window(self):
-        ui = """
-        <interface>
-          <object class="GtkShortcutsWindow" id="shortcuts">
-            <property name="modal">1</property>
-            <child>
-              <object class="GtkShortcutsSection">
-                <property name="section-name">shortcuts</property>
-                <child>
-                  <object class="GtkShortcutsGroup">
-                    <property name="title">General</property>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Search</property>
-                        <property name="accelerator">&lt;Ctrl&gt;f</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Refresh</property>
-                        <property name="accelerator">&lt;Ctrl&gt;r</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Install apps</property>
-                        <property name="accelerator">&lt;Ctrl&gt;o</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Activity Log</property>
-                        <property name="accelerator">&lt;Ctrl&gt;l</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Check for installed app updates</property>
-                        <property name="accelerator">&lt;Ctrl&gt;u</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Export installed app list as CSV</property>
-                        <property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;e</property>
-                      </object>
-                    </child>
-                  </object>
-                </child>
-                <child>
-                  <object class="GtkShortcutsGroup">
-                    <property name="title">Selection</property>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Mark all visible</property>
-                        <property name="accelerator">&lt;Ctrl&gt;a</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Clear marks</property>
-                        <property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;a</property>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkShortcutsShortcut">
-                        <property name="title">Remove marked</property>
-                        <property name="accelerator">Delete</property>
-                      </object>
-                    </child>
-                  </object>
-                </child>
-              </object>
-            </child>
-          </object>
-        </interface>
+        """Build the shortcuts window from the shared shortcut table.
+
+        Generating this from SHORTCUT_GROUPS keeps the help in step with the
+        accelerators actually registered with the application.
         """
+        accels = dict(SHORTCUT_ACCELERATORS)
+        for _scope, (action_name, accelerator) in _SCOPE_ACTIONS.items():
+            accels[f"win.{action_name}"] = [accelerator]
+
+        def escape(text):
+            return (
+                text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+
+        groups = []
+        for group_title, entries in SHORTCUT_GROUPS:
+            children = []
+            for label, action_name in entries:
+                accelerator = " ".join(accels.get(action_name, []))
+                children.append(
+                    "      <child>\n"
+                    '        <object class="GtkShortcutsShortcut">\n'
+                    f'          <property name="title">{escape(label)}</property>\n'
+                    f'          <property name="accelerator">'
+                    f"{escape(accelerator)}</property>\n"
+                    "        </object>\n"
+                    "      </child>\n"
+                )
+            groups.append(
+                "    <child>\n"
+                '      <object class="GtkShortcutsGroup">\n'
+                f'        <property name="title">{escape(group_title)}</property>\n'
+                + "".join(children)
+                + "      </object>\n"
+                "    </child>\n"
+            )
+
+        ui = (
+            "<interface>\n"
+            '  <object class="GtkShortcutsWindow" id="shortcuts">\n'
+            '    <property name="modal">1</property>\n'
+            "    <child>\n"
+            '      <object class="GtkShortcutsSection">\n'
+            '        <property name="section-name">shortcuts</property>\n'
+            + "".join(groups)
+            + "      </object>\n"
+            "    </child>\n"
+            "  </object>\n"
+            "</interface>\n"
+        )
 
         builder = Gtk.Builder.new_from_string(ui, -1)
         win = builder.get_object("shortcuts")
@@ -2635,68 +2771,16 @@ class MainWindow(Adw.ApplicationWindow):
             win.set_transient_for(self)
             win.present()
 
-    # ------------------------------------------------------------
-    # Sidebar
-    # ------------------------------------------------------------
-
-    def on_sidebar_expand_toggled(self, button):
-        if not hasattr(self, "sidebar_expanded"):
-            self.sidebar_expanded = True
-
-        self.sidebar_expanded = not self.sidebar_expanded
-
-        if self.sidebar_expanded:
-            if hasattr(self, "sidebar_controls"):
-                self.sidebar_controls.set_visible(True)
-
-            if hasattr(self, "sidebar"):
-                self.sidebar.set_size_request(190, -1)
-
-            if hasattr(self, "sidebar_wrap"):
-                self.sidebar_wrap.set_size_request(-1, -1)
-
-            button.set_label("«")
-            button.set_tooltip_text("Hide sidebar")
-            button.set_halign(Gtk.Align.END)
-        else:
-            if hasattr(self, "sidebar_controls"):
-                self.sidebar_controls.set_visible(False)
-
-            if hasattr(self, "sidebar"):
-                self.sidebar.set_size_request(36, -1)
-
-            if hasattr(self, "sidebar_wrap"):
-                self.sidebar_wrap.set_size_request(42, -1)
-
-            button.set_label("»")
-            button.set_tooltip_text("Show sidebar")
-            button.set_halign(Gtk.Align.CENTER)
-
-        # Force GTK to recalculate layout size
-        if hasattr(self, "sidebar"):
-            self.sidebar.queue_resize()
-
-        if hasattr(self, "sidebar_wrap"):
-            self.sidebar_wrap.queue_resize()
-
-    def _sidebar_heading(self, text):
-        label = Gtk.Label(label=text)
-        label.add_css_class("heading")
-        label.set_xalign(0.0)
-        label.set_margin_top(6)
-
-        return label
-
     def _build_sidebar(self):
         sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        sidebar_box.set_size_request(260, -1)
-        
+        sidebar_box.set_size_request(248, -1)
+
         # Scrolled window for top groups
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scrolled.set_vexpand(True)
-        
-        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+
+        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         content_box.set_margin_top(12)
         content_box.set_margin_bottom(12)
         content_box.set_margin_start(12)
@@ -2705,6 +2789,7 @@ class MainWindow(Adw.ApplicationWindow):
         # 1. Search
         self.search_entry = Gtk.SearchEntry()
         self.search_entry.set_placeholder_text("Search apps")
+        _set_accessible_label(self.search_entry, "Search installed apps")
         self.search_entry.connect("search-changed", self.on_search_changed)
         content_box.append(self.search_entry)
         
@@ -2716,32 +2801,64 @@ class MainWindow(Adw.ApplicationWindow):
         filter_box.append(filter_label)
         
         self.marked_only_toggle = Gtk.ToggleButton(label="Marked only")
+        self.marked_only_toggle.set_tooltip_text(
+            "Show only apps marked for removal"
+        )
         self.marked_only_toggle.connect("toggled", self.on_marked_only_toggled)
         filter_box.append(self.marked_only_toggle)
-        
+
         self.duplicates_only_toggle = Gtk.ToggleButton(label="Duplicates only")
+        self.duplicates_only_toggle.set_tooltip_text(
+            "Show only apps installed more than once"
+        )
         self.duplicates_only_toggle.connect("toggled", self.on_duplicates_only_toggled)
         filter_box.append(self.duplicates_only_toggle)
-        
-        self.show_advanced_apps_toggle = Gtk.ToggleButton(
-            label="Show system items"
+
+        # One scope selector replaces the previous pair of independent
+        # "Show system items" / "System items only" toggles, which could be
+        # active at the same time and produced a confusing empty list.
+        scope_holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        scope_label = Gtk.Label(label="SCOPE")
+        scope_label.add_css_class("sidebar-group-label")
+        scope_label.set_xalign(0.0)
+
+        self.scope_buttons = {}
+        scope_group = None
+        for scope in ("all", "apps", "system"):
+            button = Gtk.ToggleButton(label=scope.capitalize())
+            button.set_hexpand(True)
+            button.set_focusable(False)
+            button.connect("toggled", self.on_scope_toggled, scope)
+            if scope_group is None:
+                scope_group = button
+            else:
+                button.set_group(scope_group)
+            self.scope_buttons[scope] = button
+
+        self.scope_buttons["all"].set_active(True)
+        self.scope_buttons["all"].set_tooltip_text(
+            "Show installed applications and system items"
         )
-        self.show_advanced_apps_toggle.set_tooltip_text(
-            "Include runtimes, components, and non-GUI packages"
+        self.scope_buttons["apps"].set_tooltip_text(
+            "Show applications only; hide runtimes, components, and "
+            "residual configurations"
         )
-        self.show_advanced_apps_toggle.connect("toggled", self.on_show_advanced_apps_toggled)
-        filter_box.append(self.show_advanced_apps_toggle)
-        
-        self.hide_basic_apps_toggle = Gtk.ToggleButton(
-            label="System items only"
+        self.scope_buttons["system"].set_tooltip_text(
+            "Show system items only: runtimes, components, and residual "
+            "configurations"
         )
-        self.hide_basic_apps_toggle.set_tooltip_text(
-            "Hide normal applications and show advanced system items only"
-        )
-        self.hide_basic_apps_toggle.connect("toggled", self.on_hide_basic_apps_toggled)
-        filter_box.append(self.hide_basic_apps_toggle)
-        
+
+        scope_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        scope_row.set_homogeneous(True)
+        for scope in ("all", "apps", "system"):
+            scope_row.append(self.scope_buttons[scope])
+        scope_row.add_css_class("linked")
+
+        # Filters first, then the scope selector under its own heading.
         content_box.append(filter_box)
+        scope_holder.append(scope_label)
+        scope_holder.append(scope_row)
+        content_box.append(scope_holder)
         
         # 4. SELECTION
         selection_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -2753,15 +2870,22 @@ class MainWindow(Adw.ApplicationWindow):
         selection_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         selection_btns.set_homogeneous(True)
         
-        self.mark_all_button = Gtk.Button(label="Mark all visible")
+        self.mark_all_button = Gtk.Button(
+            label="Mark all",
+            icon_name="list-add-symbolic",
+        )
         self.mark_all_button.set_action_name("win.mark-all")
         self.mark_all_button.set_tooltip_text(
-            "Mark only visible apps that are allowed to be removed"
+            "Mark every currently visible app that is allowed to be removed"
         )
         selection_btns.append(self.mark_all_button)
-        
-        self.clear_all_marks_button = Gtk.Button(label="Clear marks")
+
+        self.clear_all_marks_button = Gtk.Button(
+            label="Clear",
+            icon_name="edit-clear-all-symbolic",
+        )
         self.clear_all_marks_button.set_action_name("win.clear-marks")
+        self.clear_all_marks_button.set_tooltip_text("Remove every mark")
         selection_btns.append(self.clear_all_marks_button)
         
         selection_box.append(selection_btns)
@@ -2777,29 +2901,8 @@ class MainWindow(Adw.ApplicationWindow):
         
         return revealer
         
-    def _sidebar_group(self, title, child_box):
-        child_box.set_margin_start(10)
-        child_box.set_spacing(4)
-
-        expander = Gtk.Expander(label=title)
-        expander.set_child(child_box)
-        expander.set_hexpand(True)
-
-        try:
-            expander.add_css_class("flat")
-        except Exception:
-            pass
-
-        return expander
-
-    def on_mark_all_visible_clicked(self, button):
-        self.mark_all_visible()
-
-    def on_clear_all_marks_clicked(self, button):
-        self.clear_all_marks()
-
     # ------------------------------------------------------------
-    # APT Autoremove
+    # APT residual configuration cleanup
     # ------------------------------------------------------------
 
     def on_leftover_cleanup_clicked(self, button=None):
@@ -2857,28 +2960,153 @@ class MainWindow(Adw.ApplicationWindow):
             )
             return False
 
-        package_ids = [app.package_id for app in leftovers]
+        package_ids = [app.package_id for app in leftovers if app.package_id]
         size_estimate = get_removal_size_estimate(leftovers)
+        try:
+            conffile_details = get_residual_conffile_details(package_ids[:100])
+        except Exception:
+            conffile_details = {}
+        total_conffiles = sum(
+            len(conffile_details.get(app.package_id) or [])
+            for app in leftovers
+        )
+        size_estimate = get_removal_size_estimate(leftovers)
+        critical = [
+            app.package_id
+            for app in leftovers
+            if is_critical_apt_package_name(app.package_id)
+        ]
+        try:
+            existing_backups = len(list_purge_backups())
+        except Exception:
+            existing_backups = 0
+
         lines = [
-            "These packages are already removed. Only their configuration files remain.",
-            "Before purging, Appector makes a private backup of dpkg-registered "
-            "configuration files in ~/.local/state/app-manager/purge-backups. If any "
-            "file cannot be safely backed up, the purge will not run. Backups are kept "
-            "until you remove them; this is a recovery copy, not an automatic restore.",
-            "Purging removes the original configuration files; it does not uninstall "
-            "any installed package.",
+            "These packages are already removed. Only their configuration "
+            "files remain. Purging does not uninstall any installed package.",
             "",
-            "This is different from orphaned packages (installed APT dependencies) and "
-            "unused Flatpak runtimes.",
+            "This is different from orphaned packages (installed APT "
+            "dependencies) and unused Flatpak runtimes.",
             "",
-            "Configurations that will be purged:",
+            f"Residual configurations detected: {len(package_ids)} package(s), "
+            f"{total_conffiles} dpkg-registered conffile(s)",
+            f"Existing purge backups: {existing_backups}",
             "",
             size_estimate,
             "",
-            *[f"• {package_id}" for package_id in package_ids[:30]],
         ]
+
+        if critical:
+            lines.extend([
+                "System packages among residuals — purging deletes their saved "
+                "customizations (a backup is still made):",
+                "",
+                *[f"• {name}" for name in critical[:10]],
+                "",
+            ])
+
+        lines.extend([
+            "Configurations available to purge:",
+            "",
+            *[f"• {package_id}" for package_id in package_ids[:30]],
+        ])
         if len(package_ids) > 30:
             lines.append(f"• …and {len(package_ids) - 30} more")
+
+        # With more than one candidate, let the user narrow the selection first so
+        # a single purge never removes residuals the user did not intend.
+        if len(leftovers) > 1:
+            dialog, holder = self.show_leftover_purge_select(
+                leftovers, conffile_details
+            )
+
+            def on_selection(apps, dialog=dialog):
+                if not apps:
+                    self.show_toast("Purge cancelled")
+                    return
+                self._confirm_leftover_purge(apps, conffile_details)
+
+            holder["callback"] = on_selection
+            dialog.present()
+            return False
+
+        self._confirm_leftover_purge(leftovers, conffile_details)
+        return False
+
+    def _confirm_leftover_purge(self, leftovers, conffile_details=None):
+        """Final confirmation for a specific set of residual packages.
+
+        Runs on the GTK main thread, so the synchronous size estimate and
+        APT simulation can block briefly. Kept synchronous to guarantee the
+        preview reflects the exact selection at confirmation time.
+        """
+        conffile_details = conffile_details or {}
+        package_ids = [
+            app.package_id for app in leftovers if getattr(app, "package_id", "")
+        ]
+        if not package_ids:
+            return
+
+        total_conffiles = sum(
+            len(conffile_details.get(package_id) or [])
+            for package_id in package_ids
+        )
+        critical = [p for p in package_ids if is_critical_apt_package_name(p)]
+
+        try:
+            existing_backups = len(list_purge_backups())
+        except Exception:
+            existing_backups = 0
+
+        lines = [
+            "These packages are already removed; only their configuration "
+            "files remain.",
+            "Appector backs up dpkg-registered conffiles to "
+            "~/.local/state/app-manager/purge-backups before purging, and "
+            "aborts if any file cannot be backed up safely. Only the newest "
+            "10 backups are kept. This is a recovery copy, not an automatic "
+            "restore.",
+            "Maintainer purge scripts may remove files beyond the conffiles "
+            "listed below; review the APT simulation.",
+            "",
+            f"Selected: {len(package_ids)} package(s), "
+            f"{total_conffiles} conffile(s)",
+            f"Existing purge backups: {existing_backups}",
+            "",
+            get_removal_size_estimate(leftovers),
+            "",
+        ]
+
+        if critical:
+            lines.extend([
+                "System packages selected — their saved customizations will be "
+                "deleted (a backup is still made):",
+                "",
+                *[f"• {name}" for name in critical[:10]],
+                "",
+            ])
+
+        lines.append("Packages to purge:")
+        lines.append("")
+        lines.extend(f"• {package_id}" for package_id in package_ids[:40])
+        if len(package_ids) > 40:
+            lines.append(f"• …and {len(package_ids) - 40} more")
+
+        try:
+            sim_success, sim_output, _sim_purged = simulate_leftover_purge(
+                package_ids
+            )
+        except Exception as error:
+            sim_success, sim_output = False, str(error)
+
+        lines.extend([
+            "",
+            "APT purge simulation (no changes made):"
+            if sim_success
+            else "APT purge simulation unavailable; purging is blocked:",
+            "",
+            (sim_output or "No details.")[:2500],
+        ])
 
         self._show_confirm_dialog(
             f"Purge {len(package_ids)} leftover APT configuration(s)?",
@@ -2887,7 +3115,96 @@ class MainWindow(Adw.ApplicationWindow):
             self.start_purge_leftovers,
             leftovers,
         )
-        return False
+
+    def show_leftover_purge_select(self, leftovers, conffile_details=None):
+        """Show a selection dialog for residual packages before purging.
+
+        GTK dialogs are event-driven, so this returns the dialog plus a holder
+        dict. The holder's "apps" key is updated to the still-checked
+        `AppEntry` objects when the dialog closes (empty list if cancelled),
+        and its "callback" is invoked with that list. Nothing is purged here;
+        the caller runs its own confirmation and purge.
+        """
+        entries = [
+            app for app in leftovers if getattr(app, "package_id", "")
+        ]
+        if len(entries) <= 1:
+            return entries
+
+        conffile_details = conffile_details or {}
+
+        dialog = Gtk.Dialog(
+            transient_for=self,
+            modal=True,
+            title="Select residual configurations to purge",
+            default_width=580,
+            default_height=520,
+        )
+        dialog.set_resizable(True)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Continue", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+
+        content = dialog.get_content_area()
+        content.set_spacing(8)
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+
+        hint = Gtk.Label(
+            label=(
+                "Uncheck anything you want to keep. Only checked packages will "
+                "be backed up and purged. You will see a final preview next."
+            )
+        )
+        hint.set_xalign(0)
+        hint.set_wrap(True)
+        hint.add_css_class("dim-label")
+        content.append(hint)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_vexpand(True)
+        scrolled.set_hexpand(True)
+
+        list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        list_box.set_margin_top(8)
+        checks = []
+
+        for app in entries:
+            files = conffile_details.get(app.package_id) or []
+            suffix = f" — {len(files)} conffile(s)" if files else ""
+            critical = is_critical_apt_package_name(app.package_id)
+
+            row = Gtk.CheckButton()
+            row.set_active(True)
+            label = Gtk.Label(
+                label=f"{app.package_id}{suffix}"
+                + ("  (system package)" if critical else "")
+            )
+            label.set_xalign(0)
+            label.set_wrap(True)
+            label.set_selectable(True)
+            row.set_child(label)
+            list_box.append(row)
+            checks.append((row, app))
+
+        scrolled.set_child(list_box)
+        content.append(scrolled)
+
+        def on_response(current_dialog, response, holder):
+            current_dialog.close()
+            holder["apps"] = (
+                [app for row, app in checks if row.get_active()]
+                if response == Gtk.ResponseType.OK
+                else []
+            )
+            if holder.get("callback"):
+                holder["callback"](holder["apps"])
+
+        holder = {"apps": entries, "callback": None}
+        dialog.connect("response", on_response, holder)
+        return dialog, holder
 
     def on_autoremove_clicked(self, button=None):
         if not shutil.which("apt-get"):
@@ -2971,26 +3288,6 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._show_confirm_dialog(title, message, "Remove", do_autoremove)
         return False
-
-    def on_autoremove_confirm_response(self, dialog, response):
-        dialog.close()
-
-        if response != Gtk.ResponseType.OK:
-            return
-
-        self.install_progress_window = InstallProgressWindow(
-            self,
-            "Removing orphaned packages",
-        )
-        self.install_progress_window.present()
-        self.install_progress_window.start_pulse()
-        self.install_progress_window.set_status("Removing orphaned packages…")
-
-        thread = threading.Thread(
-            target=self.autoremove_worker,
-            daemon=True,
-        )
-        thread.start()
 
     def autoremove_worker(self):
         def output_callback(line):
@@ -3098,26 +3395,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._show_confirm_dialog(title, message, "Clean Up", do_cleanup)
         return False
 
-    def on_flatpak_cleanup_confirm_response(self, dialog, response):
-        dialog.close()
-
-        if response != Gtk.ResponseType.OK:
-            return
-
-        self.install_progress_window = InstallProgressWindow(
-            self,
-            "Cleaning Flatpak runtimes",
-        )
-        self.install_progress_window.present()
-        self.install_progress_window.start_pulse()
-        self.install_progress_window.set_status("Removing unused Flatpak runtimes…")
-
-        thread = threading.Thread(
-            target=self.flatpak_cleanup_worker,
-            daemon=True,
-        )
-        thread.start()
-
     def flatpak_cleanup_worker(self):
         def output_callback(line):
             if self.install_progress_window:
@@ -3159,7 +3436,7 @@ class MainWindow(Adw.ApplicationWindow):
             transient_for=self,
             modal=True,
             title="Cleanup & residuals",
-            default_width=560,
+            default_width=600,
         )
         dialog.set_resizable(True)
         dialog.add_button("Close", Gtk.ResponseType.CLOSE)
@@ -3187,10 +3464,11 @@ class MainWindow(Adw.ApplicationWindow):
             label=(
                 "These cleanup tools are experimental and may remove packages, "
                 "runtimes, or configuration files. Apart from limited copies of "
-                "APT purge configuration files, Appector does not yet provide a "
-                "complete backup or one-click restore system. Review every preview "
-                "carefully; proceed only if you understand the changes. You are "
-                "responsible for confirming each cleanup."
+                "dpkg-registered APT conffiles, Appector does not yet provide a "
+                "complete backup or one-click restore system. Purge backups keep "
+                "only the newest 10 copies and cover conffiles only. Review every "
+                "preview carefully; proceed only if you understand the changes. "
+                "You are responsible for confirming each cleanup."
             )
         )
         warning_text.set_wrap(True)
@@ -3198,6 +3476,86 @@ class MainWindow(Adw.ApplicationWindow):
         warning.append(warning_icon)
         warning.append(warning_text)
         content.append(warning)
+
+        try:
+            backup_count = len(list_purge_backups())
+        except Exception:
+            backup_count = 0
+        try:
+            total_files = sum(
+                summary.get("backed_up", 0)
+                for summary in get_purge_backup_summaries()
+            )
+        except Exception:
+            total_files = 0
+
+        backup_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        backup_row.set_margin_bottom(4)
+        backup_label = Gtk.Label()
+        backup_label.set_xalign(0)
+        backup_label.add_css_class("dim-label")
+        backup_label.set_hexpand(True)
+        backup_label.set_wrap(True)
+
+        def backup_summary_text(count, files):
+            noun = "purge backup" if count == 1 else "purge backups"
+            return (
+                f"{count} {noun} kept "
+                f"({files} configuration file{'s' if files != 1 else ''} "
+                f"copied in total) — newest 10 retained."
+            )
+
+        backup_label.set_label(backup_summary_text(backup_count, total_files))
+        prune_button = Gtk.Button(label="Prune old backups")
+        prune_button.set_tooltip_text(
+            "Keep only the newest 10 purge backups under "
+            "~/.local/state/app-manager/purge-backups. Only backups beyond "
+            "that limit are deleted."
+        )
+        prune_button.set_sensitive(backup_count > 10)
+        browse_button = Gtk.Button(label="Browse…")
+        browse_button.set_tooltip_text(
+            "Inspect saved pre-purge backups: which packages each purge "
+            "covered, and the file paths and SHA-256 hashes recorded for it. "
+            "A backup with no files means those packages registered no "
+            "dpkg configuration files. Appector does not restore files."
+        )
+
+        def on_prune_clicked(_button):
+            try:
+                removed, kept = prune_old_purge_backups()
+                try:
+                    files = sum(
+                        summary.get("backed_up", 0)
+                        for summary in get_purge_backup_summaries()
+                    )
+                except Exception:
+                    files = 0
+                backup_label.set_label(backup_summary_text(kept, files))
+                prune_button.set_sensitive(kept > 10)
+                self.show_toast(
+                    f"Pruned {removed} old backup(s); {kept} retained."
+                    if removed
+                    else (
+                        "Nothing to prune: only the newest "
+                        f"{RESIDUAL_PURGE_BACKUP_KEEP} backups are kept, and "
+                        f"you have {kept}."
+                    )
+                )
+            except Exception as error:
+                self.show_message(
+                    "Prune failed", str(error), Gtk.MessageType.ERROR
+                )
+
+        prune_button.connect("clicked", on_prune_clicked)
+        browse_button.connect(
+            "clicked",
+            lambda _button: self.on_show_purge_backups_clicked(dialog),
+        )
+        backup_row.append(backup_label)
+        backup_row.append(browse_button)
+        backup_row.append(prune_button)
+        content.append(backup_row)
 
         actions = (
             (
@@ -3207,7 +3565,7 @@ class MainWindow(Adw.ApplicationWindow):
             ),
             (
                 "Purge leftover APT configurations…",
-                "Review removed packages’ configuration files before purging.",
+                "Simulate the purge, review conffiles and backup, then purge.",
                 self.on_leftover_cleanup_clicked,
             ),
             (
@@ -3228,6 +3586,7 @@ class MainWindow(Adw.ApplicationWindow):
             row.set_margin_bottom(8)
             row.set_margin_start(8)
             row.set_margin_end(8)
+
             heading = Gtk.Label(label=title)
             heading.set_xalign(0)
             heading.add_css_class("heading")
@@ -3237,6 +3596,7 @@ class MainWindow(Adw.ApplicationWindow):
             detail.add_css_class("dim-label")
             row.append(heading)
             row.append(detail)
+
             action_button.set_child(row)
 
             def choose_action(_button, action_callback=callback):
@@ -3248,6 +3608,177 @@ class MainWindow(Adw.ApplicationWindow):
 
         dialog.present()
         return False
+
+    def on_show_purge_backups_clicked(self, parent=None):
+        """Browse retained pre-purge backups (read-only inspection)."""
+        dialog = Gtk.Dialog(
+            transient_for=parent or self,
+            modal=True,
+            title="Pre-purge backups",
+            default_width=760,
+            default_height=560,
+        )
+        dialog.set_resizable(True)
+        dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+        dialog.connect("response", lambda d, _r: d.close())
+
+        content = dialog.get_content_area()
+        content.set_spacing(10)
+        content.set_margin_top(14)
+        content.set_margin_bottom(14)
+        content.set_margin_start(14)
+        content.set_margin_end(14)
+
+        note = Gtk.Label(
+            label=(
+                "Read-only view of backups Appector made before purging residual "
+                "APT configuration. Appector does not restore files for you. To "
+                "restore one manually, check the manifest record, confirm the "
+                "target path is correct, and copy the saved file back with the "
+                "recorded ownership and mode."
+            )
+        )
+        note.set_wrap(True)
+        note.set_xalign(0)
+        note.add_css_class("dim-label")
+        content.append(note)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_vexpand(True)
+        scrolled.set_hexpand(True)
+
+        results_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=10
+        )
+        scrolled.set_child(results_box)
+
+        try:
+            summaries = get_purge_backup_summaries()
+        except Exception as error:
+            summaries = []
+            results_box.append(
+                Gtk.Label(label=f"Could not read backups: {error}")
+            )
+
+        if not summaries:
+            empty = Gtk.Label(
+                label=(
+                    "No pre-purge backups have been created yet.\n\n"
+                    "A backup is written each time Appector purges residual "
+                    "APT configuration. Purges that have nothing to copy still "
+                    "record a manifest, which is why a backup can list no "
+                    "files."
+                )
+            )
+            empty.set_xalign(0)
+            empty.set_wrap(True)
+            empty.add_css_class("dim-label")
+            results_box.append(empty)
+        else:
+            for summary in summaries:
+                results_box.append(
+                    self._build_purge_backup_expander(summary)
+                )
+
+        content.append(scrolled)
+        dialog.present()
+        return False
+
+    def _build_purge_backup_expander(self, summary):
+        status = summary.get("status", "unknown")
+        packages = summary.get("packages") or []
+        backed_up = summary.get("backed_up", 0)
+        if backed_up:
+            file_phrase = (
+                f"{backed_up} configuration file"
+                f"{'s' if backed_up != 1 else ''} copied"
+            )
+        else:
+            file_phrase = "no config files registered"
+        heading_text = (
+            f"{summary.get('name', '')} — {status}, "
+            f"{len(packages)} package"
+            f"{'s' if len(packages) != 1 else ''}, {file_phrase}"
+        )
+        expander = Gtk.Expander(label=heading_text)
+        expander.add_css_class("card")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(8)
+        box.set_margin_bottom(8)
+        box.set_margin_start(8)
+        box.set_margin_end(8)
+
+        created = Gtk.Label(label=f"Created: {summary.get('created_at') or 'unknown'}")
+        created.set_xalign(0)
+        created.add_css_class("caption")
+        created.add_css_class("dim-label")
+        box.append(created)
+
+        if summary.get("error"):
+            error_label = Gtk.Label(
+                label=f"Backup error: {summary['error']}"
+            )
+            error_label.set_xalign(0)
+            error_label.set_wrap(True)
+            error_label.add_css_class("error")
+            box.append(error_label)
+
+        if summary.get("note"):
+            note_label = Gtk.Label(label=summary["note"])
+            note_label.set_xalign(0)
+            note_label.set_wrap(True)
+            note_label.add_css_class("dim-label")
+            box.append(note_label)
+
+        file_list = summary.get("files") or []
+        if not file_list:
+            # An empty manifest is usually good news, not a broken backup:
+            # dpkg registered no conffiles for these packages, so there was
+            # nothing to copy. Say so, instead of implying a failure.
+            explanation = Gtk.Label(
+                label=(
+                    "No configuration files to back up — dpkg registered no "
+                    "conffiles for "
+                    + (
+                        "this package."
+                        if len(summary.get("packages") or []) <= 1
+                        else "these packages."
+                    )
+                    + " Nothing was deleted that Appector had not copied."
+                )
+            )
+            explanation.set_xalign(0)
+            explanation.set_wrap(True)
+            explanation.add_css_class("dim-label")
+            box.append(explanation)
+        else:
+            for record in file_list[:200]:
+                if record.get("status") == "missing":
+                    suffix = " (missing at backup time)"
+                elif record.get("type") == "symlink":
+                    suffix = " (symlink)"
+                else:
+                    size = record.get("size")
+                    suffix = f" ({size} bytes)" if isinstance(size, int) else ""
+                line = Gtk.Label(
+                    label=f"{record.get('path', '')}{suffix}"
+                    f"  — {record.get('package', '')}"
+                )
+                line.set_xalign(0)
+                line.set_wrap(True)
+                line.set_selectable(True)
+                line.add_css_class("caption")
+                box.append(line)
+            if len(file_list) > 200:
+                box.append(
+                    Gtk.Label(
+                        label=f"…and {len(file_list) - 200} more recorded files."
+                    )
+                )
+
+        expander.set_child(box)
+        return expander
 
     def on_view_mode_toggled(self, button, mode):
         if not button.get_active():
@@ -3303,10 +3834,17 @@ class MainWindow(Adw.ApplicationWindow):
         origin.set_ellipsize(Pango.EllipsizeMode.END)
         origin.set_max_width_chars(40)
         origin.add_css_class("dim-label")
+        extra = Gtk.Label()
+        extra.set_xalign(0)
+        extra.set_ellipsize(Pango.EllipsizeMode.END)
+        extra.set_max_width_chars(40)
+        extra.add_css_class("caption")
+        extra.add_css_class("dim-label")
 
         content.append(header)
         content.append(package_id)
         content.append(origin)
+        content.append(extra)
         card.set_child(content)
         list_item.set_child(card)
 
@@ -3323,6 +3861,7 @@ class MainWindow(Adw.ApplicationWindow):
         name = icon.get_next_sibling()
         package_id = header.get_next_sibling()
         origin = package_id.get_next_sibling()
+        extra = origin.get_next_sibling()
 
         handler_id = getattr(check, "_app_manager_handler_id", None)
         if handler_id is not None:
@@ -3349,6 +3888,14 @@ class MainWindow(Adw.ApplicationWindow):
         package_id.set_tooltip_text(item.package_id)
         origin.set_label(f"{item.manager} · {item.source}")
         origin.set_tooltip_text(f"{item.manager} · {item.source}")
+        if extra is not None:
+            bits = []
+            if getattr(item, "version", ""):
+                bits.append(str(item.version))
+            if getattr(item, "is_duplicate", False):
+                bits.append("Duplicate")
+            extra.set_label(" · ".join(bits))
+            extra.set_visible(bool(bits))
         self.set_image_from_icon(icon, item.icon)
 
     # ------------------------------------------------------------
@@ -3700,24 +4247,24 @@ class MainWindow(Adw.ApplicationWindow):
     # ------------------------------------------------------------
     # Filtering
     # ------------------------------------------------------------
+    def _is_advanced_item(self, item):
+        """Leftovers and non-GUI entries are 'system' items for filtering."""
+        return (
+            getattr(item, "manager", "") == "Leftover"
+            or not getattr(item, "is_gui_app", True)
+        )
+
     def filter_func(self, item, user_data=None):
         if not isinstance(item, AppItem):
             return False
 
-        manager = getattr(item, "manager", "")
-        is_leftover = manager == "Leftover"
-        is_advanced = is_leftover or not getattr(item, "is_gui_app", True)
+        scope = getattr(self, "scope", "all")
+        is_advanced = self._is_advanced_item(item)
 
-        if is_advanced:
-            if is_leftover:
-                if not self.show_leftovers:
-                    return False
-            else:
-                if not self.show_advanced_apps:
-                    return False
-        else:
-            if self.hide_basic_apps:
-                return False
+        if scope == "apps" and is_advanced:
+            return False
+        if scope == "system" and not is_advanced:
+            return False
 
         if self.marked_only and not getattr(item, "marked", False):
             return False
@@ -4009,13 +4556,79 @@ class MainWindow(Adw.ApplicationWindow):
     # ------------------------------------------------------------
 
     def _state_dir(self):
-        return Path.home() / ".local" / "state" / "app-manager"
+        # Single definition shared with the activity log and purge backups.
+        return state_dir()
 
     def load_marked_keys(self):
-        return set()
+        """Load staged removal marks from the private Appector state file.
+
+        Marks are only a staging selection; removal always requires an
+        explicit preview and confirmation, so restoring them is safe. Unknown
+        or malformed keys are ignored.
+        """
+        path = self._state_dir() / "marked.json"
+        descriptor = None
+        try:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(path, flags)
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                return set()
+            with os.fdopen(descriptor, "r", encoding="utf-8") as source:
+                descriptor = None
+                data = json.load(source)
+        except (OSError, ValueError):
+            return set()
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+        if not isinstance(data, dict):
+            return set()
+
+        keys = data.get("marked")
+        if not isinstance(keys, list):
+            return set()
+
+        return {key for key in keys if isinstance(key, str) and key}
 
     def save_marked_keys(self):
-        return
+        """Persist staged removal marks with user-only permissions."""
+        path = self._state_dir() / "marked.json"
+        descriptor = None
+        temporary_path = None
+        try:
+            self._state_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor, temporary_path = tempfile.mkstemp(
+                prefix=".appector-marked-",
+                dir=str(self._state_dir()),
+            )
+            with os.fdopen(
+                descriptor, "w", encoding="utf-8"
+            ) as output:
+                descriptor = None
+                json.dump(
+                    {"marked": sorted(self.marked_keys)},
+                    output,
+                    indent=2,
+                )
+                output.write("\n")
+            # mkstemp already creates the file 0600, and os.replace keeps that
+            # mode, so no explicit chmod is needed.
+            os.replace(temporary_path, path)
+            temporary_path = None
+        except (OSError, TypeError, ValueError):
+            # Mark persistence is a convenience; never let it break the UI.
+            pass
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if temporary_path:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------
     # Marking
@@ -4074,17 +4687,6 @@ class MainWindow(Adw.ApplicationWindow):
         if hasattr(self, "clear_all_marks_button"):
             self.clear_all_marks_button.set_sensitive(len(self.marked_keys) > 0)
 
-        marked_leftovers = [
-            app
-            for app in marked_entries
-            if getattr(app, "manager", "") == "Leftover"
-        ]
-
-        if hasattr(self, "purge_leftovers_button"):
-            self.purge_leftovers_button.set_sensitive(len(marked_leftovers) > 0)
-
-        self.update_select_all_leftovers_state()
-        
     def mark_items(self, items):
         changed = False
         skipped_protected = 0
@@ -4207,198 +4809,70 @@ class MainWindow(Adw.ApplicationWindow):
         self.show_toast("All marks cleared")
 
     # ------------------------------------------------------------
-    # Advanced visibility helpers
+    # Scope filter
     # ------------------------------------------------------------
 
-    def on_show_leftovers_toggled(self, button):
-        self.show_leftovers = button.get_active()
-        if hasattr(self, "leftovers_revealer"):
-            self.leftovers_revealer.set_reveal_child(self.show_leftovers)
-        self._unmark_hidden_advanced_items()
-        self.rebuild_list()
+    def on_scope_toggled(self, button, scope):
+        if not button.get_active():
+            return
+        self.set_scope(scope)
+        self.custom_filter.changed(Gtk.FilterChange.DIFFERENT)
+        self.update_empty_state()
 
-    def on_show_advanced_apps_toggled(self, button):
-        self.show_advanced_apps = button.get_active()
-        self._unmark_hidden_advanced_items()
-        self.rebuild_list()
+    def _sync_legacy_scope_flags(self):
+        """Keep the scope-derived visibility booleans consistent.
 
-    def on_hide_basic_apps_toggled(self, button):
-        self.hide_basic_apps = button.get_active()
-        self._unmark_hidden_advanced_items()
-        self.rebuild_list()
+        `filter_func` decides visibility directly from `self.scope`. These
+        flags mirror that decision so other helpers (marked-entry cleanup,
+        leftover selection state) stay consistent with what is on screen.
+        """
+        scope = self.scope
+        self.show_advanced_apps = scope in {"all", "system"}
+        self.hide_basic_apps = scope == "system"
+        self.show_leftovers = scope in {"all", "system"}
 
     def _entry_hidden_by_advanced_options(self, app):
-        manager = getattr(app, "manager", "")
+        """Whether the scope selector hides this entry.
 
-        is_leftover = manager == "Leftover"
-        is_advanced = is_leftover or not getattr(app, "is_gui_app", True)
+        Mirrors the scope branch of `filter_func` exactly, so marks are only
+        cleared for entries that actually disappear from the list.
+        """
+        is_advanced = self._is_advanced_item(app)
+        scope = getattr(self, "scope", "all")
 
-        if is_advanced:
-            if is_leftover:
-                return not self.show_leftovers
-
-            return not self.show_advanced_apps
-
-        return self.hide_basic_apps
+        if scope == "apps":
+            return is_advanced
+        if scope == "system":
+            return not is_advanced
+        return False
 
     def _unmark_hidden_advanced_items(self):
-        hidden_keys = set()
+        """Drop marks for entries the scope filter now hides.
 
-        for app in self.current_apps:
-            if self._entry_hidden_by_advanced_options(app):
-                hidden_keys.add(app_key(app))
+        Returns the number of marks that were cleared so callers can tell the
+        user why their selection changed.
+        """
+        hidden_keys = {
+            app_key(app)
+            for app in self.current_apps
+            if self._entry_hidden_by_advanced_options(app)
+        }
 
-        if hidden_keys:
+        removed = len(self.marked_keys & hidden_keys)
+
+        if removed:
             self.marked_keys.difference_update(hidden_keys)
             self.save_marked_keys()
+
+        return removed
 
     # ------------------------------------------------------------
     # Leftover helpers
     # ------------------------------------------------------------
 
-    def get_leftover_entries(self):
-        return [
-            app
-            for app in self.current_apps
-            if getattr(app, "manager", "") == "Leftover"
-        ]
-
-    def get_marked_leftover_entries(self):
-        return [
-            app
-            for app in self.get_marked_entries()
-            if getattr(app, "manager", "") == "Leftover"
-        ]
-
-    def mark_all_leftovers(self):
-        changed = False
-
-        for app in self.get_leftover_entries():
-            key = app_key(app)
-
-            if key and key not in self.marked_keys:
-                self.marked_keys.add(key)
-                changed = True
-
-        if changed:
-            self.save_marked_keys()
-            self.rebuild_list()
-
-    def unmark_all_leftovers(self):
-        changed = False
-
-        for app in self.get_leftover_entries():
-            key = app_key(app)
-
-            if key and key in self.marked_keys:
-                self.marked_keys.remove(key)
-                changed = True
-
-        if changed:
-            self.save_marked_keys()
-            self.rebuild_list()
-
-    def on_select_all_leftovers_toggled(self, button):
-        if getattr(self, "_updating_select_all_leftovers", False):
-            return
-
-        if button.get_active():
-            self.mark_all_leftovers()
-        else:
-            self.unmark_all_leftovers()
-
-    def update_select_all_leftovers_state(self):
-        check = getattr(self, "select_all_leftovers_check", None)
-
-        if not check:
-            return
-
-        leftovers = self.get_leftover_entries()
-        has_leftovers = bool(leftovers)
-
-        check.set_visible(has_leftovers)
-        check.set_sensitive(has_leftovers and self.show_leftovers)
-
-        if not has_leftovers:
-            self._updating_select_all_leftovers = True
-            check.set_active(False)
-            self._updating_select_all_leftovers = False
-            return
-
-        leftover_keys = {app_key(app) for app in leftovers}
-        all_marked = leftover_keys.issubset(self.marked_keys)
-
-        self._updating_select_all_leftovers = True
-        check.set_active(all_marked)
-        self._updating_select_all_leftovers = False
-
     # ------------------------------------------------------------
-    # Leftover purge
+    # Leftover purge execution
     # ------------------------------------------------------------
-
-    def on_purge_leftovers_clicked(self, button=None):
-        leftovers = self.get_marked_leftover_entries()
-
-        if not leftovers:
-            self.show_message(
-                "No leftovers selected",
-                "Mark one or more leftover configuration packages first.",
-                Gtk.MessageType.INFO,
-            )
-            return
-
-        package_ids = [
-            getattr(app, "package_id", "")
-            for app in leftovers
-            if getattr(app, "package_id", "")
-        ]
-
-        if not package_ids:
-            self.show_message(
-                "No valid leftovers selected",
-                "Selected leftover items do not have valid package IDs.",
-                Gtk.MessageType.WARNING,
-            )
-            return
-
-        lines = []
-
-        lines.append(
-            "These packages are already removed. Purging deletes only their "
-            "remaining dpkg-registered configuration files."
-        )
-        lines.append(
-            "Appector first creates a private backup under "
-            "~/.local/state/app-manager/purge-backups. If a file cannot be "
-            "safely backed up, the purge will not run. The backup is not "
-            "restored automatically."
-        )
-        lines.append("")
-        lines.append("The following APT configurations will be purged:")
-        lines.append("")
-
-        for package_id in package_ids[:30]:
-            lines.append(f"• {package_id}")
-
-        if len(package_ids) > 30:
-            lines.append(f"• …and {len(package_ids) - 30} more")
-
-        message = "\n".join(lines)
-
-        title = f"Purge {len(package_ids)} leftover APT configuration(s)?"
-        
-        def do_purge():
-            self.start_purge_leftovers(leftovers)
-            
-        self._show_confirm_dialog(title, message, "Purge", do_purge)
-
-    def on_purge_leftovers_confirm_response(self, dialog, response, leftovers):
-        dialog.close()
-
-        if response != Gtk.ResponseType.OK:
-            return
-
-        self.start_purge_leftovers(leftovers)
 
     def start_purge_leftovers(self, leftovers):
         self._pending_leftover_keys = [app_key(app) for app in leftovers]
