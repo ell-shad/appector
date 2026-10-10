@@ -4,6 +4,7 @@ __pycache__/
 .eggs/
 build/
 dist/
+apt-repo/
 .pytest_cache/
 .mypy_cache/
 .venv/
@@ -23,3 +24,7 @@ agent-skills-*/
 .env.*
 *.pem
 *.key
+# Secret keyring exports. The *public* key lives at
+# apt/keys/appector-archive-keyring.asc and is intentionally tracked.
+*secret*.asc
+*-secret-key.asc

@@ -1,0 +1,131 @@
+name: Publish APT repository
+
+# Kept separate from the GitHub Release workflow on purpose. The release must
+# still publish if GitHub Pages is unavailable or misconfigured; a broken
+# archive should be a visible failure here, not a reason users miss a release.
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege. The signing key is read from repository secrets, which are
+# available to the workflow regardless of these token permissions.
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    # The signing key is the project's release credential: publishing through
+    # this environment means a reviewer can approve the repository before the
+    # key is used. Configure required reviewers in repository settings.
+    environment: public-release
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install repository tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes dpkg-dev gnupg
+
+      - name: Verify tag matches application version
+        run: |
+          version=$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' appector/__init__.py)
+          test "$GITHUB_REF_NAME" = "v$version" || {
+            echo "::error::Tag $GITHUB_REF_NAME does not match application version v$version"
+            exit 1
+          }
+
+      - name: Refuse to publish a pre-release into the stable channel
+        run: |
+          mkdir -p dist
+          python3 scripts/release-notes.py \
+            "$GITHUB_REF_NAME" CHANGELOG.md dist/release-notes.md \
+            dist/prerelease > /dev/null
+          if [ "$(cat dist/prerelease)" = "1" ]; then
+            echo "::error::$GITHUB_REF_NAME is marked as a pre-release in the changelog. Pre-releases must not replace the stable APT channel, so nothing was published. Publish pre-releases as GitHub Release assets only, or cut a full release."
+            exit 1
+          fi
+          echo "$GITHUB_REF_NAME is a full release; publishing to stable."
+
+      - name: Require the committed public key
+        run: |
+          if [ ! -f apt/keys/appector-archive-keyring.asc ]; then
+            echo "::error::apt/keys/appector-archive-keyring.asc is missing. Generate it with scripts/generate-apt-signing-key.sh and commit it, so users have a reviewed key to trust."
+            exit 1
+          fi
+
+      - name: Refuse to publish without the archive signing key
+        env:
+          APPECTOR_GPG_KEY: ${{ secrets.APPECTOR_GPG_KEY }}
+        run: |
+          if [ -z "${APPECTOR_GPG_KEY:-}" ]; then
+            echo "::error::The APPECTOR_GPG_KEY secret is not set. Store the exported secret key with: gh secret set APPECTOR_GPG_KEY --repo $GITHUB_REPOSITORY < appector-archive-secret-key.asc"
+            exit 1
+          fi
+
+      - name: Build Debian package
+        run: ./scripts/build-deb.sh
+
+      - name: Build and sign the APT repository
+        env:
+          APPECTOR_GPG_KEY: ${{ secrets.APPECTOR_GPG_KEY }}
+          APPECTOR_GPG_KEY_ID: ${{ secrets.APPECTOR_GPG_KEY_ID }}
+          APPECTOR_GPG_PASSPHRASE: ${{ secrets.APPECTOR_GPG_PASSPHRASE }}
+        run: ./scripts/build-apt-repo.sh
+
+      - name: Verify the repository before publishing it
+        env:
+          APPECTOR_GPG_KEY: ${{ secrets.APPECTOR_GPG_KEY }}
+          APPECTOR_GPG_KEY_ID: ${{ secrets.APPECTOR_GPG_KEY_ID }}
+          APPECTOR_GPG_PASSPHRASE: ${{ secrets.APPECTOR_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          dists=apt-repo/dists/stable
+
+          # Never deploy unsigned metadata. apt rejects such a repository, so a
+          # silent unsigned deployment would look successful while breaking
+          # every user's apt update.
+          test -f "$dists/InRelease"  || { echo "::error::InRelease was not produced"; exit 1; }
+          test -f "$dists/Release.gpg" || { echo "::error::Release.gpg was not produced"; exit 1; }
+
+          # Verify against the committed public key alone, in an isolated
+          # keyring. This proves the key users will import is the key that
+          # signed the metadata, rather than trusting the build's own output.
+          export GNUPGHOME=$(mktemp -d)
+          chmod 700 "$GNUPGHOME"
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          gpg --batch --quiet --import apt/keys/appector-archive-keyring.asc
+          gpg --batch --verify "$dists/InRelease" > /dev/null
+          gpg --batch --verify "$dists/Release.gpg" "$dists/Release" > /dev/null
+          echo "Release metadata verifies against the committed public key."
+
+          # Publish exactly the reviewed key, not one re-exported in CI.
+          cp apt/keys/appector-archive-keyring.asc \
+            apt-repo/appector-archive-keyring.asc
+
+          # Confirm the checksums in Release match the indexes actually shipped.
+          cd "$dists"
+          awk '/^SHA256:$/ {inblock=1; next}
+               inblock && /^[[:space:]]/ {print $1"  "$3}' Release \
+            > /tmp/expected-sha256
+          test -s /tmp/expected-sha256 || {
+            echo "::error::Release lists no SHA-256 checksums"; exit 1;
+          }
+          sha256sum --check /tmp/expected-sha256
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d
+
+      - name: Upload the repository as a Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
+        with:
+          path: apt-repo
+
+      - name: Publish to GitHub Pages
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346

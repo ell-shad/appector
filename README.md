@@ -74,20 +74,79 @@ sudo apt install ./appector_<version>_all.deb
 
 ### Upgrading an existing installation
 
-Use `sudo apt install ./appector_<version>_all.deb` to upgrade. It performs a
-normal versioned upgrade, exactly like installing the first time.
+The recommended way to install and upgrade Appector is the APT repository
+below. It is the only method through which `apt upgrade` and Ubuntu Software
+Center can offer Appector updates.
 
-Do **not** rely on Ubuntu Software Center (GNOME Software) to apply an update
-from a downloaded release `.deb`. Release packages are not published through
-an APT repository, so there is no configured source offering a newer candidate
+Until you have added it, upgrade a manual installation with:
+
+```bash
+sudo apt install ./appector_<version>_all.deb
+```
+
+That performs a normal versioned upgrade, exactly like installing the first
+time.
+
+### Installing from the APT repository
+
+Appector publishes a signed APT repository. Adding it is a one-time setup;
+afterwards `apt upgrade` and Ubuntu Software Center both track new releases.
+
+```bash
+# 1. Install the archive signing key. The key is committed to the source
+#    repository, so it can be reviewed before you trust it.
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://raw.githubusercontent.com/ell-shad/appector/main/apt/keys/appector-archive-keyring.asc \
+  | sudo tee /etc/apt/keyrings/appector-archive-keyring.asc > /dev/null
+
+# 2. Add the repository, restricted to the key above.
+echo "deb [signed-by=/etc/apt/keyrings/appector-archive-keyring.asc] https://ell-shad.github.io/appector stable main" \
+  | sudo tee /etc/apt/sources.list.d/appector.list > /dev/null
+
+# 3. Refresh and install.
+sudo apt update
+sudo apt install appector
+```
+
+The `signed-by` option is what makes this safe: apt will refuse the repository
+unless its metadata is signed by exactly that key. To confirm what you trusted:
+
+```bash
+apt-key --fingerprint            # older apt
+gpg --show-keys --with-fingerprint \
+  /etc/apt/keyrings/appector-archive-keyring.asc
+```
+
+That fingerprint must match the one printed at the end of
+`scripts/generate-apt-signing-key.sh` and committed at
+[`apt/keys/appector-archive-keyring.asc`](apt/keys/appector-archive-keyring.asc).
+
+To upgrade later:
+
+```bash
+sudo apt update && sudo apt upgrade appector
+```
+
+**To remove the repository**, delete both files and refresh:
+
+```bash
+sudo rm /etc/apt/sources.list.d/appector.list
+sudo apt update
+```
+
+Note that pre-releases are never published to this repository, so it always
+tracks full releases only.
+
+### Why a downloaded .deb does not upgrade in Ubuntu Software Center
+
+If you install from a downloaded `.deb` and later open a newer one in Ubuntu
+Software Center, Software Center reports Appector as *already installed*
+instead of offering the upgrade. Release packages were not published through an
+APT repository, so there was no configured source offering a newer candidate
 version. Software Center resolves a local `.deb` by package name and, finding
-`appector` already installed, reports it as *already installed* rather than
-offering the upgrade. This is a property of how PackageKit handles local
-packages, not a defect in the package.
-
-If Software Center should be able to upgrade Appector like any other
-application, Appector needs to be published to an APT repository that appears
-in `/etc/apt/sources.list.d`. See the roadmap note below.
+`appector` already installed, stops there. This is a property of how PackageKit
+handles local packages, not a defect in the package. Adding the APT repository
+above fixes it, as does `sudo apt install ./appector_<version>_all.deb`.
 
 ### Upgrading from an earlier version
 
@@ -246,12 +305,24 @@ gh attestation verify ./appector_<version>_all.deb --repo ell-shad/appector
 GitHub-generated source archives are available from the same tag and contain
 the source/build scripts for that binary version.
 
-A signed APT repository (for example, GitHub Pages with aptly/reprepro, or a
-hosted package repository) is a planned improvement; it is not configured
-today. That is the only way Ubuntu Software Center could offer Appector
-updates on its own, and it is what the release workflow would need to publish
-a `Packages` index alongside the `.deb`. Until then, upgrade with
-`sudo apt install ./appector_<version>_all.deb`.
+### The APT repository is signed, and the release packages are not
+
+The APT repository metadata is signed with a long-lived OpenPGP archive key,
+so `apt update` can verify it. Release `.deb` assets attached to GitHub
+Releases are **not** individually OpenPGP-signed; they are covered by a SHA-256
+checksum file and a GitHub build-provenance attestation (see above).
+
+That difference is intentional and worth understanding: when you install from
+the APT repository, apt itself verifies a signature over the package index that
+lists the file's hash. When you install a `.deb` downloaded by hand, you are
+relying on the checksum file plus the attestation, which is a weaker but
+practical guarantee. Prefer the APT repository for day-to-day updates.
+
+The archive key's public half is committed at
+[`apt/keys/appector-archive-keyring.asc`](apt/keys/appector-archive-keyring.asc)
+so its fingerprint can be reviewed in a pull request before it is trusted. The
+private key never leaves the maintainer's machine except as a GitHub Actions
+secret; see `scripts/generate-apt-signing-key.sh`.
 
 ## Build from source
 
@@ -275,6 +346,16 @@ install the package or publish a release. Automated tests can be run with:
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+The APT repository can be built locally the same way, after the `.deb`:
+
+```bash
+./scripts/build-apt-repo.sh        # writes apt-repo/
+```
+
+Without `APPECTOR_GPG_KEY` set it produces unsigned metadata, which apt will
+refuse. See "Installing from the APT repository" for how a user consumes it, and
+`scripts/generate-apt-signing-key.sh` for how the maintainer creates the key.
 
 ## Troubleshooting and recovery
 
