@@ -28,7 +28,7 @@ jobs:
             libxml2-utils
 
       - name: Set up Python tooling
-        uses: actions/setup-python@a26af69be951a213d495fdf4a982ed9829aaa238
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
 
