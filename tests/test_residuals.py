@@ -440,52 +440,53 @@ class MarkPersistenceTests(unittest.TestCase):
         stub.save_marked_keys = lambda: MainWindow.save_marked_keys(stub)
         return stub
 
-    def _mark_file(self, home):
+    def _mark_file(self):
         from appector.paths import state_dir
 
         return state_dir() / "marked.json"
 
     def test_marks_round_trip_with_user_only_permissions(self):
         with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            stub = self._stub()
-            with patch.object(Path, "home", return_value=home):
+            # Patch home for every path resolution, including the final
+            # assertions: state_dir() called outside the patch would touch
+            # the real per-user state directory.
+            with patch.object(Path, "home", return_value=Path(tmp)):
+                stub = self._stub()
                 stub.save_marked_keys()
                 keys = stub.load_marked_keys()
-            self.assertEqual(keys, {"APT::vim", "Snap::firefox"})
-            self.assertEqual(
-                stat.S_IMODE(self._mark_file(home).stat().st_mode),
-                0o600,
-            )
+                self.assertEqual(keys, {"APT::vim", "Snap::firefox"})
+                mark_file = self._mark_file()
+                self.assertEqual(
+                    stat.S_IMODE(mark_file.stat().st_mode),
+                    0o600,
+                )
 
     def test_malformed_mark_files_are_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            mark_file = self._mark_file(home)
-            mark_file.parent.mkdir(parents=True, exist_ok=True)
-            stub = self._stub()
+            with patch.object(Path, "home", return_value=Path(tmp)):
+                mark_file = self._mark_file()
+                mark_file.parent.mkdir(parents=True, exist_ok=True)
+                stub = self._stub()
 
-            for payload in (
-                "{not json",
-                "[]",
-                '{"marked": "nope"}',
-                '{"marked": [1, 2]}',
-            ):
-                with self.subTest(payload=payload):
-                    mark_file.write_text(payload, encoding="utf-8")
-                    with patch.object(Path, "home", return_value=home):
+                for payload in (
+                    "{not json",
+                    "[]",
+                    '{"marked": "nope"}',
+                    '{"marked": [1, 2]}',
+                ):
+                    with self.subTest(payload=payload):
+                        mark_file.write_text(payload, encoding="utf-8")
                         self.assertEqual(stub.load_marked_keys(), set())
 
     def test_symlinked_mark_file_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            mark_file = self._mark_file(home)
-            mark_file.parent.mkdir(parents=True, exist_ok=True)
-            outside = home / "outside.json"
-            outside.write_text('{"marked": ["APT::evil"]}', encoding="utf-8")
-            mark_file.symlink_to(outside)
-            stub = self._stub()
-            with patch.object(Path, "home", return_value=home):
+            with patch.object(Path, "home", return_value=Path(tmp)):
+                mark_file = self._mark_file()
+                mark_file.parent.mkdir(parents=True, exist_ok=True)
+                outside = Path(tmp) / "outside.json"
+                outside.write_text('{"marked": ["APT::evil"]}', encoding="utf-8")
+                mark_file.symlink_to(outside)
+                stub = self._stub()
                 self.assertEqual(stub.load_marked_keys(), set())
 
 
