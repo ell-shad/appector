@@ -92,7 +92,11 @@ while IFS= read -r package; do
 done < "$PACKAGE_LIST"
 
 # Retention trim (S12): keep the newest $POOL_RETENTION .debs in the pool.
-ls -1v "$POOL_DIR"/appector_*.deb 2>/dev/null | head -n -"$POOL_RETENTION" \
+# find + sort -V instead of ls -1v (SC2012): find handles arbitrary file
+# names, and sorting full paths that share one directory keeps the same
+# natural version order as ls -v.
+find "$POOL_DIR" -maxdepth 1 -name 'appector_*.deb' -type f -print \
+    | sort -V | head -n -"$POOL_RETENTION" \
     | while IFS= read -r stale; do
         rm -f "$stale"
         log "retention removed $(basename "$stale")"
