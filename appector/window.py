@@ -1,4 +1,3 @@
-import csv
 import json
 import os
 import shutil
@@ -15,13 +14,14 @@ gi.require_version("GdkPixbuf", "2.0")
 
 from gi.repository import Gtk, Adw, Gio, GLib, Gdk, GdkPixbuf, Pango
 
-import threading
-
 from .scanners import scan_all, scan_leftover_configs
 from .models import mark_duplicate_apps
 from .app_item import AppItem
 from .details import DetailsWindow
-from .progress import ProgressWindow, InstallProgressWindow
+from .ui.confirm_dialog import ConfirmPlanDialog
+from .ui.review_dialogs import FlatpakRefReviewDialog
+from .ui.progress_dialog import TaskProgressDialog
+from .ui.tasks import CancelToken, run_async
 from . import __version__
 from .updater import check_for_update
 from .actions import (
@@ -47,7 +47,7 @@ from .actions import (
     get_removal_size_estimate,
 
 )
-from ._proc import state_dir
+from ._proc import _log_action, state_dir
 from .policy import can_remove, get_removal_risk, is_blocked, is_critical_apt_package_name
 from .residual import (
     get_purge_backup_summaries,
@@ -77,7 +77,10 @@ SHORTCUT_ACCELERATORS = (
     ("win.shortcuts", ["<Ctrl>question"]),
     ("win.mark-all", ["<Ctrl>a"]),
     ("win.clear-marks", ["<Ctrl><Shift>a"]),
-    ("win.remove-marked", ["Delete"]),
+    # U5: a bare Delete hijacked the Delete key inside text entries, and
+    # <Ctrl>a overrode select-all. Ctrl+Delete cannot clash, and the two
+    # handlers additionally refuse to run while an editable has focus.
+    ("win.remove-marked", ["<Ctrl>Delete"]),
 )
 
 # Grouped for the shortcuts window, in the order the groups are shown.
@@ -170,7 +173,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.view_mode = self.load_ui_state().get("view_mode", "table")
         if self.view_mode not in {"table", "grid"}:
             self.view_mode = "table"
-        
+
         self._setup_css()
         self._setup_actions()
 
@@ -315,7 +318,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         for column in [marked_column, name_column, source_column, manager_column, version_column]:
             self.column_view.append_column(column)
-            
+
         self.column_widgets = {
             "marked": marked_column, "name": name_column, "source": source_column,
             "manager": manager_column, "version": version_column,
@@ -330,7 +333,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.column_view.sort_by_column(name_column, Gtk.SortType.ASCENDING)
         except AttributeError:
             self.sort_model.set_sorter(name_column.get_sorter())
-            
+
         sorter = self.column_view.get_sorter()
         if sorter:
             self.sort_model.set_sorter(sorter)
@@ -340,6 +343,8 @@ class MainWindow(Adw.ApplicationWindow):
         scrolled.set_child(self.column_view)
         scrolled.set_hexpand(True)
         scrolled.set_vexpand(True)
+        # Kept as attributes so a rebuild can restore the scroll position.
+        self.column_scrolled = scrolled
 
         grid_factory = Gtk.SignalListItemFactory()
         grid_factory.connect("setup", self.on_setup_grid_item)
@@ -360,6 +365,7 @@ class MainWindow(Adw.ApplicationWindow):
         grid_scrolled.set_child(self.grid_view)
         grid_scrolled.set_hexpand(True)
         grid_scrolled.set_vexpand(True)
+        self.grid_scrolled = grid_scrolled
 
         self.view_stack = Gtk.Stack()
         self.view_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
@@ -374,14 +380,14 @@ class MainWindow(Adw.ApplicationWindow):
         self.selection_label = Gtk.Label(label="0 selected")
         self.selection_label.add_css_class("dim-label")
         self.selection_label.set_margin_end(12)
-        
+
         self.mark_button = Gtk.Button(label="Mark")
         self.mark_button.set_tooltip_text("Mark selected apps for removal")
         self.mark_button.add_css_class("suggested-action")
         self.mark_button.add_css_class("pill")
         self.mark_button.set_sensitive(False)
         self.mark_button.connect("clicked", self.on_mark_clicked)
-        
+
         self.unmark_button = Gtk.Button(label="Unmark")
         self.unmark_button.set_tooltip_text("Unmark selected apps")
         self.unmark_button.add_css_class("pill")
@@ -455,8 +461,16 @@ class MainWindow(Adw.ApplicationWindow):
         content.append(sidebar_wrap)
         content.append(main_box)
 
+        # F6/U8: "1,204 apps" is not an error, but a silently short count
+        # is. The banner names the sources that failed or are missing, and
+        # offers the per-source detail.
+        self.scan_banner = Adw.Banner()
+        self.scan_banner.set_button_label("Details")
+        self.scan_banner.connect("button-clicked", self.on_scan_banner_details)
+
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         outer.append(header)
+        outer.append(self.scan_banner)
         outer.append(content)
         outer.set_hexpand(True)
         outer.set_vexpand(True)
@@ -581,6 +595,28 @@ class MainWindow(Adw.ApplicationWindow):
         self.save_ui_state()
         return False
 
+    def _worker_failed(self, what, error):
+        """U3: a crashed worker must never leave a modal window behind."""
+        for attribute in ("progress_window", "install_progress_window"):
+            dialog = getattr(self, attribute, None)
+            if dialog is not None:
+                try:
+                    dialog.finish_failure(error)
+                except Exception:
+                    try:
+                        dialog.close()
+                    except Exception:
+                        pass
+                setattr(self, attribute, None)
+        self.reload_button.set_sensitive(True)
+        if hasattr(self, "remove_marked_button"):
+            self.remove_marked_button.set_sensitive(True)
+        self.show_message(
+            "Operation failed",
+            f"The {what} failed unexpectedly:\n{error}",
+            Gtk.MessageType.ERROR,
+        )
+
     def show_toast(self, message):
         try:
             toast = Adw.Toast.new(message)
@@ -592,7 +628,7 @@ class MainWindow(Adw.ApplicationWindow):
                 message,
                 Gtk.MessageType.INFO,
             )
-            
+
     def on_filter_items_changed(self, *args):
         if getattr(self, "_empty_state_pending", False):
             return
@@ -642,7 +678,13 @@ class MainWindow(Adw.ApplicationWindow):
 
         if getattr(self, "search_text", ""):
             title = "No results"
-            description = f"No apps match “{self.search_text}”."
+            # U7: the description is parsed as Pango markup, so the search
+            # text must be escaped (& or <x> produced warnings and a blank
+            # description).
+            description = (
+                f"No apps match "
+                f"“{GLib.markup_escape_text(self.search_text)}”."
+            )
 
         elif getattr(self, "marked_only", False):
             title = "No marked apps"
@@ -772,18 +814,19 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.present()
 
     def on_check_updates_clicked(self, button=None):
-        self.progress_window = ProgressWindow(
+        self.progress_window = TaskProgressDialog(
             self,
             "Checking for installed app updates",
         )
-        self.progress_window.present()
+        self.progress_window.present(self)
         self.progress_window.start_indeterminate(
             "Checking available APT, Flatpak, and Snap package updates…"
         )
-        threading.Thread(
-            target=self.check_updates_worker,
-            daemon=True,
-        ).start()
+        run_async(
+            self.check_updates_worker,
+            on_error=lambda error: self._worker_failed("update check", error),
+            name="check-updates",
+        )
 
     def check_updates_worker(self):
         success, message = check_available_updates()
@@ -951,20 +994,21 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def start_available_updates(self, updates):
-        self.install_progress_window = InstallProgressWindow(
+        self._updates_cancel = CancelToken()
+        self.install_progress_window = TaskProgressDialog(
             self,
             "Updating apps",
+            cancel_token=self._updates_cancel,
         )
-        self.install_progress_window.present()
-        self.install_progress_window.start_pulse()
+        self.install_progress_window.present(self)
         self.install_progress_window.set_status(
             f"Installing {len(updates)} selected update(s)…"
         )
-        threading.Thread(
-            target=self.available_updates_worker,
-            args=(updates,),
-            daemon=True,
-        ).start()
+        run_async(
+            lambda: self.available_updates_worker(updates),
+            on_error=lambda error: self._worker_failed("update installation", error),
+            name="install-updates",
+        )
 
     def available_updates_worker(self, updates):
         progress_window = self.install_progress_window
@@ -1011,6 +1055,16 @@ class MainWindow(Adw.ApplicationWindow):
                     path = file.get_path() if file else None
                     if path:
                         self._export_installed_apps(path, file_format)
+                except GLib.Error as error:
+                    # U6: DISMISSED/CANCELLED is the user closing the
+                    # chooser — not a failure to report.
+                    if error.domain == "gtk-dialog-error-quark" and error.code in (
+                        0,  # Gtk.DialogError.DISMISSED
+                        1,  # Gtk.DialogError.CANCELLED
+                    ):
+                        return
+                    self.show_message("Export failed", str(error),
+                                      Gtk.MessageType.ERROR)
                 except Exception as error:
                     self.show_message(
                         "Export failed",
@@ -1045,73 +1099,27 @@ class MainWindow(Adw.ApplicationWindow):
         chooser.destroy()
 
     def _export_installed_apps(self, path, file_format="csv"):
-        fields = (
-            "name",
-            "manager",
-            "package_id",
-            "version",
-            "source",
-            "installed_at",
-            "category",
-        )
-        rows = [
-            {
-                field: getattr(app, field, "") or ""
-                for field in fields
-            }
-            for app in self.current_apps
-        ]
-        descriptor = None
-        temporary_path = None
+        """Export the installed app list via the shared exporter (S10).
+
+        Formula-injection escaping, atomic 0600 writes and symlink
+        replacement live in `appector.export`, which is testable headless.
+        """
+        from .export import write_app_export
+
         try:
-            descriptor, temporary_path = tempfile.mkstemp(
-                prefix=".appector-export-",
-                dir=str(Path(path).parent),
-            )
-            with os.fdopen(
-                descriptor,
-                "w",
-                encoding="utf-8",
-                newline="" if file_format == "csv" else None,
-            ) as output:
-                descriptor = None
-                if file_format == "json":
-                    json.dump(rows, output, ensure_ascii=False, indent=2)
-                    output.write("\n")
-                else:
-                    writer = csv.DictWriter(output, fieldnames=fields)
-                    writer.writeheader()
-                    writer.writerows(rows)
-            os.replace(temporary_path, path)
-            temporary_path = None
-        except (OSError, csv.Error, TypeError) as error:
-            cleanup_note = ""
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError as cleanup_error:
-                    cleanup_note = f"\nTemporary export descriptor could not be closed: {cleanup_error}"
-            if temporary_path:
-                try:
-                    os.unlink(temporary_path)
-                except FileNotFoundError:
-                    pass
-                except OSError as cleanup_error:
-                    cleanup_note += (
-                        f"\nTemporary export file could not be removed: "
-                        f"{cleanup_error}"
-                    )
+            count = write_app_export(path, self.current_apps, file_format)
+        except (OSError, ValueError, TypeError) as error:
             self.show_message(
                 "Export failed",
-                f"Could not save the installed app list:\n{error}{cleanup_note}",
+                f"Could not save the installed app list:\n{error}",
                 Gtk.MessageType.ERROR,
             )
             return
 
         self.show_message(
             "Export complete",
-            f"Exported {len(self.current_apps)} installed app(s) as "
-            f"{file_format.upper()} to:\n{path}",
+            f"Exported {count} installed app(s) as {file_format.upper()} "
+            f"to:\n{path}",
             Gtk.MessageType.INFO,
         )
 
@@ -1126,6 +1134,31 @@ class MainWindow(Adw.ApplicationWindow):
     def on_install_clicked(self, button=None, initial_paths=None):
         self.show_install_dialog(button, initial_paths)
 
+    def open_install_files(self, paths):
+        """Open the install dialog for files passed via CLI / file association."""
+        paths = [str(path) for path in (paths or []) if str(path or "").strip()]
+        if not paths:
+            return
+
+        deb_paths, flatpakref_paths, appimage_paths, unsupported = (
+            self._classify_install_paths(paths)
+        )
+        supported = deb_paths + flatpakref_paths + appimage_paths
+
+        if unsupported:
+            self.show_message(
+                "Unsupported files",
+                (
+                    "Only .deb packages, .flatpakref files, and .AppImage "
+                    "files can be opened with Appector:\n\n"
+                    + "\n".join(unsupported)
+                ),
+                Gtk.MessageType.WARNING,
+            )
+
+        if supported:
+            self.show_install_dialog(initial_paths=supported)
+
 
     def start_install_files_batch(
         self,
@@ -1138,19 +1171,17 @@ class MainWindow(Adw.ApplicationWindow):
     ):
         appimage_paths = appimage_paths or []
         file_count = len(deb_paths) + len(flatpakref_paths) + len(appimage_paths)
-        self.install_progress_window = InstallProgressWindow(
+        self.install_progress_window = TaskProgressDialog(
             self,
             "Installing apps",
         )
-        self.install_progress_window.present()
-        self.install_progress_window.start_pulse()
+        self.install_progress_window.present(self)
         self.install_progress_window.set_status(
             f"Installing {file_count} package file(s)…"
         )
 
-        thread = threading.Thread(
-            target=self.install_files_batch_worker,
-            args=(
+        run_async(
+            lambda: self.install_files_batch_worker(
                 deb_paths,
                 flatpakref_paths,
                 appimage_paths,
@@ -1158,9 +1189,11 @@ class MainWindow(Adw.ApplicationWindow):
                 delete_source,
                 deb_review,
             ),
-            daemon=True,
+            on_error=lambda error: self._worker_failed(
+                "installation", error
+            ),
+            name="install-batch",
         )
-        thread.start()
 
     def _confirm_appimage_install(
         self,
@@ -1187,6 +1220,26 @@ class MainWindow(Adw.ApplicationWindow):
                     user_install,
                     delete_source,
                 )
+
+        if flatpakref_paths:
+            from .actions import flatpakref_review_text, parse_flatpakref_file
+
+            review_texts = []
+            reviewed_fields = {}
+            for ref_path in flatpakref_paths:
+                review_texts.append(flatpakref_review_text(ref_path))
+                reviewed_fields[
+                    str(Path(ref_path).expanduser().absolute())
+                ] = parse_flatpakref_file(ref_path)
+
+            self._flatpakref_reviewed_fields = reviewed_fields
+            dialog = FlatpakRefReviewDialog(
+                self,
+                review_texts,
+                on_install=start_install,
+            )
+            dialog.present(self)
+            return
 
         if not appimage_paths:
             start_install()
@@ -1221,28 +1274,28 @@ class MainWindow(Adw.ApplicationWindow):
         user_install,
         delete_source,
     ):
-        self.install_progress_window = InstallProgressWindow(
+        self.install_progress_window = TaskProgressDialog(
             self,
             "Reviewing Debian packages",
         )
-        self.install_progress_window.present()
-        self.install_progress_window.start_pulse()
+        self.install_progress_window.present(self)
         self.install_progress_window.set_status(
             "Inspecting package metadata and simulating the APT transaction…"
         )
 
-        thread = threading.Thread(
-            target=self.deb_install_review_worker,
-            args=(
+        run_async(
+            lambda: self.deb_install_review_worker(
                 deb_paths,
                 flatpakref_paths,
                 appimage_paths,
                 user_install,
                 delete_source,
             ),
-            daemon=True,
+            on_error=lambda error: self._worker_failed(
+                "package review", error
+            ),
+            name="deb-review",
         )
-        thread.start()
 
     def deb_install_review_worker(
         self,
@@ -1285,73 +1338,28 @@ class MainWindow(Adw.ApplicationWindow):
             )
             return False
 
-        warnings = (
-            "Publisher identity and signatures are not verified for locally "
-            "selected .deb files. The SHA-256 values identify these exact files; "
-            "they do not establish that the publisher is trustworthy.\n\n"
-            "Installing a Debian package can run its maintainer scripts with "
-            "administrator privileges. Review the publisher and package details "
-            "yourself before continuing. Appector will remain unprivileged; the "
-            "system authorization prompt applies only to the APT operation.\n\n"
-            "The APT simulation is a preview. Package sources or system state may "
-            "change before installation, so review any final APT prompt as well."
-        )
-        if delete_source:
-            warnings += (
-                "\n\nAfter a successful installation, the selected original .deb "
-                "files will be moved to Trash only if they are unchanged since "
-                "this review."
+        # U10/F13: the structured review dialog shows per-package facts
+        # (metadata, maintainer scripts, setuid files, /etc/apt paths,
+        # systemd units) instead of a text dump.
+        from .ui.review_dialogs import DebReviewDialog
+
+        def on_install():
+            self.start_install_files_batch(
+                review.staged_paths,
+                flatpakref_paths,
+                appimage_paths,
+                user_install,
+                delete_source,
+                review,
             )
-        warnings += "\n\n" + review.summary
 
-        dialog = Gtk.Dialog(
-            transient_for=self,
-            modal=True,
+        dialog = DebReviewDialog(
+            self,
+            review,
+            on_install=on_install,
+            delete_source=delete_source,
         )
-        dialog.set_title("Review Debian package installation")
-        dialog.set_default_size(720, 560)
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        install_button = dialog.add_button(
-            "Install reviewed packages",
-            Gtk.ResponseType.OK,
-        )
-        install_button.add_css_class("suggested-action")
-        dialog.set_default_response(Gtk.ResponseType.CANCEL)
-
-        content = dialog.get_content_area()
-        content.set_spacing(8)
-        content.set_margin_top(12)
-        content.set_margin_bottom(12)
-        content.set_margin_start(12)
-        content.set_margin_end(12)
-
-        text_view = Gtk.TextView()
-        text_view.set_editable(False)
-        text_view.set_cursor_visible(False)
-        text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        text_view.get_buffer().set_text(warnings)
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_hexpand(True)
-        scrolled.set_vexpand(True)
-        scrolled.set_child(text_view)
-        content.append(scrolled)
-
-        def on_response(review_dialog, response):
-            review_dialog.close()
-            if response == Gtk.ResponseType.OK:
-                self.start_install_files_batch(
-                    review.staged_paths,
-                    flatpakref_paths,
-                    appimage_paths,
-                    user_install,
-                    delete_source,
-                    review,
-                )
-            else:
-                review.close()
-
-        dialog.connect("response", on_response)
-        dialog.present()
+        dialog.present(self)
         return False
 
     def install_files_batch_worker(
@@ -1415,6 +1423,9 @@ class MainWindow(Adw.ApplicationWindow):
                     user_install,
                     output_callback=output_callback,
                     delete_source=delete_source,
+                    reviewed_fields_by_path=getattr(
+                        self, "_flatpakref_reviewed_fields", None
+                    ),
                 )
                 results.append(f"Flatpak references:\n{message}")
                 success_count += resolved_count
@@ -1460,203 +1471,25 @@ class MainWindow(Adw.ApplicationWindow):
     # ------------------------------------------------------------
 
     def show_install_dialog(self, button=None, initial_paths=None):
-        dialog = Gtk.Dialog(
-            transient_for=self,
-            modal=True,
+        """U4: the install dialog is built in ui/install_dialog.py."""
+        from .ui.install_dialog import build_install_dialog
+
+        dialog = build_install_dialog(
+            self,
+            on_browse=self.on_flatpakref_browse_clicked,
+            on_response=self.on_flatpak_install_response,
+            on_mode_changed=self.on_flatpak_install_mode_changed,
+            on_state_changed=self.on_flatpak_install_state_changed,
+            on_batch_text_changed=self.on_flatpak_batch_text_changed,
+            on_batch_expander_changed=self.on_flatpak_batch_expander_changed,
+            add_drop_target=lambda dialog: self._add_file_drop_target(
+                dialog, self.on_installer_files_dropped, dialog
+            ),
+            set_paths=self._set_installer_dialog_paths,
+            update_state=self.update_flatpak_install_dialog_state,
+            initial_paths=initial_paths,
         )
-        dialog.set_resizable(False)
-        dialog.set_property("title", "Install apps")
-        dialog.set_default_size(520, -1)
-
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-
-        dialog.add_flatpak_button = dialog.add_button(
-            "Add Flathub",
-            Gtk.ResponseType.APPLY,
-        )
-
-        dialog.install_button = dialog.add_button(
-            "Install",
-            Gtk.ResponseType.OK,
-        )
-
-        dialog.install_button.add_css_class("suggested-action")
-
-        content = dialog.get_content_area()
-        content.set_spacing(8)
-
-        content.set_margin_top(12)
-        content.set_margin_bottom(12)
-        content.set_margin_start(12)
-        content.set_margin_end(12)
-
-        # Mode selection
-        dialog.mode_id_button = Gtk.CheckButton(label="Flathub app ID or URL")
-        dialog.mode_ref_button = Gtk.CheckButton(
-            label="Install files (.deb / .flatpakref / .AppImage)"
-        )
-
-        dialog.mode_ref_button.set_group(dialog.mode_id_button)
-        dialog.mode_ref_button.set_active(True)
-
-        # App ID entry
-        dialog.id_entry = Gtk.Entry()
-        dialog.id_entry.set_placeholder_text(
-            "org.gimp.GIMP or https://flathub.org/en/apps/org.gimp.GIMP"
-        )
-        dialog.id_entry.set_hexpand(True)
-
-        # Flatpakref entry + browse
-        dialog.file_entry = Gtk.Entry()
-        dialog.file_entry.set_placeholder_text(
-            "/path/to/package.deb, .flatpakref, or .AppImage"
-        )
-        dialog.file_entry.set_hexpand(True)
-
-        browse_button = Gtk.Button(label="Browse files…")
-        browse_button.connect("clicked", self.on_flatpakref_browse_clicked, dialog)
-
-        # Scope
-        dialog.user_check = Gtk.CheckButton(label="Install for current user only")
-        dialog.user_check.set_active(True)
-        dialog.delete_source_check = Gtk.CheckButton(
-            label="Move selected source files to Trash after successful installation"
-        )
-        dialog.delete_source_check.set_tooltip_text(
-            "Files are moved to your desktop Trash only after a successful install. "
-            "Failed installs leave their source files untouched."
-        )
-        dialog.delete_source_check.set_sensitive(False)        
-        dialog.flatpakref_paths = []
-        dialog._setting_file_entry = False
-        # Status
-        dialog.status_label = Gtk.Label(label="")
-        dialog.status_label.add_css_class("dim-label")
-        dialog.status_label.set_wrap(True)
-        dialog.status_label.set_xalign(0.0)
-
-        # Layout
-        mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        mode_box.append(dialog.mode_id_button)
-        mode_box.append(dialog.mode_ref_button)
-
-        id_label = Gtk.Label(label="Flatpak app ID or Flathub app page URL:")
-        id_label.set_xalign(0.0)
-        dialog.id_label = id_label
-
-        dialog.id_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        dialog.id_box.append(id_label)
-        dialog.id_box.append(dialog.id_entry)
-
-        dialog.batch_expander = Gtk.Expander(label="Install multiple apps")
-        batch_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        batch_hint = Gtk.Label(
-            label="Paste one Flatpak app ID or Flathub app page URL per line."
-        )
-        batch_hint.set_xalign(0.0)
-        batch_hint.set_wrap(True)
-        batch_hint.add_css_class("dim-label")
-        batch_box.append(batch_hint)
-
-        dialog.batch_text_view = Gtk.TextView()
-        dialog.batch_text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        dialog.batch_text_view.set_monospace(True)
-        dialog.batch_text_view.set_left_margin(8)
-        dialog.batch_text_view.set_right_margin(8)
-        dialog.batch_text_view.set_top_margin(6)
-        dialog.batch_text_view.set_bottom_margin(6)
-
-        batch_scroller = Gtk.ScrolledWindow()
-        batch_scroller.set_policy(
-            Gtk.PolicyType.AUTOMATIC,
-            Gtk.PolicyType.AUTOMATIC,
-        )
-        batch_scroller.set_min_content_height(100)
-        batch_scroller.set_max_content_height(150)
-        batch_scroller.set_child(dialog.batch_text_view)
-
-        batch_frame = Gtk.Frame()
-        batch_frame.set_child(batch_scroller)
-        batch_box.append(batch_frame)
-
-        dialog.batch_status_label = Gtk.Label(label="")
-        dialog.batch_status_label.set_xalign(0.0)
-        dialog.batch_status_label.set_wrap(True)
-        dialog.batch_status_label.add_css_class("dim-label")
-        batch_box.append(dialog.batch_status_label)
-
-        dialog.batch_expander.set_child(batch_box)
-        dialog.id_box.append(dialog.batch_expander)
-
-        ref_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        ref_row.append(dialog.file_entry)
-        ref_row.append(browse_button)
-
-        dialog.ref_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        file_hint = Gtk.Label(
-            label=(
-                "Select or drop .deb, .flatpakref, and/or .AppImage files. "
-                "AppImages are copied into your user applications folder."
-            )
-        )
-        file_hint.set_xalign(0.0)
-        file_hint.add_css_class("dim-label")
-        dialog.ref_box.append(file_hint)
-        dialog.ref_box.append(ref_row)
-        dialog.ref_box.append(dialog.delete_source_check)
-
-        content.append(mode_box)
-        content.append(dialog.id_box)
-        content.append(dialog.ref_box)
-        content.append(dialog.user_check)
-        content.append(dialog.status_label)
-
-        dialog.mode_id_button.connect(
-            "toggled",
-            self.on_flatpak_install_mode_changed,
-            dialog,
-        )
-
-        dialog.user_check.connect(
-            "toggled",
-            self.on_flatpak_install_state_changed,
-            dialog,
-        )
-
-        dialog.id_entry.connect(
-            "changed",
-            self.on_flatpak_install_state_changed,
-            dialog,
-        )
-
-        dialog.batch_text_view.get_buffer().connect(
-            "changed",
-            self.on_flatpak_batch_text_changed,
-            dialog,
-        )
-
-        dialog.batch_expander.connect(
-            "notify::expanded",
-            self.on_flatpak_batch_expander_changed,
-            dialog,
-        )
-
-        dialog.file_entry.connect(
-            "changed",
-            self.on_flatpak_install_state_changed,
-            dialog,
-        )
-
-        self._add_file_drop_target(dialog, self.on_installer_files_dropped, dialog)
-
-        dialog.connect("response", self.on_flatpak_install_response)
-
-        if initial_paths:
-            self._set_installer_dialog_paths(dialog, initial_paths)
-            dialog.mode_ref_button.set_active(True)
-
-        self.update_flatpak_install_dialog_state(dialog)
-        dialog.present()
+        dialog.present(self)
 
     def _add_file_drop_target(self, widget, callback, *user_data):
         if not hasattr(Gtk, "DropTarget") or not hasattr(Gdk, "FileList"):
@@ -2094,16 +1927,13 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.add_flatpak_button.set_sensitive(False)
         dialog.install_button.set_sensitive(False)
 
-        thread = threading.Thread(
-            target=self.add_flathub_remote_worker,
-            args=(
-                dialog,
-                user_install,
+        run_async(
+            lambda: self.add_flathub_remote_worker(dialog, user_install),
+            on_error=lambda error: self._worker_failed(
+                "Flathub remote setup", error
             ),
-            daemon=True,
+            name="add-flathub",
         )
-
-        thread.start()
 
     def add_flathub_remote_worker(self, dialog, user_install):
         success, message = add_flathub_remote(user_install)
@@ -2166,6 +1996,14 @@ class MainWindow(Adw.ApplicationWindow):
                 def callback(fd, result):
                     try:
                         files_model = fd.open_multiple_finish(result)
+                    except GLib.Error as error:
+                        # U6: cancelling the file chooser is not an error.
+                        if error.domain == "gtk-dialog-error-quark" and error.code in (
+                            0,
+                            1,
+                        ):
+                            return
+                        return
                     except Exception:
                         return
 
@@ -2254,24 +2092,21 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             label = Path(value).name
 
-        self.install_progress_window = InstallProgressWindow(self, "Installing Flatpak")
-        self.install_progress_window.present()
-
-        self.install_progress_window.start_pulse()
+        self.install_progress_window = TaskProgressDialog(
+            self, "Installing Flatpak"
+        )
+        self.install_progress_window.present(self)
         self.install_progress_window.set_status(f"Installing {label}…")
 
-        thread = threading.Thread(
-            target=self.flatpak_install_worker,
-            args=(
-                source_type,
-                value,
-                user_install,
-                delete_source,
+        run_async(
+            lambda: self.flatpak_install_worker(
+                source_type, value, user_install, delete_source
             ),
-            daemon=True,
+            on_error=lambda error: self._worker_failed(
+                "Flatpak installation", error
+            ),
+            name="flatpak-install",
         )
-
-        thread.start()
 
     def flatpak_install_worker(self, source_type, value, user_install, delete_source):
         def output_callback(line):
@@ -2320,22 +2155,24 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def start_flatpak_app_id_batch_install(self, app_ids, user_install):
-        self.install_progress_window = InstallProgressWindow(
+        self.install_progress_window = TaskProgressDialog(
             self,
             "Installing Flatpak apps",
         )
-        self.install_progress_window.present()
-        self.install_progress_window.start_pulse()
+        self.install_progress_window.present(self)
         self.install_progress_window.set_status(
             f"Installing {len(app_ids)} Flatpak app(s)…"
         )
 
-        thread = threading.Thread(
-            target=self.flatpak_app_id_batch_install_worker,
-            args=(app_ids, user_install),
-            daemon=True,
+        run_async(
+            lambda: self.flatpak_app_id_batch_install_worker(
+                app_ids, user_install
+            ),
+            on_error=lambda error: self._worker_failed(
+                "Flatpak installation", error
+            ),
+            name="flatpak-batch",
         )
-        thread.start()
 
     def flatpak_app_id_batch_install_worker(self, app_ids, user_install):
         def output_callback(line):
@@ -2374,7 +2211,7 @@ class MainWindow(Adw.ApplicationWindow):
                 self.install_progress_window.finish_batch_results(message)
 
         return False
-        
+
     # ------------------------------------------------------------
     # Flatpak .flatpakref batch installation
     # ------------------------------------------------------------
@@ -2419,7 +2256,7 @@ class MainWindow(Adw.ApplicationWindow):
             provider.load_from_string(css)
         except AttributeError:
             provider.load_from_data(css.encode(), len(css.encode()))
-            
+
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(),
             provider,
@@ -2542,7 +2379,7 @@ class MainWindow(Adw.ApplicationWindow):
                 pass
 
 
-        
+
     def on_sidebar_toggle_btn_toggled(self, button):
         if hasattr(self, "sidebar_revealer"):
             self.sidebar_revealer.set_reveal_child(button.get_active())
@@ -2645,10 +2482,13 @@ class MainWindow(Adw.ApplicationWindow):
     def on_check_appector_updates(self):
         self.action_check_appector_updates.set_enabled(False)
         self.show_toast("Checking for Appector updates…")
-        threading.Thread(
-            target=self._check_appector_updates_worker,
-            daemon=True,
-        ).start()
+        run_async(
+            self._check_appector_updates_worker,
+            on_error=lambda error: self._worker_failed(
+                "Appector update check", error
+            ),
+            name="appector-update-check",
+        )
 
     def _check_appector_updates_worker(self):
         try:
@@ -2797,21 +2637,22 @@ class MainWindow(Adw.ApplicationWindow):
         content_box.set_margin_bottom(12)
         content_box.set_margin_start(12)
         content_box.set_margin_end(12)
-        
+
         # 1. Search
         self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_hexpand(True)
         self.search_entry.set_placeholder_text("Search apps")
         _set_accessible_label(self.search_entry, "Search installed apps")
         self.search_entry.connect("search-changed", self.on_search_changed)
         content_box.append(self.search_entry)
-        
+
         # 2. FILTER
         filter_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         filter_label = Gtk.Label(label="FILTER")
         filter_label.add_css_class("sidebar-group-label")
         filter_label.set_xalign(0.0)
         filter_box.append(filter_label)
-        
+
         self.marked_only_toggle = Gtk.ToggleButton(label="Marked only")
         self.marked_only_toggle.set_tooltip_text(
             "Show only apps marked for removal"
@@ -2866,22 +2707,39 @@ class MainWindow(Adw.ApplicationWindow):
             scope_row.append(self.scope_buttons[scope])
         scope_row.add_css_class("linked")
 
-        # Filters first, then the scope selector under its own heading.
+        # U9: per-manager filter chips; counts refresh with every scan.
+        manager_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        manager_label = Gtk.Label(label="PACKAGE SOURCE")
+        manager_label.add_css_class("sidebar-group-label")
+        manager_label.set_xalign(0.0)
+        manager_box.append(manager_label)
+
+        self.manager_filter_buttons = {}
+        self.active_manager_filters = set()
+        for manager in ("APT", "Snap", "Flatpak", "AppImage", "Manual", "Leftover"):
+            chip = Gtk.ToggleButton(label=f"{manager} (0)")
+            chip.set_focusable(False)
+            chip.set_tooltip_text(f"Show only {manager} items")
+            chip.connect("toggled", self.on_manager_filter_toggled, manager)
+            self.manager_filter_buttons[manager] = chip
+            manager_box.append(chip)
+
         content_box.append(filter_box)
+        content_box.append(manager_box)
         scope_holder.append(scope_label)
         scope_holder.append(scope_row)
         content_box.append(scope_holder)
-        
+
         # 4. SELECTION
         selection_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         selection_label = Gtk.Label(label="SELECTION")
         selection_label.add_css_class("sidebar-group-label")
         selection_label.set_xalign(0.0)
         selection_box.append(selection_label)
-        
+
         selection_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         selection_btns.set_homogeneous(True)
-        
+
         self.mark_all_button = Gtk.Button(
             label="Mark all",
             icon_name="list-add-symbolic",
@@ -2899,37 +2757,40 @@ class MainWindow(Adw.ApplicationWindow):
         self.clear_all_marks_button.set_action_name("win.clear-marks")
         self.clear_all_marks_button.set_tooltip_text("Remove every mark")
         selection_btns.append(self.clear_all_marks_button)
-        
+
         selection_box.append(selection_btns)
         content_box.append(selection_box)
-        
+
         scrolled.set_child(content_box)
         sidebar_box.append(scrolled)
-        
+
         revealer = Gtk.Revealer()
         revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
         revealer.set_reveal_child(True)
         revealer.set_child(sidebar_box)
-        
+
         return revealer
-        
+
     # ------------------------------------------------------------
     # APT residual configuration cleanup
     # ------------------------------------------------------------
 
     def on_leftover_cleanup_clicked(self, button=None):
-        self.progress_window = ProgressWindow(
+        self.progress_window = TaskProgressDialog(
             self,
             "Checking leftover APT configurations",
         )
-        self.progress_window.present()
+        self.progress_window.present(self)
         self.progress_window.start_indeterminate(
             "Checking for removed packages with remaining configuration files…"
         )
-        threading.Thread(
-            target=self.leftover_cleanup_preview_worker,
-            daemon=True,
-        ).start()
+        run_async(
+            self.leftover_cleanup_preview_worker,
+            on_error=lambda error: self._worker_failed(
+                "leftover configuration check", error
+            ),
+            name="leftover-preview",
+        )
 
     def leftover_cleanup_preview_worker(self):
         try:
@@ -2982,7 +2843,6 @@ class MainWindow(Adw.ApplicationWindow):
             len(conffile_details.get(app.package_id) or [])
             for app in leftovers
         )
-        size_estimate = get_removal_size_estimate(leftovers)
         critical = [
             app.package_id
             for app in leftovers
@@ -3046,11 +2906,13 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _confirm_leftover_purge(self, leftovers, conffile_details=None):
-        """Final confirmation for a specific set of residual packages.
+        """U1/U2: residual-purge confirmation on the plan dialog.
 
-        Runs on the GTK main thread, so the synchronous size estimate and
-        APT simulation can block briefly. Kept synchronous to guarantee the
-        preview reflects the exact selection at confirmation time.
+        The APT simulation and the size estimate run in a worker behind a
+        progress dialog (they used to block the GTK thread); the plan
+        dialog then shows the full package list, the conffile count, and
+        the simulation output — with Purge disabled until everything
+        loaded, and not offered at all when the simulation is blocked.
         """
         conffile_details = conffile_details or {}
         package_ids = [
@@ -3059,6 +2921,49 @@ class MainWindow(Adw.ApplicationWindow):
         if not package_ids:
             return
 
+        def work():
+            try:
+                sim_success, sim_output, sim_purged = simulate_leftover_purge(
+                    package_ids
+                )
+            except Exception as error:
+                sim_success, sim_output, sim_purged = False, str(error), []
+            try:
+                estimate = get_removal_size_estimate(leftovers)
+            except Exception as error:
+                estimate = f"Estimated space to be freed: unavailable ({error})"
+            return sim_success, sim_output, sim_purged, estimate
+
+        progress = TaskProgressDialog(
+            self, "Simulating the purge"
+        )
+        progress.present(self)
+        progress.set_status(
+            "Simulating the APT purge (no changes are made)…"
+        )
+
+        def on_ready(result):
+            progress.close()
+            sim_success, sim_output, _sim_purged, estimate = result
+            self._show_leftover_purge_plan(
+                leftovers, package_ids, conffile_details,
+                sim_success, sim_output, estimate,
+            )
+
+        run_async(
+            work,
+            on_done=on_ready,
+            on_error=lambda error: self._worker_failed(
+                "purge simulation", error
+            ),
+            name="leftover-simulation",
+        )
+
+    def _show_leftover_purge_plan(
+        self, leftovers, package_ids, conffile_details,
+        sim_success, sim_output, estimate,
+    ):
+        """Present the residual-purge plan (U1)."""
         total_conffiles = sum(
             len(conffile_details.get(package_id) or [])
             for package_id in package_ids
@@ -3070,63 +2975,69 @@ class MainWindow(Adw.ApplicationWindow):
         except Exception:
             existing_backups = 0
 
-        lines = [
+        warnings = []
+        if critical:
+            warnings.append(
+                "System packages selected — their saved customizations will "
+                "be deleted (a backup is still made): "
+                + ", ".join(critical[:15])
+            )
+
+        notes = [
             "These packages are already removed; only their configuration "
             "files remain.",
-            "Appector backs up dpkg-registered conffiles to "
-            "~/.local/state/app-manager/purge-backups before purging, and "
-            "aborts if any file cannot be backed up safely. Only the newest "
-            "10 backups are kept. This is a recovery copy, not an automatic "
-            "restore.",
+            "Appector backs up dpkg-registered conffiles (as root) before "
+            "purging, and aborts if any file cannot be backed up safely. "
+            "Only the newest 10 backups are kept. This is a recovery copy, "
+            "not an automatic restore.",
             "Maintainer purge scripts may remove files beyond the conffiles "
-            "listed below; review the APT simulation.",
-            "",
-            f"Selected: {len(package_ids)} package(s), "
-            f"{total_conffiles} conffile(s)",
+            "listed; review the simulation output.",
             f"Existing purge backups: {existing_backups}",
-            "",
-            get_removal_size_estimate(leftovers),
-            "",
         ]
 
-        if critical:
-            lines.extend([
-                "System packages selected — their saved customizations will be "
-                "deleted (a backup is still made):",
-                "",
-                *[f"• {name}" for name in critical[:10]],
-                "",
-            ])
+        files_to_delete = []
+        for package_id in package_ids:
+            files_to_delete.extend(conffile_details.get(package_id) or [])
 
-        lines.append("Packages to purge:")
-        lines.append("")
-        lines.extend(f"• {package_id}" for package_id in package_ids[:40])
-        if len(package_ids) > 40:
-            lines.append(f"• …and {len(package_ids) - 40} more")
+        # The simulation is the authoritative preview — show its output as
+        # part of the plan (selectable, scrollable, never a hidden surprise).
+        simulation_text = (sim_output or "").strip()
+        if simulation_text:
+            shown = simulation_text[:1200]
+            if len(simulation_text) > 1200:
+                shown += "\n…(truncated; the full output is in the activity log)"
+            notes.append("APT purge simulation (no changes made):\n" + shown)
 
-        try:
-            sim_success, sim_output, _sim_purged = simulate_leftover_purge(
-                package_ids
-            )
-        except Exception as error:
-            sim_success, sim_output = False, str(error)
-
-        lines.extend([
-            "",
-            "APT purge simulation (no changes made):"
-            if sim_success
-            else "APT purge simulation unavailable; purging is blocked:",
-            "",
-            (sim_output or "No details.")[:2500],
-        ])
-
-        self._show_confirm_dialog(
+        dialog = ConfirmPlanDialog(
+            self,
             f"Purge {len(package_ids)} leftover APT configuration(s)?",
-            "\n".join(lines),
-            "Purge",
-            self.start_purge_leftovers,
-            leftovers,
+            heading=(
+                f"{len(package_ids)} package(s), {total_conffiles} "
+                "dpkg-registered conffile(s). The simulation below shows "
+                "exactly what apt would do; no changes have been made."
+            ),
+            selected=package_ids,
+            files_to_delete=files_to_delete or None,
+            warnings=warnings or None,
+            notes=notes,
+            confirm_label="Purge",
+            destructive=True,
+            on_confirm=lambda: self.start_purge_leftovers(leftovers),
         )
+        dialog.set_disk_estimate(estimate)
+
+        if not sim_success:
+            # Purging is blocked: the dialog explains why without offering
+            # a Purge button, and the reason is recorded.
+            dialog.set_blocked(
+                "The APT simulation failed; purging is blocked."
+            )
+            _log_action(
+                "LEFTOVER_PURGE_SIMULATION_BLOCKED "
+                f"output={simulation_text[:400]}"
+            )
+
+        dialog.present(self)
 
     def show_leftover_purge_select(self, leftovers, conffile_details=None):
         """Show a selection dialog for residual packages before purging.
@@ -3228,18 +3139,22 @@ class MainWindow(Adw.ApplicationWindow):
             return
 
         # Show progress while checking preview
-        self.progress_window = ProgressWindow(self, "Checking orphaned packages")
-        self.progress_window.present()
+        self.progress_window = TaskProgressDialog(
+            self, "Checking orphaned packages"
+        )
+        self.progress_window.present(self)
         self.progress_window.start_indeterminate("Checking for orphaned packages…")
 
-        thread = threading.Thread(
-            target=self.autoremove_preview_worker,
-            daemon=True,
+        run_async(
+            self.autoremove_preview_worker,
+            on_error=lambda error: self._worker_failed(
+                "autoremove check", error
+            ),
+            name="autoremove-preview",
         )
-        thread.start()
 
     def autoremove_preview_worker(self):
-        success, packages, space_freed, raw_output = get_apt_autoremove_preview()
+        success, packages, space_freed, raw_output, plan = get_apt_autoremove_preview()
 
         GLib.idle_add(
             self.on_autoremove_preview_finished,
@@ -3247,9 +3162,10 @@ class MainWindow(Adw.ApplicationWindow):
             packages,
             space_freed,
             raw_output,
+            plan,
         )
 
-    def on_autoremove_preview_finished(self, success, packages, space_freed, raw_output):
+    def on_autoremove_preview_finished(self, success, packages, space_freed, raw_output, plan=None):
         if self.progress_window:
             self.progress_window.close_window()
             self.progress_window = None
@@ -3289,19 +3205,25 @@ class MainWindow(Adw.ApplicationWindow):
         message = "\n".join(lines)
 
         title = f"Remove {len(packages)} orphaned packages?"
-        
+
         def do_autoremove():
-            self.install_progress_window = InstallProgressWindow(self, "Removing orphaned packages")
-            self.install_progress_window.present()
-            self.install_progress_window.start_pulse()
+            self.install_progress_window = TaskProgressDialog(
+                self, "Removing orphaned packages"
+            )
+            self.install_progress_window.present(self)
             self.install_progress_window.set_status("Removing orphaned packages…")
-            thread = threading.Thread(target=self.autoremove_worker, daemon=True)
-            thread.start()
+            run_async(
+                lambda: self.autoremove_worker(plan),
+                on_error=lambda error: self._worker_failed(
+                    "autoremove", error
+                ),
+                name="autoremove",
+            )
 
         self._show_confirm_dialog(title, message, "Remove", do_autoremove)
         return False
 
-    def autoremove_worker(self):
+    def autoremove_worker(self, plan=None):
         def output_callback(line):
             if self.install_progress_window:
                 GLib.idle_add(
@@ -3311,6 +3233,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         success, message = execute_apt_autoremove(
             output_callback=output_callback,
+            plan=plan,
         )
 
         GLib.idle_add(
@@ -3351,15 +3274,21 @@ class MainWindow(Adw.ApplicationWindow):
             return
 
         # Show progress while checking
-        self.progress_window = ProgressWindow(self, "Checking Flatpak runtimes")
-        self.progress_window.present()
-        self.progress_window.start_indeterminate("Checking for unused Flatpak runtimes…")
-
-        thread = threading.Thread(
-            target=self.flatpak_cleanup_preview_worker,
-            daemon=True,
+        self.progress_window = TaskProgressDialog(
+            self, "Checking Flatpak runtimes"
         )
-        thread.start()
+        self.progress_window.present(self)
+        self.progress_window.start_indeterminate(
+            "Checking for unused Flatpak runtimes…"
+        )
+
+        run_async(
+            self.flatpak_cleanup_preview_worker,
+            on_error=lambda error: self._worker_failed(
+                "Flatpak runtime check", error
+            ),
+            name="flatpak-cleanup-preview",
+        )
 
     def flatpak_cleanup_preview_worker(self):
         success, preview_text, raw_output = get_flatpak_unused_preview()
@@ -3395,14 +3324,22 @@ class MainWindow(Adw.ApplicationWindow):
         message = "Flatpak identified these unused runtimes for removal:\n\n" + preview_text
 
         title = "Remove unused Flatpak runtimes?"
-        
+
         def do_cleanup():
-            self.install_progress_window = InstallProgressWindow(self, "Cleaning Flatpak runtimes")
-            self.install_progress_window.present()
-            self.install_progress_window.start_pulse()
-            self.install_progress_window.set_status("Removing unused Flatpak runtimes…")
-            thread = threading.Thread(target=self.flatpak_cleanup_worker, daemon=True)
-            thread.start()
+            self.install_progress_window = TaskProgressDialog(
+                self, "Cleaning Flatpak runtimes"
+            )
+            self.install_progress_window.present(self)
+            self.install_progress_window.set_status(
+                "Removing unused Flatpak runtimes…"
+            )
+            run_async(
+                self.flatpak_cleanup_worker,
+                on_error=lambda error: self._worker_failed(
+                    "Flatpak cleanup", error
+                ),
+                name="flatpak-cleanup",
+            )
 
         self._show_confirm_dialog(title, message, "Clean Up", do_cleanup)
         return False
@@ -3980,10 +3917,10 @@ class MainWindow(Adw.ApplicationWindow):
         label = list_item.get_child()
         if item is None or label is None:
             return
-            
+
         manager = getattr(item, "manager", "")
         label.set_label(manager)
-        
+
         # Reset classes
         for cls in [
             "manager-apt",
@@ -3994,14 +3931,20 @@ class MainWindow(Adw.ApplicationWindow):
             "manager-leftover",
         ]:
             label.remove_css_class(cls)
-            
+
         # Apply specific tint
-        if manager == "APT": label.add_css_class("manager-apt")
-        elif manager == "Snap": label.add_css_class("manager-snap")
-        elif manager == "Flatpak": label.add_css_class("manager-flatpak")
-        elif manager == "AppImage": label.add_css_class("manager-appimage")
-        elif manager == "Manual": label.add_css_class("manager-manual")
-        elif manager == "Leftover": label.add_css_class("manager-leftover")
+        if manager == "APT":
+            label.add_css_class("manager-apt")
+        elif manager == "Snap":
+            label.add_css_class("manager-snap")
+        elif manager == "Flatpak":
+            label.add_css_class("manager-flatpak")
+        elif manager == "AppImage":
+            label.add_css_class("manager-appimage")
+        elif manager == "Manual":
+            label.add_css_class("manager-manual")
+        elif manager == "Leftover":
+            label.add_css_class("manager-leftover")
     def on_setup_cell(self, factory, list_item):
         label = Gtk.Label()
         label.set_xalign(0.0)
@@ -4017,7 +3960,7 @@ class MainWindow(Adw.ApplicationWindow):
             return
 
         value = getattr(item, prop, "")
-        
+
         if prop == "installed_at":
             if not value:
                 value = "—"
@@ -4028,9 +3971,9 @@ class MainWindow(Adw.ApplicationWindow):
             value = "-"
         elif prop == "marked_label" and not value:
             value = ""
-            
+
         label.set_label(str(value))
-        
+
         # Add tooltips for truncated cells
         if prop in ("source", "version"):
             label.set_tooltip_text(str(value) if value and value != "-" and value != "—" else "")
@@ -4284,6 +4227,13 @@ class MainWindow(Adw.ApplicationWindow):
         if self.duplicates_only and not getattr(item, "is_duplicate", False):
             return False
 
+        # U9: manager filter chips (APT / Snap / Flatpak / AppImage /
+        # Manual / Leftover). An empty selection shows every manager.
+        active_managers = getattr(self, "active_manager_filters", None)
+        if active_managers:
+            if str(getattr(item, "manager", "")) not in active_managers:
+                return False
+
         if self.search_text:
             haystack = f"{item.name} {item.source} {item.manager} {item.package_id}".lower()
             if self.search_text.lower() not in haystack:
@@ -4291,17 +4241,63 @@ class MainWindow(Adw.ApplicationWindow):
 
         return True
 
+    def _focus_is_editable(self):
+        """True when keyboard focus sits in a text entry (U5)."""
+        try:
+            focus = self.get_focus()
+        except Exception:
+            return False
+        try:
+            return isinstance(focus, Gtk.Editable)
+        except Exception:
+            return False
+
     def on_search_changed(self, entry):
+        """U8: debounce the refilter so typing stays smooth on long lists."""
         self.search_text = entry.get_text().strip()
-        self.custom_filter.changed(Gtk.FilterChange.DIFFERENT)
+
+        pending = getattr(self, "_search_debounce_id", None)
+        if pending is not None:
+            GLib.source_remove(pending)
+
+        def apply_filter():
+            self._search_debounce_id = None
+            self.custom_filter.changed(Gtk.FilterChange.DIFFERENT)
+            return False
+
+        self._search_debounce_id = GLib.timeout_add(250, apply_filter)
 
     def on_marked_only_toggled(self, button):
         self.marked_only = button.get_active()
         self.custom_filter.changed(Gtk.FilterChange.DIFFERENT)
-        
+
     def on_duplicates_only_toggled(self, button):
         self.duplicates_only = button.get_active()
         self.custom_filter.changed(Gtk.FilterChange.DIFFERENT)
+
+    def on_manager_filter_toggled(self, button, manager):
+        """U9: a manager chip filters the list to that package source."""
+        if button.get_active():
+            self.active_manager_filters.add(manager)
+        else:
+            self.active_manager_filters.discard(manager)
+        self.custom_filter.changed(Gtk.FilterChange.DIFFERENT)
+        self.update_empty_state()
+
+    def refresh_manager_chip_counts(self):
+        """U9: keep the chip labels in sync with the scanned list."""
+        counts = {}
+        for app in getattr(self, "current_apps", []):
+            manager = str(getattr(app, "manager", "") or "?")
+            counts[manager] = counts.get(manager, 0) + 1
+        for manager, chip in getattr(
+            self, "manager_filter_buttons", {}
+        ).items():
+            try:
+                chip.set_label(f"{manager} ({counts.get(manager, 0)})")
+                chip.set_sensitive(counts.get(manager, 0) > 0)
+            except Exception:
+                continue
 
     # ------------------------------------------------------------
     # Sorting
@@ -4322,7 +4318,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         if item:
             details_window = DetailsWindow(self, item)
-            details_window.present()
+            details_window.present(self)
 
     # ------------------------------------------------------------
     # Context menu
@@ -4428,7 +4424,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         if item:
             details_window = DetailsWindow(self, item)
-            details_window.present()
+            details_window.present(self)
 
     def on_action_mark_selected(self, action, param):
         items = self.get_selected_items()
@@ -4519,32 +4515,85 @@ class MainWindow(Adw.ApplicationWindow):
         self.reload_button.set_sensitive(False)
         self.window_title.set_subtitle("Scanning…")
 
-        thread = threading.Thread(target=self.scan_worker, daemon=True)
-        thread.start()
+        run_async(
+            self.scan_worker,
+            on_error=lambda error: self._worker_failed("scan", error),
+            name="scan",
+        )
 
     def reload(self):
         self.on_reload_clicked(self.reload_button)
 
     def scan_worker(self):
-        apps = scan_all()
-        GLib.idle_add(self.populate_apps, apps)
+        result = scan_all()
+        GLib.idle_add(self.populate_apps, result.apps, result.source_status)
 
-    def populate_apps(self, apps):
+    def populate_apps(self, apps, source_status=None):
+        # Keep the last per-source scan status for the UI (F6/U8).
+        self.scan_source_status = list(source_status or [])
         present_keys = {app_key(app) for app in apps}
-        self.marked_keys.intersection_update(present_keys)
+        # Prune staged marks only for sources that scanned successfully:
+        # a transient snap list failure must not silently erase the user's
+        # Snap marks (F6).
+        failed_sources = {
+            source.split(" ")[0]
+            for source, status, _message in self.scan_source_status
+            if status != "ok"
+        }
+        def _manager_failed(app):
+            manager = str(getattr(app, "manager", ""))
+            if manager == "Leftover":
+                return "APT" in failed_sources
+            return manager in failed_sources
+
+        previously_marked = {
+            key: app for key, app in (
+                (app_key(app), app) for app in getattr(self, "current_apps", [])
+            ) if key in self.marked_keys
+        }
+        self.marked_keys.intersection_update(
+            present_keys
+            | {
+                key for key, app in previously_marked.items()
+                if _manager_failed(app)
+            }
+        )
         self.save_marked_keys()
-        
+
         self.current_apps = apps
         self.detect_duplicates()
         self.rebuild_list()
-        
+
         self.window_title.set_subtitle(f"{len(apps)} apps detected")
         self.reload_button.set_sensitive(True)
+        self._update_scan_banner()
+        self.refresh_manager_chip_counts()
         return False
 
     def rebuild_list(self):
-        self.list_store.remove_all()
+        """Rebuild the list model without losing selection or scroll (U8).
 
+        `Gio.ListStore.splice` swaps the whole model in one step instead of
+        remove_all + append (no flicker, no empty state flash), then the
+        previously selected entries are re-selected by identity and the
+        scroll position is restored proportionally.
+        """
+        selected_keys = {app_key(item) for item in self.get_selected_items()}
+
+        scroll_fractions = {}
+        for view_name in ("column_scrolled", "grid_scrolled"):
+            view = getattr(self, view_name, None)
+            if view is None:
+                continue
+            try:
+                adjustment = view.get_vadjustment()
+                upper = adjustment.get_upper()
+                if upper > 0:
+                    scroll_fractions[view_name] = adjustment.get_value() / upper
+            except Exception:
+                continue
+
+        items = []
         for app in self.current_apps:
             item = AppItem(app)
             key = app_key(app)
@@ -4553,15 +4602,95 @@ class MainWindow(Adw.ApplicationWindow):
                 item.marked = True
                 item.marked_label = "✓"
 
-            self.list_store.append(item)
+            items.append(item)
+
+        try:
+            self.list_store.splice(0, self.list_store.get_n_items(), items)
+        except (AttributeError, TypeError):
+            # Very old libadwaita stacks: fall back to the clear rebuild.
+            self.list_store.remove_all()
+            for item in items:
+                self.list_store.append(item)
 
         self.custom_filter.changed(Gtk.FilterChange.DIFFERENT)
+
+        # Restore selection by identity: positions changed with the model.
+        if selected_keys:
+            for position in range(self.sort_model.get_n_items()):
+                item = self.sort_model.get_item(position)
+                if item is not None and app_key(item) in selected_keys:
+                    try:
+                        self.selection.select_item(position, False)
+                    except Exception:
+                        break
+
+        if scroll_fractions:
+
+            def _restore_scroll():
+                for view_name, fraction in scroll_fractions.items():
+                    view = getattr(self, view_name, None)
+                    if view is None:
+                        continue
+                    try:
+                        adjustment = view.get_vadjustment()
+                        adjustment.set_value(fraction * adjustment.get_upper())
+                    except Exception:
+                        continue
+                return False
+
+            GLib.idle_add(_restore_scroll)
 
         self.update_marked_ui()
         self.update_selection_ui()
 
     def detect_duplicates(self):
         mark_duplicate_apps(self.current_apps)
+
+    def _update_scan_banner(self):
+        """F6/U8: surface per-source scan problems instead of a short count."""
+        banner = getattr(self, "scan_banner", None)
+        if banner is None:
+            return
+        statuses = getattr(self, "scan_source_status", [])
+        failed = [source for source, status, _m in statuses if status == "failed"]
+        missing = [source for source, status, _m in statuses
+                   if status == "tool-missing"]
+        if not failed and not missing:
+            banner.set_revealed(False)
+            return
+        parts = []
+        if failed:
+            parts.append("failed: " + ", ".join(failed))
+        if missing:
+            parts.append("not installed: " + ", ".join(missing))
+        banner.set_title(
+            "Some sources could not be scanned ("
+            + "; ".join(parts)
+            + ")."
+        )
+        banner.set_revealed(True)
+
+    def on_scan_banner_details(self, *_args):
+        statuses = getattr(self, "scan_source_status", [])
+        if not statuses:
+            return
+        lines = []
+        for source, status, message in statuses:
+            if status == "ok":
+                continue
+            label = {
+                "failed": "failed",
+                "tool-missing": "not installed",
+            }.get(status, status)
+            detail = f"\n• {source}: {label}"
+            if message:
+                detail += f"\n  {message}"
+            lines.append(detail)
+        self.show_message(
+            "Scan report",
+            "Every source reports how it went:\n" + "\n".join(lines),
+            Gtk.MessageType.WARNING,
+        )
 
     # ------------------------------------------------------------
     # Mark persistence
@@ -4784,6 +4913,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.clear_all_marks()
 
     def mark_all_visible(self):
+        if self._focus_is_editable():
+            return
         visible_items = [
             item for item in self.get_visible_items()
             if can_remove(item)
@@ -4895,22 +5026,23 @@ class MainWindow(Adw.ApplicationWindow):
             if getattr(app, "package_id", "")
         ]
 
-        self.install_progress_window = InstallProgressWindow(
+        self.install_progress_window = TaskProgressDialog(
             self,
             "Purging leftovers",
         )
 
-        self.install_progress_window.present()
-        self.install_progress_window.start_pulse()
-        self.install_progress_window.set_status("Purging leftover configuration packages…")
-
-        thread = threading.Thread(
-            target=self.purge_leftover_worker,
-            args=(package_ids,),
-            daemon=True,
+        self.install_progress_window.present(self)
+        self.install_progress_window.set_status(
+            "Purging leftover configuration packages…"
         )
 
-        thread.start()
+        run_async(
+            lambda: self.purge_leftover_worker(package_ids),
+            on_error=lambda error: self._worker_failed(
+                "leftover purge", error
+            ),
+            name="purge-leftovers",
+        )
 
     def purge_leftover_worker(self, package_ids):
         def output_callback(line):
@@ -4933,7 +5065,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def on_purge_leftovers_finished(self, success, message):
         if self.install_progress_window:
-            self.install_progress_window.stop_pulse()
+            self.install_progress_window.stop_pulse()  # compat no-op
 
             if success:
                 self.install_progress_window.finish_batch_results(message)
@@ -5032,6 +5164,10 @@ class MainWindow(Adw.ApplicationWindow):
     # ------------------------------------------------------------
 
     def on_remove_marked_clicked(self, button=None):
+        # U5: accelerators are evaluated in the capture phase, so the
+        # keyboard shortcut must not fire while the user is editing text.
+        if self._focus_is_editable():
+            return
         marked_entries = self.get_marked_entries()
         removable = [app for app in marked_entries if can_remove(app)]
 
@@ -5045,192 +5181,179 @@ class MainWindow(Adw.ApplicationWindow):
         )
 
         if has_apt:
-            self.progress_window = ProgressWindow(self, "Preparing removal")
-            self.progress_window.present()
-            self.progress_window.start_indeterminate("Checking APT dependencies…")
-
-            thread = threading.Thread(
-                target=self.apt_batch_prepare_worker,
-                args=(removable,),
-                daemon=True,
+            self.progress_window = TaskProgressDialog(
+                self, "Preparing removal"
             )
-            thread.start()
+            self.progress_window.present(self)
+            self.progress_window.start_indeterminate(
+                "Checking APT dependencies…"
+            )
+
+            run_async(
+                lambda: self.apt_batch_prepare_worker(removable),
+                on_error=lambda error: self._worker_failed(
+                    "APT dependency check", error
+                ),
+                name="apt-prepare",
+            )
         else:
             self.show_batch_confirm(removable, None)
 
     def show_batch_confirm(self, removable, apt_preview):
+        """U1: the batch confirmation is a scrollable plan dialog.
+
+        The dependency cascade ("also removed") is never truncated, the
+        buttons can never fall off-screen, and the disk estimate is computed
+        by a worker (U2) instead of blocking the GTK thread.
+        """
         marked_entries = self.get_marked_entries()
         skipped = [app for app in marked_entries if not can_remove(app)]
 
-        lines = []
+        selected = [f"{app.name} ({getattr(app, 'manager', '')})" for app in removable]
+        if len(selected) > 50:
+            selected = [*selected[:50], f"…and {len(removable) - 50} more"]
 
-        lines.append("The following apps will be removed:")
-        lines.append("")
-
-        for app in removable[:20]:
-            lines.append(f"• {app.name} — {app.manager}")
-
-        if len(removable) > 20:
-            lines.append(f"• …and {len(removable) - 20} more")
-
-        if skipped:
-            lines.append("")
-            lines.append("Skipped items:")
-            lines.append("")
-
-            for app in skipped[:10]:
-                lines.append(f"• {app.name} — {app.manager}")
-
-            if len(skipped) > 10:
-                lines.append(f"• …and {len(skipped) - 10} more")
-
+        # The full cascade, never truncated — this is the part that
+        # protects the user.
+        also_removed = None
         if apt_preview:
-            blocked = apt_preview.get("blocked", [])
+            also_removed = apt_preview.get("removed_packages") or None
 
-            if blocked:
-                lines.append("")
-                lines.append("APT blocked/skipped:")
-                lines.append("")
+        warnings = list(apt_preview.get("warnings", [])) if apt_preview else []
+        if skipped:
+            warnings.append(
+                f"{len(skipped)} marked item(s) were skipped by the safety policy."
+            )
 
-                for name, reason in blocked[:10]:
-                    lines.append(f"• {name}: {reason}")
+        # Exact file paths for Manual/AppImage deletions.
+        files_to_delete = []
+        for app in removable:
+            if getattr(app, "manager", "") in {"Manual", "AppImage"}:
+                paths = getattr(app, "removal_paths", None) or []
+                if isinstance(paths, str):
+                    paths = paths.splitlines()
+                files_to_delete.extend(str(p) for p in paths)
 
-                if len(blocked) > 10:
-                    lines.append(f"• …and {len(blocked) - 10} more")
-
-            preview_text = apt_preview.get("preview", "")
-
-            if preview_text:
-                lines.append("")
-
-                if apt_preview.get("apt_ok"):
-                    lines.append("APT dependency preview:")
-                else:
-                    lines.append("APT warning:")
-
-                lines.append("")
-                lines.append(self._shorten_text(preview_text))
-
-            warnings = apt_preview.get("warnings", [])
-
-            if warnings:
-                lines.append("")
-                lines.append("Warnings:")
-
-                for warning in warnings:
-                    lines.append(f"• {warning}")
-                    
-        risk_warnings = []
-
-        for app in removable[:50]:
+        risk_rows = []
+        for app in removable:
             try:
-                risk, reason = get_removal_risk(app)
+                risk, _reason = get_removal_risk(app)
             except Exception:
-                risk, reason = "normal", ""
+                risk = "normal"
+            risk_rows.append((getattr(app, "name", "?"), risk))
 
-            if risk == "high" and reason:
-                risk_warnings.append(f"• {app.name} — {reason}")
-
-        if risk_warnings:
-            lines.append("")
-            lines.append("High-risk items detected:")
-            lines.append("")
-
-            lines.extend(risk_warnings[:20])
-
-            if len(risk_warnings) > 20:
-                lines.append(f"• …and {len(risk_warnings) - 20} more")
-
+        notes = []
         if any(getattr(app, "manager", "") == "APT" for app in removable):
-            lines.append("")
-            lines.append(
-                  "Safety reminder: For APT changes, consider creating a Timeshift "
-                "or system snapshot before continuing."
-             )
-        apt_package_ids = (
-            apt_preview.get("removed_packages", [])
-            if apt_preview
-            else []
-        )
-        lines.append("")
-        lines.append(
-            get_removal_size_estimate(removable, apt_package_ids=apt_package_ids)
-        )
-        message = "\n".join(lines)
-        
-        
+            notes.append(
+                "Safety reminder: for APT changes, consider creating a "
+                "Timeshift or system snapshot before continuing."
+            )
 
-
-        dialog = Gtk.MessageDialog(
-            transient_for=self,
-            modal=True,
-        )
-        dialog.set_resizable(False)
-        dialog.set_property("message-type", Gtk.MessageType.WARNING)
-        dialog.set_property("text", f"Remove {len(removable)} marked apps?")
-        dialog.set_property("secondary-text", message)
-
+        # Purge choice as a proper child widget (U4), not an attribute
+        # bolted onto the dialog object.
+        extra_widget = None
         has_apt = any(getattr(app, "manager", "") == "APT" for app in removable)
+        purge_holder = {}
         if has_apt:
-            content_area = dialog.get_content_area()
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             purge_check = Gtk.CheckButton(
-                label="Purge APT configuration files (private backup first)"
+                label="Purge APT configuration files (backup made as root first)"
             )
             purge_check.set_tooltip_text(
-                "Appector backs up dpkg-registered configuration files before "
-                "purging. If a file cannot be safely backed up, APT removal will "
-                "not run. The backup is retained in your private Appector state."
+                "The helper backs up dpkg-registered configuration files "
+                "before purging; if a file cannot be safely backed up, the "
+                "purge does not run. The backup is kept in your private "
+                "Appector state."
             )
-            content_area.append(purge_check)
             purge_note = Gtk.Label(
                 label=(
-                    "A private copy is kept in "
-                    "~/.local/state/app-manager/purge-backups. If any affected "
-                    "configuration file cannot be safely copied, the purge is "
-                    "cancelled. This backup does not automatically restore files."
+                    "A copy is kept under your Appector state directory "
+                    "(purge-backups). If any affected configuration file "
+                    "cannot be safely copied, the purge is cancelled. This "
+                    "backup does not automatically restore files."
                 )
             )
             purge_note.set_xalign(0)
             purge_note.set_wrap(True)
             purge_note.add_css_class("dim-label")
-            content_area.append(purge_note)
-            dialog.purge_check = purge_check
+            box.append(purge_check)
+            box.append(purge_note)
+            extra_widget = box
+            purge_holder["check"] = purge_check
 
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        remove_button = dialog.add_button("Remove", Gtk.ResponseType.OK)
-        remove_button.add_css_class("destructive-action")
-        
-        # Ensure Cancel is the default and Enter doesn't accidentally trigger removal
-        dialog.set_default_response(Gtk.ResponseType.CANCEL)
-        
-        dialog.connect("response", self.on_confirm_batch_response, removable)
-        dialog.present()
+        apt_package_ids = (
+            apt_preview.get("removed_packages", []) if apt_preview else []
+        )
 
-    def on_confirm_batch_response(self, dialog, response, removable):
+        def on_confirm():
+            purge = bool(
+                purge_holder.get("check") and purge_holder["check"].get_active()
+            )
+            self.start_batch_removal(removable, purge, apt_preview)
+
+        dialog = ConfirmPlanDialog(
+            self,
+            f"Remove {len(removable)} marked apps?",
+            heading=(
+                "Review the plan below. The list of additional packages is "
+                "complete — scroll it, and copy any part of it."
+            ),
+            selected=selected,
+            also_removed=also_removed,
+            files_to_delete=files_to_delete or None,
+            warnings=warnings or None,
+            risk_rows=risk_rows,
+            notes=notes or None,
+            confirm_label="Remove",
+            destructive=True,
+            on_confirm=on_confirm,
+            extra_widget=extra_widget,
+        )
+        # U2: the size estimate runs in a worker; the dialog starts with a
+        # spinner and a disabled confirm button until the estimate lands.
+        dialog.set_disk_estimate_async(
+            lambda: get_removal_size_estimate(
+                removable, apt_package_ids=apt_package_ids
+            )
+        )
+        dialog.present(self)
+
+    def start_batch_removal(self, removable, purge, apt_preview):
+        """Continuation of the confirmed batch plan."""
+        self.remove_marked_button.set_sensitive(False)
+
+        self._batch_cancel = CancelToken()
+        self.install_progress_window = TaskProgressDialog(
+            self,
+            "Removing apps",
+            cancel_token=self._batch_cancel,
+        )
+        self.install_progress_window.present(self)
+        self.install_progress_window.set_status("Preparing removal…")
+
+        apt_plan = apt_preview.get("plan") if apt_preview else None
+        run_async(
+            lambda: self.batch_worker(removable, purge, apt_plan),
+            on_error=lambda error: self._worker_failed("removal", error),
+            name="batch-removal",
+        )
+
+    def on_confirm_batch_response(self, dialog, response, removable, apt_plan=None):
+        """Legacy dialog response path; delegates to the shared start."""
         dialog.close()
 
         if response != Gtk.ResponseType.OK:
             return
 
-        # Read purge checkbox state
         purge = False
         if hasattr(dialog, "purge_check"):
             purge = dialog.purge_check.get_active()
 
-        self.remove_marked_button.set_sensitive(False)
-
-        self.install_progress_window = InstallProgressWindow(self, "Removing apps")
-        self.install_progress_window.present()
-        self.install_progress_window.start_pulse()
-        self.install_progress_window.set_status("Preparing removal…")
-
-        thread = threading.Thread(
-            target=self.batch_worker,
-            args=(removable, purge),
-            daemon=True,
+        self.start_batch_removal(
+            removable, purge, {"plan": apt_plan} if apt_plan else None
         )
-        thread.start()
-    def batch_worker(self, apps, purge=False):
+
+    def batch_worker(self, apps, purge=False, apt_plan=None):
         def progress_callback(current, total, message):
             if self.install_progress_window:
                 line = f"[{current}/{total}] {message}"
@@ -5247,12 +5370,13 @@ class MainWindow(Adw.ApplicationWindow):
             apps,
             progress_callback=progress_callback,
             purge=purge,
+            apt_plan=apt_plan,
         )
 
         GLib.idle_add(self.on_batch_finished, results, summary)
-        
+
     def on_batch_finished(self, results, summary):
-        for app, success, message in results:
+        for app, success, _message in results:
             if success:
                 self.marked_keys.discard(app_key(app))
 
@@ -5321,7 +5445,7 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.connect("response", lambda d, response: d.close())
 
         dialog.present()
-        
+
     def _show_confirm_dialog(self, title, message, confirm_label, on_confirm_callback, *callback_args):
         if hasattr(Adw, "AlertDialog"):
             dialog = Adw.AlertDialog.new(title, message)
@@ -5330,11 +5454,11 @@ class MainWindow(Adw.ApplicationWindow):
             dialog.set_response_appearance("confirm", Adw.ResponseAppearance.DESTRUCTIVE)
             dialog.set_default_response("cancel")
             dialog.set_close_response("cancel")
-            
+
             def on_response(d, response):
                 if response == "confirm":
                     on_confirm_callback(*callback_args)
-                    
+
             dialog.connect("response", on_response)
             dialog.present(self)
         else:
@@ -5349,10 +5473,10 @@ class MainWindow(Adw.ApplicationWindow):
             confirm_btn = dialog.add_button(confirm_label, Gtk.ResponseType.OK)
             confirm_btn.add_css_class("destructive-action")
             dialog.set_default_response(Gtk.ResponseType.CANCEL)
-            
+
             def on_response(d, response):
                 if response == Gtk.ResponseType.OK:
                     on_confirm_callback(*callback_args)
-                    
+
             dialog.connect("response", on_response)
             dialog.present()

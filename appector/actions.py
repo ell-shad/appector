@@ -1,6 +1,4 @@
 import hashlib
-import json
-import logging
 import os
 import re
 import shlex
@@ -8,37 +6,66 @@ import shutil
 import stat
 import subprocess
 import tempfile
-import threading
-from datetime import datetime
 from email.parser import Parser
 from pathlib import Path
-from uuid import uuid4
-from urllib.parse import urlsplit
 
 from ._proc import (
     _log_action,
-    _run_command,
     _run_command_raw,
     _run_command_stream,
 )
+from . import helper_client
+from .helper_client import HelperUnavailable
+from .paths import appimage_dir, legacy_appimage_dir
+from .plans import (
+    Plan,
+    check_apt_removal_plan,
+    check_apt_upgrade_plan,
+)
 from .policy import (
     APT_MAX_REMOVALS,
-    BATCH_REMOVABLE_MANAGERS,
     SINGLE_REMOVABLE_MANAGERS,
     _base_package_name,
-    _deduplicate_package_ids,
+    _format_package_list,
     _is_safe_package_id,
-    _normalize_package_id,
-    _split_safe_package_ids,
+    _parse_apt_simulation_removed_packages,
     can_remove,
     can_remove_single,
-    get_removal_risk,
     is_blocked,
     is_critical_apt_package_name,
 )
+# Flatpak surface moved to managers/flatpak.py (ADR-0002 next step);
+# re-exported here so existing callers and tests keep working.
+from .managers.flatpak import (  # noqa: F401
+    get_flatpak_remotes,
+    flathub_remote_exists,
+    add_flathub_remote,
+    install_flatpak_app_id,
+    parse_flatpak_app_inputs,
+    install_flatpak_app_id_batch,
+    extract_flathub_app_id,
+    parse_flatpakref_file,
+    flatpakref_https_ok,
+    flatpakref_review_text,
+    install_flatpak_ref_file,
+    install_flatpak_source,
+    get_flatpak_unused_preview,
+    execute_flatpak_unused_cleanup,
+)
+from .managers.flatpak import (  # noqa: F401
+    _flatpak_install_command,
+    _flatpak_is_installed,
+    _flatpak_output_is_already_installed,
+    _format_flatpak_batch_summary,
+    _install_flatpak_location,
+)
+from .managers.flatpak import (  # noqa: F401
+    FLATPAK_PROMPT_RE,
+    FLATHUB_REMOTE_NAME,
+    FLATPAKREF_REVIEW_FIELDS,
+)
 from .residual import (
     CONFFILE_LINE_RE,
-    _backup_residual_conffiles,
     _purge_backup_note,
 )
 
@@ -341,6 +368,37 @@ def _desktop_entry_value(value):
     return f'"{escaped}"'
 
 
+# AppImage type magic (F9): bytes 8-11 hold the ASCII type marker; the
+# older code only checked the ELF magic, so any ELF executable renamed to
+# .AppImage was accepted and installed as a launcher.
+APPIMAGE_HEADER_SIZE = 512
+APPIMAGE_TYPE_MAGIC = {
+    b"\x01": "AppImage type 1",
+    b"\x02": "AppImage type 2",
+}
+
+
+def _validate_appimage_header(header: bytes):
+    """(ok, reason) for the first bytes of an AppImage file."""
+    if len(header) < 12 or header[:4] != b"\x7fELF":
+        return False, "File is not a valid ELF AppImage"
+    marker = header[8:9]
+    if marker not in APPIMAGE_TYPE_MAGIC:
+        return (
+            False,
+            "File is an ELF binary but not a type 1 or type 2 AppImage",
+        )
+    return True, ""
+
+
+def appimage_missing_fuse_hint() -> str:
+    """F9: how to run an AppImage when libfuse is unavailable."""
+    return (
+        "If the app fails to launch with a FUSE error, either install "
+        "libfuse2 or run it with --appimage-extract-and-run."
+    )
+
+
 def install_appimage(path, delete_source=False):
     """Copy an AppImage into the per-user app directory and add a launcher."""
     source = Path(path).expanduser()
@@ -351,17 +409,30 @@ def install_appimage(path, delete_source=False):
 
     try:
         with source.open("rb") as appimage_file:
-            if appimage_file.read(4) != b"\x7fELF":
-                return False, f"File is not a valid ELF AppImage: {source.name}"
+            header = appimage_file.read(APPIMAGE_HEADER_SIZE)
+            _ok, reason = _validate_appimage_header(header)
+            if not _ok:
+                return False, f"{reason}: {source.name}"
+            # F9: the identity is the *content* hash — two different
+            # AppImages that share a file name are different installs.
+            digest_source = hashlib.sha256()
+            appimage_file.seek(0)
+            for chunk in iter(lambda: appimage_file.read(1024 * 1024), b""):
+                digest_source.update(chunk)
+            content_hash = digest_source.hexdigest()
     except OSError as error:
         return False, f"Could not read AppImage {source}: {error}"
 
     slug = re.sub(r"[^A-Za-z0-9_-]+", "-", source.stem).strip("-") or "appimage"
-    app_dir = Path.home() / ".local/share/app-manager/appimages"
+    app_dir = appimage_dir()
     desktop_dir = Path.home() / ".local/share/applications"
     try:
         resolved_source = source.resolve(strict=True)
-        if resolved_source.is_relative_to(app_dir.resolve()):
+        if any(
+            resolved_source.is_relative_to(root.resolve())
+            for root in (app_dir, legacy_appimage_dir())
+            if root.exists()
+        ):
             for existing_desktop in desktop_dir.glob("app-manager-appimage-*.desktop"):
                 try:
                     existing_content = existing_desktop.read_text(encoding="utf-8")
@@ -378,7 +449,7 @@ def install_appimage(path, delete_source=False):
     if "\n" in str(app_dir) or "\n" in str(desktop_dir):
         return False, "AppImage installation paths cannot contain newline characters."
 
-    digest = hashlib.sha256(str(resolved_source).encode("utf-8")).hexdigest()[:10]
+    digest = content_hash[:10]
     installed_image = app_dir / f"{slug}-{digest}.AppImage"
     desktop_file = desktop_dir / f"app-manager-appimage-{slug}-{digest}.desktop"
 
@@ -398,7 +469,18 @@ def install_appimage(path, delete_source=False):
     try:
         app_dir.mkdir(parents=True, exist_ok=True)
         desktop_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, installed_image)
+        # F9: install atomically — a half-written AppImage must never be
+        # left behind (or launched) if the copy fails midway.
+        temp_image = app_dir / f".{installed_image.name}.part"
+        try:
+            with source.open("rb") as source_file, temp_image.open("wb") as target:
+                shutil.copyfileobj(source_file, target, 1024 * 1024)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temp_image, installed_image)
+        except OSError:
+            temp_image.unlink(missing_ok=True)
+            raise
         installed_image.chmod(0o755)
 
         display_name = "".join(
@@ -422,7 +504,16 @@ def install_appimage(path, delete_source=False):
                 "",
             ]
         )
-        desktop_file.write_text(desktop_content, encoding="utf-8")
+        temp_desktop = desktop_dir / f".{desktop_file.name}.part"
+        try:
+            with temp_desktop.open("w", encoding="utf-8") as launcher_file:
+                launcher_file.write(desktop_content)
+                launcher_file.flush()
+                os.fsync(launcher_file.fileno())
+            os.replace(temp_desktop, desktop_file)
+        except OSError:
+            temp_desktop.unlink(missing_ok=True)
+            raise
         desktop_file.chmod(0o644)
     except OSError as error:
         try:
@@ -479,7 +570,7 @@ def install_appimage_batch(paths, output_callback=None, delete_source=False):
 
     lines = [
         f"Installed ({len(installed)}): " + (", ".join(installed) if installed else "none"),
-        "Already installed ({}): ".format(len(already_installed))
+        f"Already installed ({len(already_installed)}): "
         + (", ".join(already_installed) if already_installed else "none"),
         f"Failed ({len(failures)}): " + ("; ".join(failures) if failures else "none"),
     ]
@@ -498,11 +589,40 @@ def check_available_updates():
     successful_checks = 0
 
     apt_command = shutil.which("apt")
+    apt_get_command = shutil.which("apt-get")
     if apt_command:
+        # F12: refresh the package lists first, so the result is not the
+        # stale cache (the old flow told the user to run apt update).
+        if apt_get_command:
+            _run_command_raw(
+                [apt_get_command, "update"],
+                timeout=300,
+                env_overrides={"LC_ALL": "C"},
+                uses_apt=True,
+            )
+            # Needrestart (if installed) reports which services need a
+            # restart after the coming upgrades; surfaced as a note.
+            try:
+                needrestart = shutil.which("needrestart")
+                if needrestart:
+                    _rc, nr_output = _run_command_raw(
+                        [needrestart, "-b"],
+                        timeout=90,
+                        env_overrides={"LC_ALL": "C", "NEEDRESTART_MODE": "l"},
+                    )
+                    for line in nr_output.splitlines():
+                        if line.startswith("NEEDRESTART-SVC") or line.startswith(
+                            "NEEDRESTART-KSTA"
+                        ):
+                            notes.append(f"needrestart: {line.strip()}")
+                            break
+            except Exception:
+                pass
         returncode, output = _run_command_raw(
             [apt_command, "list", "--upgradable"],
             timeout=90,
             env_overrides={"LC_ALL": "C"},
+            uses_apt=True,
         )
         if returncode == 0:
             successful_checks += 1
@@ -624,6 +744,20 @@ def check_available_updates():
         "AppImages and manual installations are not checked; they do not share a "
         "standard update source or command.",
     ))
+    # F12: a pending reboot requirement belongs in the update report.
+    if Path("/var/run/reboot-required").exists():
+        reboot_note = "A system restart is required to complete recent updates."
+        try:
+            hint = Path("/var/run/reboot-required.pkgs").read_text(
+                encoding="utf-8", errors="replace"
+            ).strip()
+        except OSError:
+            hint = ""
+        if hint:
+            reboot_note += "\nAffected: " + ", ".join(
+                sorted({line.strip() for line in hint.splitlines() if line.strip()})[:15]
+            )
+        notes.append(reboot_note)
     return successful_checks > 0, {
         "updates": updates,
         "checks": checks,
@@ -632,8 +766,91 @@ def check_available_updates():
     }
 
 
+def prepare_available_updates(updates):
+    """Group selected updates per manager and preview the APT transaction (S4).
+
+    Returns (plans, errors). The APT group is simulated now; an upgrade that
+    would REMOVE anything is refused before it can run.
+    """
+    grouped = {}
+    for update in updates or []:
+        manager = update.get("manager")
+        scope = update.get("scope")
+        package_id = str(update.get("id", ""))
+        if manager == "APT" and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+.:_-]*", package_id):
+            group = ("APT", None)
+        elif manager == "Flatpak" and scope in {"user", "system"} and re.fullmatch(
+            r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+",
+            package_id,
+        ):
+            group = ("Flatpak", scope)
+        elif manager == "Snap" and re.fullmatch(r"[a-z0-9][a-z0-9-]*", package_id):
+            group = ("Snap", None)
+        else:
+            continue
+        grouped.setdefault(group, set()).add(package_id)
+
+    plans = []
+    errors = []
+
+    apt_ids = sorted(grouped.get(("APT", None), set()))
+    if apt_ids:
+        apt_get_command = shutil.which("apt-get")
+        if not apt_get_command:
+            errors.append("APT: apt-get is not available.")
+        else:
+            returncode, output = _run_command_raw(
+                [
+                    apt_get_command,
+                    "--simulate",
+                    "install",
+                    "--only-upgrade",
+                    "--",
+                    *apt_ids,
+                ],
+                timeout=180,
+                env_overrides={"LC_ALL": "C"},
+                uses_apt=True,
+            )
+            if returncode != 0:
+                errors.append(f"APT: the upgrade simulation failed.\n{output}")
+            else:
+                simulated_removed = _parse_apt_simulation_removed_packages(output)
+                upgrade_ok, upgrade_message = check_apt_upgrade_plan(
+                    simulated_removed
+                )
+                if not upgrade_ok:
+                    errors.append(f"APT: {upgrade_message}")
+                else:
+                    plans.append(Plan(
+                        action="apt-upgrade",
+                        package_ids=apt_ids,
+                        removed_preview=[],
+                    ))
+
+    for (manager, scope), ids in sorted(grouped.items()):
+        if manager == "APT":
+            continue
+        plans.append(Plan(
+            action=f"{manager.lower()}-update",
+            package_ids=sorted(ids),
+            removed_preview=[],
+        ) if manager != "Flatpak" else Plan(
+            action="flatpak-update",
+            package_ids=sorted(ids),
+            removed_preview=[],
+        ))
+        _ = scope
+
+    return plans, errors
+
+
 def execute_available_updates(updates, output_callback=None):
-    """Install selected updates using each package manager's native updater."""
+    """Install selected updates using each package manager's native updater.
+
+    S4: the APT group is re-simulated immediately before running and must
+    contain no removals ("an update must not remove packages").
+    """
     grouped = {}
     for update in updates or []:
         manager = update.get("manager")
@@ -655,6 +872,11 @@ def execute_available_updates(updates, output_callback=None):
     if not grouped:
         return False, "No valid updates were selected."
 
+    # S4: preview the APT upgrade transaction and refuse removals.
+    _plans, prepare_errors = prepare_available_updates(updates)
+    if prepare_errors:
+        return False, "\n".join(prepare_errors)
+
     results = []
     failures = []
     manager_order = {"APT": 0, "Flatpak": 1, "Snap": 2}
@@ -671,6 +893,29 @@ def execute_available_updates(updates, output_callback=None):
             command = shutil.which("apt-get")
             if not command:
                 failures.append("APT: apt-get is not available.")
+                continue
+            # S4: re-simulate immediately before the privileged run; an
+            # update transaction that would remove anything is refused.
+            sim_rc, sim_output = _run_command_raw(
+                [
+                    command,
+                    "--simulate",
+                    "install",
+                    "--only-upgrade",
+                    "--",
+                    *package_ids,
+                ],
+                timeout=180,
+                env_overrides={"LC_ALL": "C"},
+                uses_apt=True,
+            )
+            if sim_rc != 0:
+                failures.append(f"APT: upgrade simulation failed.\n{sim_output}")
+                continue
+            simulated_removed = _parse_apt_simulation_removed_packages(sim_output)
+            upgrade_ok, upgrade_message = check_apt_upgrade_plan(simulated_removed)
+            if not upgrade_ok:
+                failures.append(f"APT: {upgrade_message}")
                 continue
             cmd = [command, "install", "--only-upgrade", "-y", "--", *package_ids]
         elif manager == "Flatpak":
@@ -692,19 +937,33 @@ def execute_available_updates(updates, output_callback=None):
                 continue
             cmd = [command, "refresh", "--", *package_ids]
 
-        if (manager == "APT" or manager == "Snap" or scope == "system") and os.geteuid() != 0:
-            pkexec_command = shutil.which("pkexec")
-            if not pkexec_command:
-                failures.append(
-                    f"{manager}: pkexec is required to update system packages."
-                )
-                continue
-            cmd.insert(0, pkexec_command)
-
         title = f"{manager}{f' ({scope})' if scope else ''}"
         if output_callback:
             output_callback(f"Updating {title}: {', '.join(package_ids)}")
-        success, output = _run_command_stream(cmd, output_callback)
+        if manager == "APT" or (manager == "Flatpak" and scope == "system"):
+            # S5/S6: privileged updates go through the named helper action.
+            try:
+                if manager == "APT":
+                    result = helper_client.apt_upgrade(
+                        package_ids,
+                        plan=Plan(
+                            action="apt-upgrade",
+                            package_ids=package_ids,
+                            removed_preview=[],
+                        ),
+                        output_callback=output_callback,
+                    )
+                else:
+                    result = helper_client.flatpak_update_system(
+                        package_ids, output_callback=output_callback
+                    )
+            except (HelperUnavailable, OSError) as error:
+                failures.append(f"{title}: {error}")
+                continue
+            success, output = result.ok, result.message
+        else:
+            success, output = _run_command_stream(cmd, output_callback)
+            output = output if output else ""
         if success:
             results.append(f"{title}: updated {len(package_ids)} item(s).")
         else:
@@ -727,6 +986,7 @@ class DebInstallReview:
         hashes,
         simulation,
         summary,
+        package_records=None,
     ):
         self._temporary_directory = temporary_directory
         self.original_paths = original_paths
@@ -734,7 +994,20 @@ class DebInstallReview:
         self.hashes = hashes
         self.simulation = simulation
         self.summary = summary
+        # F13/U10: structured per-package facts (fields, maintainer
+        # scripts, setuid files, /etc and /etc/apt paths, systemd units)
+        # consumed by the structured review dialog.
+        self.package_records = list(package_records or [])
         self._closed = False
+
+    @property
+    def all_warnings(self):
+        """Flattened security warnings across every staged package."""
+        warnings = []
+        for record in self.package_records:
+            for warning in record.get("warnings", []):
+                warnings.append(f"{record.get('name', '?')}: {warning}")
+        return warnings
 
     def close(self):
         if self._closed:
@@ -760,7 +1033,6 @@ class DebInstallReview:
         if not missing:
             return
 
-        scratch = Path(self._temporary_directory.name)
         for index in missing:
             original = self.original_paths[index]
             expected = self.hashes[index]
@@ -814,7 +1086,7 @@ class DebInstallReview:
 
     def trash_unchanged_sources(self):
         results = []
-        for path, expected_hash in zip(self.original_paths, self.hashes):
+        for path, expected_hash in zip(self.original_paths, self.hashes, strict=True):
             digest = hashlib.sha256()
             try:
                 source_fd = os.open(
@@ -866,6 +1138,135 @@ def _deb_review_scratch_dir():
     return root
 
 
+
+# ---------------------------------------------------------------------------
+# Structured review facts (F13/U10)
+# ---------------------------------------------------------------------------
+
+# Members of a .deb's control archive that run with root privileges or
+# otherwise change system behaviour beyond unpacking files.
+MAINTAINER_SCRIPT_NAMES = (
+    "preinst", "postinst", "prerm", "postrm", "config", "triggers",
+)
+
+_REVIEW_CONTENTS_TIMEOUT = 60
+
+
+def _dpkg_deb_control_members(dpkg_deb, path, timeout=_REVIEW_CONTENTS_TIMEOUT):
+    """Names of the control-archive members (./postinst, ./conffiles, ...)."""
+    import subprocess as _subprocess
+
+    try:
+        control_tar = _subprocess.run(
+            [dpkg_deb, "--ctrl-tarfile", str(path)],
+            capture_output=True,
+            timeout=timeout,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, _subprocess.TimeoutExpired):
+        return []
+    if control_tar.returncode != 0:
+        return []
+    try:
+        listing = _subprocess.run(
+            ["tar", "-t"],
+            input=control_tar.stdout,
+            capture_output=True,
+            timeout=timeout,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, _subprocess.TimeoutExpired):
+        return []
+    if listing.returncode != 0:
+        return []
+    members = []
+    for line in listing.stdout.decode("utf-8", errors="replace").splitlines():
+        name = line.strip().lstrip("./").strip()
+        if name:
+            members.append(name)
+    return members
+
+
+def _dpkg_deb_contents(dpkg_deb, path, timeout=_REVIEW_CONTENTS_TIMEOUT):
+    """(mode, path) pairs of the data archive, from `dpkg-deb --contents`."""
+    try:
+        result = subprocess.run(
+            [dpkg_deb, "--contents", str(path)],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    entries = []
+    # Lines look like:
+    # -rwsr-xr-x root/root 123 2024-01-01 00:00 ./usr/bin/tool
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 5)
+        if len(parts) < 6 or not line.startswith("-"):
+            continue
+        mode = parts[0]
+        entry_path = parts[5].strip()
+        if entry_path.startswith("./"):
+            entry_path = entry_path[2:]
+        entries.append((mode, entry_path))
+    return entries
+
+
+def _security_findings(modes_and_paths):
+    """Security-relevant facts about a package's data files (F13)."""
+    setuid_files = []
+    etc_files = []
+    apt_config_files = []
+    systemd_units = []
+    for mode, entry_path in modes_and_paths:
+        if entry_path.endswith("/"):
+            continue
+        permissions = mode[1:10]
+        if "s" in permissions or "S" in permissions:
+            setuid_files.append(entry_path)
+        if entry_path.startswith("etc/") and not entry_path.endswith("/"):
+            etc_files.append(entry_path)
+            if entry_path.startswith("etc/apt/"):
+                apt_config_files.append(entry_path)
+        if entry_path.startswith("lib/systemd/system/") or entry_path.startswith(
+            "usr/lib/systemd/system/"
+        ):
+            systemd_units.append(entry_path)
+
+    warnings = []
+    if setuid_files:
+        warnings.append(
+            "Installs setuid/setgid programs (run with elevated privileges "
+            "regardless of who starts them): " + ", ".join(setuid_files[:10])
+        )
+    if apt_config_files:
+        warnings.append(
+            "Adds files under /etc/apt (package sources, preferences or "
+            "authentication could be altered): " + ", ".join(apt_config_files[:10])
+        )
+    if etc_files and len(etc_files) > 10:
+        warnings.append(
+            f"Adds {len(etc_files)} configuration files under /etc."
+        )
+    if systemd_units:
+        warnings.append(
+            "Installs systemd units (background services or timers will be "
+            "registered): " + ", ".join(systemd_units[:10])
+        )
+    return {
+        "setuid_files": setuid_files,
+        "etc_files": etc_files,
+        "apt_config_files": apt_config_files,
+        "systemd_units": systemd_units,
+        "warnings": warnings,
+    }
+
+
 def review_deb_batch(paths):
     """Stage local packages, inspect metadata and simulate their APT transaction."""
     if not paths:
@@ -901,6 +1302,7 @@ def review_deb_batch(paths):
     staged_paths = []
     hashes = []
     package_summaries = []
+    package_records = []
 
     def fail(message):
         temporary_directory.cleanup()
@@ -974,6 +1376,30 @@ def review_deb_batch(paths):
 
         staged_paths.append(staged_path)
         hashes.append(digest.hexdigest())
+        control_members = _dpkg_deb_control_members(dpkg_deb, staged_path)
+        maintainer_scripts = sorted(
+            name for name in control_members
+            if name in MAINTAINER_SCRIPT_NAMES or name.startswith("triggers")
+        )
+        conffiles = []
+        if "conffiles" in control_members:
+            try:
+                conf_status, conf_listing = _run_command_raw(
+                    [dpkg_deb, "--info", str(staged_path), "conffiles"],
+                    timeout=30,
+                    env_overrides={"LC_ALL": "C"},
+                )
+                if conf_status == 0:
+                    conffiles = [
+                        line.strip().lstrip("/")
+                        for line in conf_listing.splitlines()
+                        if line.strip() and not line.startswith(" ")
+                    ]
+            except OSError:
+                conffiles = []
+        findings = _security_findings(
+            _dpkg_deb_contents(dpkg_deb, staged_path)
+        )
         fields = (
             ("Package", package_name),
             ("Version", version),
@@ -995,6 +1421,29 @@ def review_deb_batch(paths):
             f"\nFile size: {staged_size} bytes"
             f"\nSHA-256: {digest.hexdigest()}"
         )
+        record = {
+            "filename": source.name,
+            "name": package_name,
+            "version": version,
+            "architecture": architecture,
+            "maintainer": metadata.get("Maintainer", "Not specified").strip(),
+            "description": (description[0] if description else ""),
+            "depends": metadata.get("Depends", "").strip(),
+            "pre_depends": metadata.get("Pre-Depends", "").strip(),
+            "recommends": metadata.get("Recommends", "").strip(),
+            "size": staged_size,
+            "sha256": digest.hexdigest(),
+            "maintainer_scripts": maintainer_scripts,
+            "conffiles": conffiles,
+            **findings,
+        }
+        if maintainer_scripts:
+            record["warnings"].insert(
+                0,
+                "Contains maintainer scripts that run as root during install or "
+                "removal: " + ", ".join(maintainer_scripts),
+            )
+        package_records.append(record)
         package_summaries.append(package_summary)
         try:
             os.chmod(staged_path, 0o400)
@@ -1036,6 +1485,7 @@ def review_deb_batch(paths):
             hashes,
             simulation,
             summary,
+            package_records,
         ),
         "",
     )
@@ -1077,7 +1527,7 @@ def install_deb_batch(
             f"available. No package was installed.\n\n{error}"
         )
 
-    for path, expected_hash in zip(staged_paths, review.hashes):
+    for path, expected_hash in zip(staged_paths, review.hashes, strict=True):
         digest = hashlib.sha256()
         package_fd = None
         try:
@@ -1157,7 +1607,7 @@ def install_deb_batch(
     # Re-hash after the second simulation: the staged files could have been
     # swapped between the first hash check and the simulation above. Checking
     # again here closes the window before the privileged install runs.
-    for path, expected_hash in zip(staged_paths, review.hashes):
+    for path, expected_hash in zip(staged_paths, review.hashes, strict=True):
         digest = hashlib.sha256()
         package_fd = None
         try:
@@ -1185,26 +1635,29 @@ def install_deb_batch(
                 "Review the package again."
             )
 
-    pkexec_command = shutil.which("pkexec")
-    if os.geteuid() != 0 and not pkexec_command:
-        return False, (
-            "pkexec is required to authorize a system-wide Debian package "
-            "installation. Appector itself must not be run as root."
-        )
+    # S1: the privileged install runs through the helper, which copies
+    # each reviewed file into root-owned staging *while hashing it* and
+    # installs only the copies — root never opens a user-writable path
+    # after verification.
+    helper_files = [
+        {"path": str(path), "sha256": expected_hash}
+        for path, expected_hash in zip(staged_paths, review.hashes, strict=True)
+    ]
 
-    cmd = [
-        apt_get_command,
-        "install",
-        "-y",
-        "--",
-    ] + [str(p) for p in deb_paths]
+    _log_action(
+        "DEB_BATCH_INSTALL_START helper=install-deb "
+        f"files={len(helper_files)}"
+    )
 
-    if pkexec_command:
-        cmd = [pkexec_command] + cmd
+    try:
+        result = helper_client.install_deb(helper_files, output_callback)
+    except HelperUnavailable as error:
+        return False, f"{error}"
+    except OSError as error:
+        return False, f"Could not start the privileged installer: {error}"
 
-    _log_action(f"DEB_BATCH_INSTALL_START cmd={shlex.join(cmd)}")
-
-    success, message = _run_command_stream(cmd, output_callback)
+    success = result.ok
+    message = result.message or ("Installed." if success else "Installation failed.")
 
     if success:
         if delete_source:
@@ -1228,6 +1681,7 @@ def install_flatpak_ref_batch(
     user_install: bool = True,
     output_callback=None,
     delete_source: bool = False,
+    reviewed_fields_by_path=None,
 ):
     """
     Installs multiple .flatpakref files sequentially.
@@ -1260,6 +1714,7 @@ def install_flatpak_ref_batch(
             user_install,
             output_callback,
             delete_source,
+            reviewed_fields=(reviewed_fields_by_path or {}).get(str(Path(p).expanduser().absolute())),
         )
 
         if success:
@@ -1331,7 +1786,8 @@ def execute_removal(app):
             else:
                 removal_paths = list(raw_removal_paths)
             allowed_roots = [
-                Path.home() / ".local/share/app-manager/appimages",
+                appimage_dir(),
+                legacy_appimage_dir(),
                 Path.home() / ".local/share/applications",
             ]
             resolved_roots = _resolve_allowed_roots(allowed_roots)
@@ -1367,9 +1823,10 @@ def execute_removal(app):
                 desktop_content = desktop_files[0].read_text(encoding="utf-8")
             except OSError as error:
                 return False, f"Could not verify the AppImage launcher: {error}"
+            desktop_keys = _desktop_key_values(desktop_content)
             if (
-                "X-AppManager-Installed-AppImage=true" not in desktop_content
-                or f"X-AppManager-AppImage-Path={package_id}" not in desktop_content
+                desktop_keys.get("x-appmanager-installed-appimage") != "true"
+                or desktop_keys.get("x-appmanager-appimage-path") != str(package_id)
             ):
                 message = "The launcher does not identify this as an Appector installation."
                 _log_action(f"REMOVE_BLOCKED {key} manager=AppImage reason=unverified-desktop")
@@ -1400,7 +1857,25 @@ def execute_removal(app):
             _log_action(f"REMOVE_SUCCESS {key} manager=AppImage integrated=true")
             return True, message
 
-        path = Path(package_id)
+        # S8: a standalone AppImage is still a file deletion, so it gets
+        # the same allowlist/ownership/regular-file validation as managed
+        # removals instead of unlinking package_id unchecked.
+        allowed_roots = [
+            Path.home() / "Applications",
+            Path.home() / "Downloads",
+            Path("/opt"),
+            Path("/usr/local/bin"),
+        ]
+        resolved_roots = _resolve_allowed_roots(allowed_roots)
+        try:
+            lexical = _validate_removal_file(package_id, allowed_roots, resolved_roots)
+        except OSError as error:
+            _log_action(
+                f"REMOVE_BLOCKED {key} manager=AppImage reason=invalid-path"
+            )
+            return False, str(error)
+
+        path = Path(lexical)
 
         if not path.is_file():
             message = "AppImage file not found."
@@ -1431,6 +1906,11 @@ def execute_removal(app):
             Path.home() / ".local/share/applications",
             Path("/usr/local/share/applications"),
             Path.home() / ".local/bin",
+            Path.home() / ".cargo/bin",
+            Path.home() / "go/bin",
+            Path.home() / ".npm-global/bin",
+            # Retained so launchers created by older versions in this
+            # developer-specific directory can still be removed.
             Path.home() / ".opencode/bin",
             Path.home() / "bin",
             Path.home() / "Applications",
@@ -1494,6 +1974,28 @@ def execute_removal(app):
     return False, message
 
 
+def _desktop_key_values(content: str):
+    """Parse a .desktop file into its [Desktop Entry] key/value pairs (S8).
+
+    Exact per-line parsing instead of substring search, so a launcher for
+    ``x.AppImage`` can no longer satisfy a check for ``x.AppImage.bak``.
+    """
+    keys = {}
+    in_entry = False
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            in_entry = line.lower() == "[desktop entry]"
+            continue
+        if not in_entry or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        keys.setdefault(name.strip().lower(), value.strip())
+    return keys
+
+
 def _manual_removal_paths(app):
     raw_paths = getattr(app, "removal_paths", None)
     if isinstance(raw_paths, str):
@@ -1552,7 +2054,7 @@ def _validate_removal_file(value, allowed_roots, resolved_roots):
     except FileNotFoundError:
         raise OSError(
             f"Manual app file no longer exists or is not a regular file: {value}"
-        )
+        ) from None
 
     is_symlink = stat.S_ISLNK(file_stat.st_mode)
     if not is_symlink and not stat.S_ISREG(file_stat.st_mode):
@@ -1570,15 +2072,30 @@ def _validate_removal_file(value, allowed_roots, resolved_roots):
             f"{value}"
         )
 
-    # Symlinks are deleted by unlinking the link itself; the link already
-    # passed the allowlisted-root check, and its target is never followed.
+    # Symlinks are deleted by unlinking the link itself, but the parent
+    # chain may still be redirected out of the allowlist (S8): resolve the
+    # parent directory and require it to sit inside an allowed root, the
+    # same rule non-symlink targets follow.
     if is_symlink:
-        return str(lexical)
+        try:
+            resolved_parent = lexical.parent.resolve()
+        except (OSError, RuntimeError) as error:
+            raise OSError(
+                f"Could not resolve manual app file {value}: {error}"
+            ) from error
+        for root in resolved_roots:
+            if resolved_parent == root or resolved_parent.is_relative_to(root):
+                return str(lexical)
+        raise OSError(
+            f"Refusing to remove a file outside known manual-install locations: {value}"
+        )
 
     try:
         resolved = lexical.resolve()
     except (OSError, RuntimeError) as error:
-        raise OSError(f"Could not resolve manual app file {value}: {error}")
+        raise OSError(
+            f"Could not resolve manual app file {value}: {error}"
+        ) from error
 
     for root in resolved_roots:
         if not resolved.is_relative_to(root):
@@ -1618,7 +2135,8 @@ def simulate_apt_remove_multiple(package_ids, purge=False):
         "-s",
         apt_action,
         "--",
-    ] + list(package_ids)
+        *list(package_ids),
+    ]
 
     _log_action(f"APT_SIMULATION cmd={shlex.join(cmd)}")
 
@@ -1638,38 +2156,26 @@ def simulate_apt_remove_multiple(package_ids, purge=False):
     return True, output, removed_packages
 
 
-def _parse_apt_simulation_removed_packages(output: str):
-    removed = []
-
-    for line in output.splitlines():
-        if line.startswith(("Remv ", "Purg ")):
-            parts = line.split()
-
-            if len(parts) >= 2:
-                package_name = _base_package_name(parts[1])
-                removed.append(package_name)
-
-    seen = set()
-    unique_removed = []
-
-    for package_name in removed:
-        if package_name not in seen:
-            seen.add(package_name)
-            unique_removed.append(package_name)
-
-    return unique_removed
-
-
 # ------------------------------------------------------------
 # Single APT removal
 # ------------------------------------------------------------
 
 def prepare_apt_removal(app, purge=False):
+    """Preview an APT removal and return the binding plan (S4).
+
+    Returns (success, message, plan, warnings); the plan must be handed to
+    execute_apt_removal, which refuses to run without it or when the
+    re-simulation no longer matches.
+    """
     manager = getattr(app, "manager", "")
     package_id = getattr(app, "package_id", "")
 
     if manager != "APT":
-        return False, "This is not an APT package.", [], ""
+        return False, "This is not an APT package.", None, ""
+    if not can_remove_single(app):
+        return False, "This APT package is blocked by safety policy.", None, ""
+    if not package_id:
+        return False, "APT package ID is missing.", None, ""
 
     if not can_remove_single(app):
         return False, "This APT package is blocked by safety policy.", [], ""
@@ -1684,7 +2190,7 @@ def prepare_apt_removal(app, purge=False):
             "APT simulation failed.\n\n"
             f"{output}"
         )
-        return False, message, removed_packages, ""
+        return False, message, None, ""
 
     removed_base_names = {_base_package_name(p) for p in removed_packages}
     target_name = _base_package_name(package_id)
@@ -1695,7 +2201,7 @@ def prepare_apt_removal(app, purge=False):
             "It may already be removed, held, or not removable by APT.\n\n"
             f"{output}"
         )
-        return False, message, removed_packages, ""
+        return False, message, None, ""
 
     critical_removed = [
         p
@@ -1710,7 +2216,7 @@ def prepare_apt_removal(app, purge=False):
             f"{_format_package_list(critical_removed)}\n\n"
             "This operation will not be allowed from this app."
         )
-        return False, message, removed_packages, ""
+        return False, message, None, ""
 
     if len(removed_packages) > APT_MAX_REMOVALS:
         message = (
@@ -1719,7 +2225,7 @@ def prepare_apt_removal(app, purge=False):
             f"The current safety limit is {APT_MAX_REMOVALS} packages.\n\n"
             "Please review this manually in a terminal."
         )
-        return False, message, removed_packages, ""
+        return False, message, None, ""
 
     warnings = []
 
@@ -1741,10 +2247,21 @@ def prepare_apt_removal(app, purge=False):
         f"{get_removal_size_estimate([], apt_package_ids=removed_packages)}"
     )
 
-    return True, message, removed_packages, "\n".join(warnings)
+    plan = Plan(
+        action="purge" if purge else "remove",
+        package_ids=[package_id],
+        removed_preview=list(removed_packages),
+        text=message,
+    )
+    return True, message, plan, "\n".join(warnings)
 
 
-def execute_apt_removal(app, purge=False):
+def execute_apt_removal(app, purge=False, plan=None):
+    """Execute an APT removal that the user confirmed via `prepare_apt_removal`.
+
+    S4: the confirmed :class:`Plan` is mandatory. The removal is re-simulated
+    and refused when the transaction grew or no longer matches the preview.
+    """
     key = app_key(app)
     manager = getattr(app, "manager", "")
     package_id = getattr(app, "package_id", "")
@@ -1768,80 +2285,38 @@ def execute_apt_removal(app, purge=False):
         _log_action(f"APT_REMOVE_FAILED {key} reason=simulation-failed")
         return False, sim_output
 
-    removed_base_names = {_base_package_name(p) for p in removed_packages}
-    target_name = _base_package_name(package_id)
+    plan_ok, plan_message = check_apt_removal_plan(
+        plan, [package_id], removed_packages
+    )
+    if not plan_ok:
+        _log_action(f"APT_REMOVE_BLOCKED {key} reason=plan-mismatch")
+        return False, plan_message
 
-    if target_name not in removed_base_names:
-        message = (
-            f"APT simulation did not confirm removal of '{package_id}'.\n\n"
-            f"{sim_output}"
+    # S6: the removal runs through the privileged helper, which
+    # re-validates the plan and the policy as root. A purge's conffile
+    # backup is made there too, as root (S9).
+    _log_action(f"APT_REMOVE_START {key} helper=remove-apt purge={purge}")
+
+    try:
+        result = helper_client.remove_apt(
+            [package_id],
+            plan=plan,
+            purge=purge,
+            output_callback=None,
         )
-        _log_action(f"APT_REMOVE_BLOCKED {key} reason=target-not-in-simulation")
-        return False, message
+    except HelperUnavailable as error:
+        return False, f"{error}"
+    except OSError as error:
+        return False, f"Could not start the privileged helper: {error}"
 
-    critical_removed = [
-        p
-        for p in removed_packages
-        if is_critical_apt_package_name(p)
-    ]
-
-    if critical_removed:
-        message = (
-            "Blocked by safety policy.\n\n"
-            "APT simulation says the following critical packages would be removed:\n\n"
-            f"{_format_package_list(critical_removed)}"
-        )
-        _log_action(f"APT_REMOVE_BLOCKED {key} reason=critical-packages")
-        return False, message
-
-    if len(removed_packages) > APT_MAX_REMOVALS:
-        message = (
-            "Blocked by safety policy.\n\n"
-            f"APT simulation says {len(removed_packages)} packages would be removed.\n"
-            f"The current safety limit is {APT_MAX_REMOVALS} packages."
-        )
-        _log_action(f"APT_REMOVE_BLOCKED {key} reason=too-many-packages")
-        return False, message
-
-    apt_get_command = shutil.which("apt-get") or "/usr/bin/apt-get"
-    pkexec_command = shutil.which("pkexec")
+    success = result.ok
+    message = result.message or ("Removed." if success else "Removal failed.")
     backup_note = ""
-    if purge:
-        try:
-            backup_dir, backed_up_count = _backup_residual_conffiles(
-                removed_packages
+    for event in result.events:
+        if event.get("type") == "backup":
+            backup_note = _purge_backup_note(
+                event.get("path"), int(event.get("files", 0) or 0)
             )
-        except OSError as error:
-            _log_action(f"APT_REMOVE_BLOCKED {key} reason=purge-backup-failed")
-            return False, (
-                "Purge was not started because Appector could not securely back "
-                f"up the affected configuration files.\n\n{error}"
-            )
-        backup_note = _purge_backup_note(backup_dir, backed_up_count)
-
-    apt_action = "purge" if purge else "remove"
-
-    if pkexec_command:
-        cmd = [
-            pkexec_command,
-            apt_get_command,
-            apt_action,
-            "-y",
-            "--",
-            package_id,
-        ]
-    else:
-        cmd = [
-            apt_get_command,
-            apt_action,
-            "-y",
-            "--",
-            package_id,
-        ]
-
-    _log_action(f"APT_REMOVE_START {key} cmd={shlex.join(cmd)}")
-
-    success, message = _run_command(cmd)
 
     if success:
         _log_action(f"APT_REMOVE_SUCCESS {key}")
@@ -1896,6 +2371,8 @@ def prepare_apt_batch_preview(apps, purge=False):
         "blocked_keys": set(),
         "removed_packages": [],
         "warnings": [],
+        # S4: the plan binds the confirmed simulation to the execution.
+        "plan": None,
     }
 
     if not apts:
@@ -1928,6 +2405,12 @@ def prepare_apt_batch_preview(apps, purge=False):
     success, output, removed_packages = simulate_apt_remove_multiple(apt_ids, purge=purge)
 
     preview["removed_packages"] = removed_packages
+    if success:
+        preview["plan"] = Plan(
+            action="batch-remove",
+            package_ids=list(apt_ids),
+            removed_preview=list(removed_packages),
+        )
 
     if not success:
         preview["apt_ok"] = False
@@ -2071,7 +2554,7 @@ def prepare_apt_batch_preview(apps, purge=False):
 # Batch removal
 # ------------------------------------------------------------
 
-def execute_batch_removal(apps, progress_callback=None, purge=False):
+def execute_batch_removal(apps, progress_callback=None, purge=False, apt_plan=None):
 
     """
     Batch removal designed to reduce repeated privilege prompts.
@@ -2115,31 +2598,40 @@ def execute_batch_removal(apps, progress_callback=None, purge=False):
         elif manager == "Snap":
             snaps.append(app)
         elif manager == "Flatpak":
-            details = getattr(app, "details", "") or ""
-            if "system" in details.lower():
+            # F11: the scanner records the installation name explicitly;
+            # falling back to the old "system" substring check keeps old
+            # entries working.
+            installation = str(getattr(app, "installation", "") or "").strip().lower()
+            details = str(getattr(app, "details", "") or "").lower()
+            if installation:
+                is_system = installation not in {"user", ""}
+            else:
+                is_system = "system" in details
+            if is_system:
                 system_flatpaks.append(app)
             else:
                 user_flatpaks.append(app)
         elif manager == "APT":
             apts.append(app)
 
-    total_steps = (
-        len(manual_apps)
-        + len(appimages)
-        + (1 if user_flatpaks else 0)
-        + (1 if apts else 0)
-        + (1 if (snaps or system_flatpaks or apts) else 0)
-    )
+    # F16: the step total is tracked dynamically so blocked groups can
+    # neither stall the bar below 100% nor double-count a group that never
+    # runs (every APT item blocked, for example).
+    progress_state = {"current": 0, "total": 0}
 
-    current_step = 0
-
-    def report(message):
-        nonlocal current_step
-
-        current_step += 1
-
+    def report(message, reserve=False):
+        if reserve:
+            progress_state["total"] += 1
+        else:
+            progress_state["current"] += 1
+            if progress_state["current"] > progress_state["total"]:
+                progress_state["total"] = progress_state["current"]
         if progress_callback:
-            progress_callback(current_step, total_steps, message)
+            progress_callback(
+                progress_state["current"],
+                progress_state["total"],
+                message,
+            )
 
     for app in manual_apps:
         name = getattr(app, "name", "Manual app")
@@ -2158,23 +2650,39 @@ def execute_batch_removal(apps, progress_callback=None, purge=False):
         results_by_key[app_key(app)] = (success, message)
 
     # ------------------------------------------------------------
-    # User Flatpak removals
+    # User Flatpak removals (no privilege, one command per app)
     # ------------------------------------------------------------
     if user_flatpaks:
         report(f"Removing {len(user_flatpaks)} Flatpak app(s)…")
 
-        script_results, output = _execute_user_flatpak_batch(user_flatpaks)
-
         for app in user_flatpaks:
             package_id = getattr(app, "package_id", "") or ""
-            key = ("Flatpak", package_id)
-
-            success, message = script_results.get(
-                key,
-                (False, output if output else "Flatpak removal failed."),
+            if not _is_safe_package_id(package_id):
+                results_by_key[app_key(app)] = (
+                    False,
+                    "Unsafe or invalid Flatpak package ID.",
+                )
+                continue
+            installation = str(getattr(app, "installation", "") or "").strip().lower()
+            scope = ["--user"] if installation in {"user", ""} else [
+                f"--installation={installation}"
+            ]
+            cmd = [
+                shutil.which("flatpak") or "flatpak",
+                "uninstall",
+                "-y",
+                *scope,
+                "--",
+                package_id,
+            ]
+            returncode, output = _run_command_raw(cmd, timeout=300)
+            success = returncode == 0
+            results_by_key[app_key(app)] = (
+                success,
+                output if success else (
+                    output or "Flatpak removal failed."
+                ),
             )
-
-            results_by_key[app_key(app)] = (success, message)
 
     # ------------------------------------------------------------
     # APT validation/simulation
@@ -2183,7 +2691,7 @@ def execute_batch_removal(apps, progress_callback=None, purge=False):
     apt_ids = []
 
     if apts:
-        report("Checking APT dependencies…")
+        report("Checking APT dependencies…", reserve=True)
 
         for app in apts:
             package_id = getattr(app, "package_id", "") or ""
@@ -2218,58 +2726,15 @@ def execute_batch_removal(apps, progress_callback=None, purge=False):
                 apt_valid_apps = []
                 apt_ids = []
             else:
-                removed_base_names = {
-                    _base_package_name(p)
-                    for p in removed_packages
-                }
+                # S4: consent is bound to the confirmed plan; a re-simulation
+                # that grew (or a missing plan) blocks only the APT group.
+                plan_ok, plan_message = check_apt_removal_plan(
+                    apt_plan, apt_ids, removed_packages
+                )
 
-                missing = [
-                    p
-                    for p in apt_ids
-                    if _base_package_name(p) not in removed_base_names
-                ]
-
-                critical_removed = [
-                    p
-                    for p in removed_packages
-                    if is_critical_apt_package_name(p)
-                ]
-
-                if missing:
-                    message = (
-                        "APT simulation did not confirm removal for:\n\n"
-                        f"{_format_package_list(missing)}\n\n"
-                        f"{sim_output}"
-                    )
-
+                if not plan_ok:
                     for app in apt_valid_apps:
-                        results_by_key[app_key(app)] = (False, message)
-
-                    apt_valid_apps = []
-                    apt_ids = []
-
-                elif critical_removed:
-                    message = (
-                        "Blocked by safety policy.\n\n"
-                        "APT simulation says the following critical packages would be removed:\n\n"
-                        f"{_format_package_list(critical_removed)}"
-                    )
-
-                    for app in apt_valid_apps:
-                        results_by_key[app_key(app)] = (False, message)
-
-                    apt_valid_apps = []
-                    apt_ids = []
-
-                elif len(removed_packages) > APT_MAX_REMOVALS:
-                    message = (
-                        "Blocked by safety policy.\n\n"
-                        f"APT simulation says {len(removed_packages)} packages would be removed.\n"
-                        f"The current safety limit is {APT_MAX_REMOVALS} packages."
-                    )
-
-                    for app in apt_valid_apps:
-                        results_by_key[app_key(app)] = (False, message)
+                        results_by_key[app_key(app)] = (False, plan_message)
 
                     apt_valid_apps = []
                     apt_ids = []
@@ -2363,65 +2828,97 @@ def execute_batch_removal(apps, progress_callback=None, purge=False):
             )
 
     if snap_ids or system_flatpak_ids or apt_ids:
-        report("Removing apps with administrator privileges…")
+        report("Removing apps with administrator privileges…", reserve=True)
 
         backup_note = ""
-        if purge and apt_ids:
+        # S9: the conffile backup for a batch purge is made inside the
+        # helper (as root), together with the removal, so a root-only
+        # conffile can no longer block the purge or split the transaction.
+
+        # S6: the privileged groups run through the dedicated helper,
+        # one named action per manager; the pkexec sh -c text protocol is
+        # gone. Failures are isolated per group.
+        def fail_group(apps, message):
+            for app in apps:
+                results_by_key[app_key(app)] = (False, message)
+
+        if snap_ids:
             try:
-                backup_dir, backed_up_count = _backup_residual_conffiles(
-                    removed_packages
+                result = helper_client.remove_snap(
+                    snap_ids, output_callback=None
                 )
-                backup_note = _purge_backup_note(backup_dir, backed_up_count)
-            except OSError as error:
-                message = (
-                    "Privileged removal was not started because Appector could "
-                    "not securely back up the APT configuration files.\n\n"
-                    f"{error}"
+                snap_message = result.message or (
+                    "Removed." if result.ok else "Snap removal failed."
                 )
-                for app in privileged_apps:
-                    results_by_key[app_key(app)] = (False, message)
-                privileged_apps = []
-                privileged_expected = []
-                apt_ids = []
-                snap_ids = []
-                system_flatpak_ids = []
-
-        script = _build_privileged_script(
-            snap_exe,
-            snap_ids,
-            flatpak_exe,
-            system_flatpak_ids,
-            apt_get_exe,
-            apt_ids,
-            purge=purge,
-        )
-
-        if not script:
-            for app in privileged_apps:
-                results_by_key[app_key(app)] = (
-                    False,
-                    "Could not build privileged removal script.",
+                for app in snaps:
+                    if app_key(app) not in results_by_key:
+                        results_by_key[app_key(app)] = (result.ok, snap_message)
+            except (HelperUnavailable, OSError) as error:
+                fail_group(
+                    [app for app in snaps if app_key(app) not in results_by_key],
+                    str(error),
                 )
-        else:
-            script_results, output = _execute_privileged_script(
-                script,
-                privileged_expected,
-            )
 
-            for app in privileged_apps:
-                manager = getattr(app, "manager", "")
-                package_id = getattr(app, "package_id", "") or ""
-
-                key = (manager, package_id)
-
-                success, message = script_results.get(
-                    key,
-                    (False, output if output else "Privileged removal failed."),
+        if system_flatpak_ids:
+            installations = {
+                str(getattr(app, "installation", "") or "").strip()
+                for app in system_flatpaks
+            }
+            installation = next(iter(installations)) if len(installations) == 1 else None
+            try:
+                result = helper_client.remove_flatpak_system(
+                    system_flatpak_ids,
+                    installation=installation,
+                    output_callback=None,
                 )
+                flatpak_message = result.message or (
+                    "Removed." if result.ok else "Flatpak removal failed."
+                )
+                for app in system_flatpaks:
+                    if app_key(app) not in results_by_key:
+                        results_by_key[app_key(app)] = (result.ok, flatpak_message)
+            except (HelperUnavailable, OSError) as error:
+                fail_group(
+                    [app for app in system_flatpaks
+                     if app_key(app) not in results_by_key],
+                    str(error),
+                )
+
+        if apt_ids and apt_plan is None:
+            # Never fabricate a plan from the live simulation: consent must
+            # bind to the preview the user actually confirmed (S4). The
+            # gate above usually catches this earlier.
+            fail_group(apt_valid_apps, "A confirmed removal plan is required.")
+        elif apt_ids:
+            try:
+                result = helper_client.remove_apt(
+                    apt_ids,
+                    plan=apt_plan,
+                    purge=purge,
+                    output_callback=None,
+                )
+                apt_message = result.message or (
+                    "Removed." if result.ok else "APT removal failed."
+                )
+                events_note = ""
+                for event in result.events:
+                    if event.get("type") == "backup":
+                        events_note = _purge_backup_note(
+                            event.get("path"), int(event.get("files", 0) or 0)
+                        )
+                if events_note:
+                    apt_message = f"{apt_message}\n\n{events_note}"
                 if backup_note:
-                    message = f"{message}\n\n{backup_note}"
-
-                results_by_key[app_key(app)] = (success, message)
+                    apt_message = f"{apt_message}\n\n{backup_note}"
+                for app in apt_valid_apps:
+                    if app_key(app) not in results_by_key:
+                        results_by_key[app_key(app)] = (result.ok, apt_message)
+            except (HelperUnavailable, OSError) as error:
+                fail_group(
+                    [app for app in apt_valid_apps
+                     if app_key(app) not in results_by_key],
+                    str(error),
+                )
 
     # ------------------------------------------------------------
     # Preserve original order
@@ -2452,757 +2949,20 @@ def execute_batch_removal(apps, progress_callback=None, purge=False):
 # Flatpak user batch
 # ------------------------------------------------------------
 
-def _execute_user_flatpak_batch(apps):
-    flatpak_exe = shutil.which("flatpak")
-
-    expected = []
-    package_ids = []
-
-    invalid_results = {}
-
-    for app in apps:
-        package_id = getattr(app, "package_id", "") or ""
-
-        if not _is_safe_package_id(package_id):
-            invalid_results[("Flatpak", package_id)] = (
-                False,
-                "Unsafe or invalid Flatpak package ID.",
-            )
-            continue
-
-        package_ids.append(package_id)
-        expected.append(("Flatpak", package_id))
-
-    if not flatpak_exe:
-        results = dict(invalid_results)
-
-        for key in expected:
-            results[key] = (False, "flatpak command not found.")
-
-        return results, "flatpak command not found."
-
-    lines = []
-
-    if not _append_loop_commands(
-        lines,
-        "Flatpak",
-        flatpak_exe,
-        ["uninstall", "-y"],
-        package_ids,
-    ):
-        results = dict(invalid_results)
-
-        for key in expected:
-            results[key] = (False, "Could not build Flatpak removal script.")
-
-        return results, "Could not build Flatpak removal script."
-
-    script = "\n".join(lines)
-
-    sh_exe = shutil.which("sh") or "/bin/sh"
-    cmd = [sh_exe, "-c", script]
-
-    returncode, output = _run_command_raw(cmd)
-
-    results = _parse_script_results(output, expected)
-
-    if returncode != 0:
-        for key in expected:
-            success, message = results.get(key, (False, "No result captured."))
-
-            if not success and message == "No result captured.":
-                results[key] = (False, output if output else "Flatpak removal failed.")
-
-    results.update(invalid_results)
-
-    return results, output
-
-
 # ------------------------------------------------------------
 # Flatpak remote / Flathub helpers
 # ------------------------------------------------------------
 
-FLATHUB_REMOTE_NAME = "flathub"
 FLATHUB_REMOTE_URL = "https://dl.flathub.org/repo/flathub.flatpakrepo"
-
-
-def get_flatpak_remotes(user_install: bool = True):
-    """
-    Returns a list of configured Flatpak remote names.
-    """
-
-    flatpak_command = shutil.which("flatpak")
-
-    if not flatpak_command:
-        return []
-
-    scope = "--user" if user_install else "--system"
-
-    cmd = [
-        flatpak_command,
-        "remotes",
-        scope,
-        "--columns=name",
-    ]
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-        if result.returncode != 0:
-            return []
-
-        return [
-            line.strip()
-            for line in result.stdout.splitlines()
-            if line.strip()
-        ]
-    except Exception:
-        return []
-
-
-def flathub_remote_exists(user_install: bool = True) -> bool:
-    """
-    Checks whether the Flathub remote exists in the selected scope.
-    """
-
-    try:
-        remotes = get_flatpak_remotes(user_install)
-        return FLATHUB_REMOTE_NAME in remotes
-    except Exception:
-        return False
-
-
-def add_flathub_remote(user_install: bool = True):
-    """
-    Adds the Flathub remote.
-
-    For user installation:
-        flatpak remote-add --user --if-not-exists flathub <url>
-
-    For system installation:
-        pkexec flatpak remote-add --system --if-not-exists flathub <url>
-    """
-
-    flatpak_command = shutil.which("flatpak")
-
-    if not flatpak_command:
-        return False, "flatpak command not found."
-
-    scope = "--user" if user_install else "--system"
-
-    base_cmd = [
-        flatpak_command,
-        "remote-add",
-        scope,
-        "--if-not-exists",
-        FLATHUB_REMOTE_NAME,
-        FLATHUB_REMOTE_URL,
-    ]
-
-    if user_install:
-        cmd = base_cmd
-    else:
-        pkexec_command = shutil.which("pkexec")
-
-        if pkexec_command:
-            cmd = [pkexec_command] + base_cmd
-        else:
-            cmd = base_cmd
-
-    _log_action(f"FLATHUB_ADD_START cmd={shlex.join(cmd)}")
-
-    success, message = _run_command(cmd)
-
-    if success:
-        _log_action(f"FLATHUB_ADD_SUCCESS scope={scope}")
-    else:
-        _log_action(f"FLATHUB_ADD_FAILED scope={scope} error={message}")
-
-    return success, message
 
 
 # ------------------------------------------------------------
 # Flatpak installation helpers
 # ------------------------------------------------------------
 
-def _flatpak_install_command(target: str, user_install: bool = True):
-    """
-    Builds a Flatpak install command for a target.
-
-    Target can be:
-    - app ID
-    - local .flatpakref path
-    - remote .flatpakref URL
-    """
-
-    flatpak_command = shutil.which("flatpak")
-
-    if not flatpak_command:
-        return None, "flatpak command not found."
-
-    scope = "--user" if user_install else "--system"
-
-    cmd = [
-        flatpak_command,
-        "install",
-        "-y",
-        scope,
-        target,
-    ]
-
-    if not user_install:
-        pkexec_command = shutil.which("pkexec")
-
-        if pkexec_command:
-            cmd = [pkexec_command] + cmd
-
-    return cmd, None
-
-
-def install_flatpak_app_id(app_id: str, user_install: bool = True, output_callback=None):
-    """
-    Installs a Flatpak app by app ID.
-    """
-
-    app_id = app_id.strip()
-
-    if not app_id:
-        return False, "Flatpak app ID is empty."
-
-    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", app_id):
-        return False, "Invalid Flatpak app ID.\n\nExample: org.gimp.GIMP"
-
-    cmd, error = _flatpak_install_command(app_id, user_install)
-
-    if error:
-        return False, error
-
-    _log_action(f"FLATPAK_INSTALL_START cmd={shlex.join(cmd)}")
-
-    def filtered_output(line):
-        if output_callback and "already installed" not in line.lower():
-            output_callback(line)
-
-    success, message = _run_command_stream(cmd, filtered_output if output_callback else None)
-
-    if not success and _flatpak_output_is_already_installed(message):
-        _log_action(f"FLATPAK_INSTALL_ALREADY_INSTALLED app_id={app_id}")
-        return True, f"Already installed: {app_id}"
-
-    if success:
-        _log_action(f"FLATPAK_INSTALL_SUCCESS app_id={app_id}")
-    else:
-        if (
-            "No refs found" in message
-            or "No remote refs" in message
-            or "Unable to find" in message
-        ):
-            message += (
-                "\n\nHint: The app was not found in your configured Flatpak remotes.\n"
-                "If you are installing from Flathub, add the Flathub remote first."
-            )
-
-        _log_action(f"FLATPAK_INSTALL_FAILED app_id={app_id} error={message}")
-
-    return success, message
-
-
-def _flatpak_output_is_already_installed(message: str):
-    return "already installed" in (message or "").lower()
-
-
-def parse_flatpak_app_inputs(text: str):
-    """Validate and deduplicate newline-separated Flatpak IDs or Flathub URLs."""
-    app_ids = []
-    issues = []
-    seen = set()
-
-    for line_number, raw_value in enumerate(text.splitlines(), start=1):
-        value = raw_value.strip()
-
-        if not value:
-            continue
-
-        app_id = extract_flathub_app_id(value) or value
-
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", app_id):
-            issues.append(f"Line {line_number}: invalid app ID or Flathub URL.")
-            continue
-
-        if app_id in seen:
-            issues.append(f"Line {line_number}: duplicate app ignored ({app_id}).")
-            continue
-
-        seen.add(app_id)
-        app_ids.append(app_id)
-
-    return app_ids, issues
-
-
-def install_flatpak_app_id_batch(app_ids, user_install: bool = True, output_callback=None):
-    """Install a sequence of validated Flatpak app IDs, continuing after failures."""
-    if not app_ids:
-        return True, "Installed (0): none\nAlready installed (0): none\nFailed (0): none", 0
-
-    installed = []
-    already_installed = []
-    failures = []
-    success_count = 0
-    total = len(app_ids)
-
-    for index, app_id in enumerate(app_ids, start=1):
-        if output_callback:
-            output_callback(f"[{index}/{total}] Installing {app_id}…")
-
-        success, message = install_flatpak_app_id(
-            app_id,
-            user_install,
-            output_callback,
-        )
-
-        if success:
-            success_count += 1
-            if _flatpak_output_is_already_installed(message):
-                already_installed.append(app_id)
-                result = "ALREADY INSTALLED"
-            else:
-                installed.append(app_id)
-                result = "INSTALLED"
-        else:
-            message_lines = (message or "").splitlines()
-            first_line = message_lines[0] if message_lines else "Installation failed"
-            failures.append(f"{app_id}: {first_line}")
-            result = "FAILED"
-
-        if output_callback:
-            output_callback(f"[{index}/{total}] {result} {app_id}")
-
-    summary = _format_flatpak_batch_summary(
-        installed,
-        already_installed,
-        failures,
-    )
-
-    return not failures, summary, success_count
-
-
-def _format_flatpak_batch_summary(installed, already_installed, failures):
-    def format_section(title, entries):
-        if not entries:
-            return f"{title} (0): none"
-        return f"{title} ({len(entries)}):\n" + "\n".join(
-            f"  {entry}" for entry in entries[:20]
-        )
-
-    sections = [
-        format_section("Installed", installed),
-        format_section("Already installed", already_installed),
-        format_section("Failed", failures),
-    ]
-
-    if len(installed) > 20 or len(already_installed) > 20 or len(failures) > 20:
-        sections.append("Lists are limited to the first 20 entries per section.")
-
-    return "\n\n".join(sections)
-
-
-def extract_flathub_app_id(value: str):
-    """Return the app ID from a Flathub app page URL, if value is one."""
-    try:
-        parsed = urlsplit(value.strip())
-        hostname = parsed.hostname
-        port = parsed.port
-    except ValueError:
-        return None
-
-    if (
-        parsed.scheme.lower() not in {"http", "https"}
-        or hostname is None
-        or hostname.lower() not in {"flathub.org", "www.flathub.org"}
-        or parsed.username is not None
-        or parsed.password is not None
-        or port is not None
-    ):
-        return None
-
-    segments = [segment for segment in parsed.path.split("/") if segment]
-
-    if (
-        len(segments) == 3
-        and re.fullmatch(r"[a-z]{2}(?:-[A-Z]{2})?", segments[0])
-        and segments[1] == "apps"
-    ):
-        app_id = segments[2]
-    elif len(segments) == 2 and segments[0] == "apps":
-        app_id = segments[1]
-    else:
-        return None
-
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", app_id):
-        return None
-
-    return app_id
-
-
-def _parse_flatpakref_url(path: Path):
-    """
-    Parses a .flatpakref file and returns the Url= value if present.
-    """
-
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for raw in f:
-                line = raw.strip()
-
-                if line.lower().startswith("url="):
-                    return line.split("=", 1)[1].strip()
-    except Exception:
-        pass
-
-    return None
-
-
-def _install_flatpak_location(location: str, user_install: bool = True, output_callback=None):
-    """
-    Installs from a location.
-
-    Location can be:
-    - local .flatpakref path
-    - remote .flatpakref URL
-    """
-
-    cmd, error = _flatpak_install_command(location, user_install)
-
-    if error:
-        return False, error
-
-    _log_action(f"FLATPAK_INSTALL_LOCATION_START cmd={shlex.join(cmd)}")
-
-    success, message = _run_command_stream(cmd, output_callback)
-
-    if success:
-        _log_action(f"FLATPAK_INSTALL_LOCATION_SUCCESS location={location}")
-    else:
-        _log_action(f"FLATPAK_INSTALL_LOCATION_FAILED location={location} error={message}")
-
-    return success, message
-
-
-def install_flatpak_ref_file(
-    path: str,
-    user_install: bool = True,
-    output_callback=None,
-    delete_source: bool = False,
-):
-    """
-    Installs a local .flatpakref file.
-
-    If direct installation fails, this also tries to parse the Url=
-    from the .flatpakref file and install that URL.
-    """
-
-    ref_path = Path(path).expanduser()
-
-    if not ref_path.is_file():
-        return False, "Selected .flatpakref file not found."
-
-    def filtered_output(line):
-        if output_callback and "already installed" not in line.lower():
-            output_callback(line)
-
-    success, message = _install_flatpak_location(
-        str(ref_path),
-        user_install,
-        filtered_output if output_callback else None,
-    )
-
-    if success:
-        message = _maybe_delete_source_file(ref_path, delete_source, message)
-        return True, message
-
-    if _flatpak_output_is_already_installed(message):
-        message = f"Already installed: {ref_path.stem}"
-        message = _maybe_delete_source_file(ref_path, delete_source, message)
-        _log_action(f"FLATPAK_REF_ALREADY_INSTALLED path={ref_path}")
-        return True, message
-
-    url = _parse_flatpakref_url(ref_path)
-
-    if url:
-        url_success, url_message = _install_flatpak_location(
-            url,
-            user_install,
-            filtered_output if output_callback else None,
-        )
-
-        if url_success:
-            url_message = _maybe_delete_source_file(ref_path, delete_source, url_message)
-            return True, url_message
-
-        if _flatpak_output_is_already_installed(url_message):
-            url_message = f"Already installed: {ref_path.stem}"
-            url_message = _maybe_delete_source_file(ref_path, delete_source, url_message)
-            _log_action(f"FLATPAK_REF_ALREADY_INSTALLED path={ref_path}")
-            return True, url_message
-
-        message += (
-            "\n\nAlso tried URL from .flatpakref file:\n"
-            f"{url_message}"
-        )
-
-    return False, message
-
-
-def install_flatpak_source(
-    source_type: str,
-    value: str,
-    user_install: bool = True,
-    output_callback=None,
-    delete_source: bool = False,
-):
-    """
-    Unified Flatpak installation entry point.
-
-    source_type:
-        "id"  -> Flathub/Flatpak app ID
-        "ref" -> .flatpakref file or URL
-    """
-
-    value = value.strip()
-
-    if not value:
-        return False, "No Flatpak source provided."
-
-    flathub_app_id = extract_flathub_app_id(value)
-
-    if source_type == "id":
-        return install_flatpak_app_id(
-            flathub_app_id or value,
-            user_install,
-            output_callback,
-        )
-
-    if source_type == "ref":
-        if flathub_app_id:
-            return install_flatpak_app_id(
-                flathub_app_id,
-                user_install,
-                output_callback,
-            )
-
-        if value.startswith("http://") or value.startswith("https://"):
-            return _install_flatpak_location(
-                value,
-                user_install,
-                output_callback,
-            )
-
-        return install_flatpak_ref_file(
-            value,
-            user_install,
-            output_callback,
-            delete_source,
-        )
-
-    return False, "Unknown Flatpak source type."
-
 # ------------------------------------------------------------
-# Privileged grouped script
+# Privileged operations now run through appector-helper (ADR-0003).
 # ------------------------------------------------------------
-
-def _build_privileged_script(
-    snap_exe,
-    snap_ids,
-    flatpak_exe,
-    system_flatpak_ids,
-    apt_get_exe,
-    apt_ids,
-    purge=False,
-):
-    lines = []
-
-    if snap_ids:
-        if not snap_exe:
-            return None
-
-        if not _append_loop_commands(
-            lines,
-            "Snap",
-            snap_exe,
-            ["remove"],
-            snap_ids,
-        ):
-            return None
-
-    if system_flatpak_ids:
-        if not flatpak_exe:
-            return None
-
-        if not _append_loop_commands(
-            lines,
-            "Flatpak",
-            flatpak_exe,
-            ["uninstall", "-y"],
-            system_flatpak_ids,
-        ):
-            return None
-
-    if apt_ids:
-        if not apt_get_exe:
-            return None
-
-        for package_id in apt_ids:
-            if not _is_safe_package_id(package_id):
-                return None
-
-            lines.append(f"echo APP_MANAGER_START APT {package_id}")
-
-        quoted_packages = " ".join(
-            shlex.quote(package_id)
-            for package_id in apt_ids
-        )
-
-        apt_action = "purge" if purge else "remove"
-
-        apt_command = " ".join(
-            [
-                shlex.quote(apt_get_exe),
-                apt_action,
-                "-y",
-                "--",
-                quoted_packages,
-            ]
-        )
-
-        lines.append(apt_command)
-        lines.append("status=$?")
-
-        for package_id in apt_ids:
-            lines.append(f"echo APP_MANAGER_END APT {package_id} $status")
-
-    if not lines:
-        return None
-
-    return "\n".join(lines)
-
-
-def _execute_privileged_script(script, expected):
-    sh_exe = shutil.which("sh") or "/bin/sh"
-    pkexec_exe = shutil.which("pkexec")
-
-    if pkexec_exe:
-        cmd = [
-            pkexec_exe,
-            sh_exe,
-            "-c",
-            script,
-        ]
-    else:
-        cmd = [
-            sh_exe,
-            "-c",
-            script,
-        ]
-
-    _log_action("PRIVILEGED_BATCH_SCRIPT_START")
-
-    returncode, output = _run_command_raw(cmd)
-
-    results = _parse_script_results(output, expected)
-
-    if returncode != 0:
-        for key in expected:
-            success, message = results.get(key, (False, "No result captured."))
-
-            if not success and message == "No result captured.":
-                results[key] = (
-                    False,
-                    output if output else "Privileged removal failed.",
-                )
-
-    if returncode == 0:
-        _log_action("PRIVILEGED_BATCH_SCRIPT_SUCCESS")
-    else:
-        _log_action(f"PRIVILEGED_BATCH_SCRIPT_FAILED returncode={returncode}")
-
-    return results, output
-
-
-def _append_loop_commands(lines, manager, executable, args, package_ids):
-    for package_id in package_ids:
-        if not _is_safe_package_id(package_id):
-            return False
-
-        quoted_package = shlex.quote(package_id)
-
-        command_parts = [
-            shlex.quote(executable)
-        ]
-
-        for arg in args:
-            command_parts.append(shlex.quote(arg))
-
-        command_parts.append(quoted_package)
-
-        command = " ".join(command_parts)
-
-        lines.append(f"echo APP_MANAGER_START {manager} {package_id}")
-        lines.append(command)
-        lines.append("status=$?")
-        lines.append(f"echo APP_MANAGER_END {manager} {package_id} $status")
-
-    return True
-
-
-def _parse_script_results(output, expected):
-    statuses = {}
-
-    for line in output.splitlines():
-        if line.startswith("APP_MANAGER_END "):
-            parts = line.split()
-
-            if len(parts) >= 4:
-                manager = parts[1]
-                package_id = parts[2]
-
-                try:
-                    status = int(parts[3])
-                except Exception:
-                    status = 1
-
-                statuses[(manager, package_id)] = status
-
-    results = {}
-
-    for key in expected:
-        status = statuses.get(key)
-
-        if status == 0:
-            results[key] = (True, "Removed.")
-        elif status is None:
-            results[key] = (False, "No result captured.")
-        else:
-            results[key] = (False, f"Command exited with code {status}.")
-
-    return results
-
-
-def _format_package_list(packages, limit=50):
-    lines = []
-
-    for package_name in packages[:limit]:
-        lines.append(f"• {package_name}")
-
-    if len(packages) > limit:
-        lines.append(f"• …and {len(packages) - limit} more")
-
-    return "\n".join(lines)
-
 
 # ------------------------------------------------------------
 # APT Autoremove
@@ -3218,6 +2978,7 @@ def get_apt_autoremove_preview():
         packages: list[str]
         space_freed: str
         raw_output: str
+        plan: Plan (S4; binds the confirmed autoremove set to execution)
     """
     cmd = ["apt-get", "--simulate", "autoremove"]
     try:
@@ -3225,11 +2986,12 @@ def get_apt_autoremove_preview():
             cmd,
             timeout=60,
             env_overrides={"LC_ALL": "C"},
+            uses_apt=True,
         )
         if returncode != 0:
             return False, [], "", output or (
                 f"APT autoremove simulation failed with exit code {returncode}."
-            )
+            ), None
 
         packages = []
         for line in output.splitlines():
@@ -3247,35 +3009,58 @@ def get_apt_autoremove_preview():
                 space_freed = line.strip()
                 break
 
-        return True, packages, space_freed, output
+        plan = Plan(
+            action="autoremove",
+            package_ids=[],
+            removed_preview=list(packages),
+        )
+        return True, packages, space_freed, output, plan
 
     except Exception as e:
-        return False, [], "", str(e)
+        return False, [], "", str(e), None
 
 
-def execute_apt_autoremove(output_callback=None):
+def execute_apt_autoremove(output_callback=None, plan=None):
     """
     Executes apt-get autoremove with pkexec.
-    Streams output line-by-line via output_callback.
 
-    Returns:
-        success: bool
-        message: str
+    S4: requires the :class:`Plan` produced by `get_apt_autoremove_preview`.
+    The autoremove set is re-simulated first and the shared policy gate
+    (plan binding, critical packages, cascade limit) is applied — the old
+    flow ran `autoremove -y` with no gate at all.
     """
     apt_get_command = shutil.which("apt-get") or "/usr/bin/apt-get"
-    pkexec_command = shutil.which("pkexec")
 
-    cmd = [apt_get_command, "autoremove", "-y"]
-
-    if pkexec_command:
-        cmd = [pkexec_command] + cmd
-
-    _log_action(f"APT_AUTOREMOVE_START cmd={shlex.join(cmd)}")
-    success, message = _run_command_stream(
-        cmd,
-        output_callback=output_callback,
-        timeout=900,
+    returncode, simulate_output = _run_command_raw(
+        [apt_get_command, "--simulate", "autoremove"],
+        timeout=120,
+        env_overrides={"LC_ALL": "C"},
+        uses_apt=True,
     )
+    if returncode != 0:
+        _log_action("APT_AUTOREMOVE_BLOCKED reason=simulation-failed")
+        return False, (
+            "Autoremove was not started: the APT simulation failed.\n\n"
+            f"{simulate_output}"
+        )
+
+    actual_removed = _parse_apt_simulation_removed_packages(simulate_output)
+    plan_ok, plan_message = check_apt_removal_plan(plan, [], actual_removed)
+    if not plan_ok:
+        _log_action("APT_AUTOREMOVE_BLOCKED reason=plan-mismatch")
+        return False, plan_message
+
+    _log_action("APT_AUTOREMOVE_START helper=apt-autoremove")
+    try:
+        result = helper_client.apt_autoremove(
+            plan, output_callback=output_callback
+        )
+    except HelperUnavailable as error:
+        return False, f"{error}"
+    except OSError as error:
+        return False, f"Could not start the privileged helper: {error}"
+    success = result.ok
+    message = result.message or ("Autoremove finished." if success else "Autoremove failed.")
     if success:
         _log_action("APT_AUTOREMOVE_SUCCESS")
         return True, message
@@ -3288,142 +3073,5 @@ def execute_apt_autoremove(output_callback=None):
 # Flatpak Unused Runtimes
 # ------------------------------------------------------------
 
-FLATPAK_PROMPT_RE = re.compile(
-    r"(\[(?:y/n|Y/n|n/Y|n/y)\])|(proceed with these changes)",
-    re.IGNORECASE,
-)
 
 
-def get_flatpak_unused_preview():
-    """
-    Asks Flatpak for its unused-removal plan and declines the confirmation.
-
-    The preview is produced by answering "n" to Flatpak's confirmation prompt,
-    so nothing is removed. If the prompt cannot be recognised the check fails
-    instead of showing a preview that may not match the real transaction.
-
-    Returns:
-        success: bool
-        preview_text: str
-        raw_output: str
-    """
-    flatpak_command = shutil.which("flatpak")
-    if not flatpak_command:
-        return False, "", "flatpak command not found."
-
-    outputs = []
-    previews = []
-    refs_by_scope = {}
-    env = os.environ.copy()
-    env["LC_ALL"] = "C"
-
-    for scope in ("--user", "--system"):
-        cmd = [
-            flatpak_command,
-            "uninstall",
-            scope,
-            "--unused",
-        ]
-        try:
-            result = subprocess.run(
-                cmd,
-                input="n\n",
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            return False, "", f"Flatpak unused-runtime check timed out ({scope})."
-        except OSError as error:
-            return False, "", f"Could not check unused Flatpak runtimes ({scope}): {error}"
-
-        output = "\n".join(
-            part.strip()
-            for part in (result.stdout, result.stderr)
-            if part.strip()
-        )
-        outputs.append(f"[{scope.removeprefix('--')}]\n{output}".rstrip())
-
-        if result.returncode == 0 and "Nothing unused to uninstall" in output:
-            continue
-
-        # Flatpak exits non-zero when the confirmation is declined. Treat that
-        # as a valid preview only when the prompt is clearly recognised and
-        # nothing was written to stderr.
-        declined_prompt = (
-            bool(FLATPAK_PROMPT_RE.search(output))
-            and not result.stderr.strip()
-        )
-
-        if result.returncode != 0 and not declined_prompt:
-            error = output or (
-                f"Flatpak unused-runtime check failed with exit code {result.returncode}."
-            )
-            return False, "", f"{scope}: {error}"
-
-        if output:
-            refs = list(dict.fromkeys(re.findall(
-                r"\b((?:[A-Za-z0-9_-]+\.)+[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+)\b",
-                output,
-            )))
-            if refs:
-                refs_by_scope[scope] = refs
-            preview = "\n".join(
-                line
-                for line in output.splitlines()
-                if not FLATPAK_PROMPT_RE.search(line)
-            ).strip()
-            if preview:
-                previews.append(
-                    f"{scope.removeprefix('--').title()} installation:\n{preview}"
-                )
-
-    if refs_by_scope:
-        size_estimate = get_removal_size_estimate(
-            [],
-            flatpak_refs_by_scope=refs_by_scope,
-        )
-        previews.append(size_estimate)
-
-    return True, "\n\n".join(previews), "\n\n".join(outputs)
-
-
-def execute_flatpak_unused_cleanup(output_callback=None):
-    """
-    Executes flatpak uninstall --unused.
-    Streams output line-by-line via output_callback.
-
-    Returns:
-        success: bool
-        message: str
-    """
-    flatpak_command = shutil.which("flatpak")
-
-    if not flatpak_command:
-        return False, "flatpak command not found."
-
-    results = []
-    failures = []
-    for scope in ("--user", "--system"):
-        cmd = [flatpak_command, "uninstall", scope, "--unused", "-y"]
-        _log_action(f"FLATPAK_UNUSED_CLEANUP_START cmd={shlex.join(cmd)}")
-        success, message = _run_command_stream(
-            cmd,
-            output_callback=output_callback,
-            timeout=900,
-        )
-        scope_name = scope.removeprefix("--")
-        results.append(f"{scope_name}: {message}")
-        if not success:
-            failures.append(scope_name)
-
-    combined = "\n\n".join(results)
-    if failures:
-        _log_action(
-            f"FLATPAK_UNUSED_CLEANUP_FAILED scopes={','.join(failures)}"
-        )
-        return False, f"Cleanup failed for: {', '.join(failures)}.\n\n{combined}"
-
-    _log_action("FLATPAK_UNUSED_CLEANUP_SUCCESS")
-    return True, combined

@@ -1,0 +1,56 @@
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["build", "apt-repo", "scripts/__pycache__"]
+
+[tool.ruff.lint]
+# Keep the rule set pragmatic: the code base predates linting; these rules
+# catch real defects (unused names, f-string placeholders, dict iteration
+# hazards) without demanding a wholesale reformat of working code.
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "B",    # bugbear: likely bugs
+    "UP",   # pyupgrade: keep Python 3.10+ idioms current
+    "S",    # bandit-style security checks (subprocess, eval, ...)
+    "RUF",
+]
+ignore = [
+    "E501",  # line length: enforced loosely; long command lists are clearer unsplit
+    "S603",  # subprocess calls: audited individually, argv lists only
+    "S607",  # partial executable paths: all callers resolve via shutil.which
+    "B008",  # function call in default arg: used for frozen dataclass defaults
+    # Deliberate defensive style inherited from the code base: scanners and
+    # display callbacks must never crash the operation that called them.
+    "S110",  # try-except-pass: best-effort paths (icons, optional metadata)
+    "S112",  # try-except-continue: per-item resilience in scans and batches
+    # The GTK import is deliberately deferred (headless CLI, see main.py);
+    # module-level code above it sets up the paths it needs.
+    "E402",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "S101",   # assert is the point of tests
+    "S108",   # temp paths in fixtures
+    "B011",   # assertFalse(False) patterns in gate probes
+    "E402",
+    "RUF059", # unpacked fixtures with intentionally unused members
+    "S105",   # literal test passphrases for gpg fixtures
+    "S106",   # literal test passphrases for gpg fixtures
+]
+"appector/helper.py" = ["S603", "S607"]
+"appector/_proc.py" = ["S603", "S607"]
+
+[tool.coverage.run]
+source = ["appector"]
+omit = ["appector/window.py", "appector/details.py", "appector/progress.py", "appector/app_item.py", "appector/app.py", "appector/main.py"]
+
+[tool.coverage.report]
+# The GUI modules need a display; the floor covers the logic modules.
+exclude_also = [
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

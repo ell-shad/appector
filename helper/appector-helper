@@ -1,0 +1,26 @@
+#!/usr/bin/python3
+"""appector-helper — privileged helper entry point (see ADR-0003).
+
+Installed root-owned at /usr/lib/appector/appector-helper and invoked as
+
+    pkexec /usr/lib/appector/appector-helper <action>
+
+The implementing module is appector/helper.py; this shim only arranges the
+import path so the same file works from the packaged layout (/usr/lib) and
+from a source checkout.
+"""
+
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
+for candidate in (_HERE, os.path.join(_HERE, "..", ".."), "/usr/lib"):
+    if candidate and os.path.isdir(os.path.join(candidate, "appector")):
+        if candidate not in sys.path:
+            sys.path.insert(0, candidate)
+        break
+
+from appector.helper import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

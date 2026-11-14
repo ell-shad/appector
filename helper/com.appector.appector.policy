@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Appector polkit actions (ADR-0003).
+
+  One action per privileged operation so the authorization prompt names
+  exactly what will run. The helper itself re-validates every request as
+  root; these actions gate who may ask at all.
+-->
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<policyconfig>
+
+  <vendor>Appector</vendor>
+  <vendor_url>https://github.com/ell-shad/appector</vendor_url>
+
+  <action id="com.appector.appector.install-deb">
+    <description>Install reviewed Debian packages</description>
+    <description xml:lang="de">Geprüfte Debian-Pakete installieren</description>
+    <message>Appector needs to install the locally reviewed Debian packages as root. The packages were copied and hash-checked by the helper.</message>
+    <message xml:lang="de">Appector muss die lokal geprüften Debian-Pakete als Root installieren. Der Helper hat die Pakete kopiert und ihre Prüfsummen geprüft.</message>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/appector/appector-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">install-deb</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.appector.appector.remove-apt">
+    <description>Remove or purge APT packages</description>
+    <description xml:lang="de">APT-Pakete entfernen oder vollständig löschen</description>
+    <message>Appector needs to remove the APT packages you selected and confirmed as root.</message>
+    <message xml:lang="de">Appector muss die von Ihnen ausgewählten und bestätigten APT-Pakete als Root entfernen.</message>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/appector/appector-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">remove-apt</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.appector.appector.purge-residual">
+    <description>Purge leftover configuration of removed packages</description>
+    <description xml:lang="de">Konfigurationsreste entfernter Pakete löschen</description>
+    <message>Appector needs root rights to back up and purge the leftover configuration files you selected.</message>
+    <message xml:lang="de">Appector benötigt Root-Rechte, um die ausgewählten Konfigurationsreste zu sichern und zu löschen.</message>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/appector/appector-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">purge-residual</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.appector.appector.remove-snap">
+    <description>Remove snap packages</description>
+    <description xml:lang="de">Snap-Pakete entfernen</description>
+    <message>Appector needs to remove the snap packages you selected as root.</message>
+    <message xml:lang="de">Appector muss die ausgewählten Snap-Pakete als Root entfernen.</message>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/appector/appector-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">remove-snap</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.appector.appector.remove-flatpak-system">
+    <description>Remove system Flatpak apps</description>
+    <description xml:lang="de">Systemweite Flatpak-Apps entfernen</description>
+    <message>Appector needs to remove the system Flatpak apps you selected as root.</message>
+    <message xml:lang="de">Appector muss die ausgewählten systemweiten Flatpak-Apps als Root entfernen.</message>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/appector/appector-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">remove-flatpak-system</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.appector.appector.apt-autoremove">
+    <description>Remove automatically installed packages that are no longer needed</description>
+    <description xml:lang="de">Nicht mehr benötigte, automatisch installierte Pakete entfernen</description>
+    <message>Appector needs root rights to run apt-get autoremove with the package set you confirmed.</message>
+    <message xml:lang="de">Appector benötigt Root-Rechte, um apt-get autoremove mit der bestätigten Paketmenge auszuführen.</message>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/appector/appector-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">apt-autoremove</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.appector.appector.apt-upgrade">
+    <description>Upgrade APT packages</description>
+    <description xml:lang="de">APT-Pakete aktualisieren</description>
+    <message>Appector needs root rights to install the APT updates you selected. Updates must not remove any packages.</message>
+    <message xml:lang="de">Appector benötigt Root-Rechte, um die ausgewählten APT-Aktualisierungen zu installieren. Aktualisierungen dürfen keine Pakete entfernen.</message>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/appector/appector-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">apt-upgrade</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.appector.appector.flatpak-update-system">
+    <description>Update system Flatpak apps</description>
+    <description xml:lang="de">Systemweite Flatpak-Apps aktualisieren</description>
+    <message>Appector needs root rights to update the system Flatpak apps you selected.</message>
+    <message xml:lang="de">Appector benötigt Root-Rechte, um die ausgewählten systemweiten Flatpak-Apps zu aktualisieren.</message>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/appector/appector-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">flatpak-update-system</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+</policyconfig>

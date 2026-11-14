@@ -16,7 +16,7 @@ class ProgressWindow(Gtk.Window):
 
         self.set_resizable(False)
         self.set_deletable(False)
-        
+
 
         self._pulse_source_id = None
 

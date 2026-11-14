@@ -171,9 +171,13 @@ class AptRepositoryLayoutTests(unittest.TestCase):
         binary_dir = (
             self.output / "dists" / SUITE / COMPONENT / f"binary-{ARCHITECTURE}"
         )
+        # Files only, recursively: by-hash/SHA256/<digest> index copies are
+        # files under a directory, and directories themselves are not
+        # checksum entries.
         on_disk = {
-            f"{COMPONENT}/binary-{ARCHITECTURE}/{path.name}"
-            for path in binary_dir.iterdir()
+            f"{COMPONENT}/binary-{ARCHITECTURE}/{path.relative_to(binary_dir)}"
+            for path in binary_dir.rglob("*")
+            if path.is_file()
         }
         self.assertEqual(on_disk, listed)
 

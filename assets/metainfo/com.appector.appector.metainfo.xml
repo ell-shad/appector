@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.appector.appector</id>
+  <name>Appector</name>
+  <summary>Manage installed applications and software sources</summary>
+  <summary xml:lang="de">Installierte Anwendungen und Paketquellen verwalten</summary>
+  <developer_name translatable="no">Elshad Guliyev</developer_name>
+  <launchable type="desktop-id">com.appector.appector.desktop</launchable>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <url type="homepage">https://github.com/ell-shad/appector</url>
+  <url type="bugtracker">https://github.com/ell-shad/appector/issues</url>
+  <url type="vcs-browser">https://github.com/ell-shad/appector</url>
+  <content_rating type="oars-1.1"/>
+  <requires>
+    <!-- U4: Adw.Dialog, Adw.AlertDialog and Adw.Banner need libadwaita 1.5 -->
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>touch</control>
+  </recommends>
+  <description>
+    <p>
+      Appector lists, installs, updates and removes software across APT, Snap,
+      Flatpak, AppImage and manual installs, and can purge the leftover
+      configuration of already-removed packages.
+    </p>
+    <p>
+      Destructive actions always run through a preview first: APT removals are
+      simulated and bound to the plan you confirmed, residual purges back up
+      configuration files before deleting them, and every privileged
+      operation runs through a dedicated, polkit-authorized helper so the
+      authentication prompt names exactly what will happen.
+    </p>
+  </description>
+  <screenshots>
+    <screenshot type="default">
+      <caption>The installed application list</caption>
+      <image>https://raw.githubusercontent.com/ell-shad/appector/main/assets/screenshots/appector-list-view.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Installing local packages after a review</caption>
+      <image>https://raw.githubusercontent.com/ell-shad/appector/main/assets/screenshots/install-files.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Cleaning up leftover APT configurations</caption>
+      <image>https://raw.githubusercontent.com/ell-shad/appector/main/assets/screenshots/cleanup-residuals.png</image>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <release version="0.3.0" date="2026-11-14">
+      <description>
+        <p>Security and data-safety remediation release.</p>
+        <ul>
+          <li>Privileged operations run through a dedicated polkit-authorized helper; authentication prompts now name the exact operation.</li>
+          <li>Multi-arch safety: residual purges refuse to run when another architecture of the same package is installed.</li>
+          <li>Confirmed plans: APT removals, autoremove and updates are bound to the preview you accepted and refuse to run when the transaction changed.</li>
+          <li>Plain-HTTP Flatpak references are refused; .flatpakref files are reviewed and re-checked before installation.</li>
+          <li>Confirmation dialogs are scrollable plans showing the complete dependency cascade; progress can be cancelled.</li>
+          <li>Per-user state moved to ~/.local/state/appector (migrated automatically).</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.2.1" date="2026-10-10">
+      <description>
+        <p>Bug-fix release: duplicate-detection fixes, flatpakref review text, and dependency metadata.</p>
+      </description>
+    </release>
+  </releases>
+  <categories>
+    <category>System</category>
+  </categories>
+  <keywords>
+    <keyword>package</keyword>
+    <keyword>manager</keyword>
+    <keyword>install</keyword>
+    <keyword>uninstall</keyword>
+    <keyword>remove</keyword>
+    <keyword>apt</keyword>
+    <keyword>snap</keyword>
+    <keyword>flatpak</keyword>
+    <keyword>appimage</keyword>
+    <keyword>cleanup</keyword>
+  </keywords>
+</component>

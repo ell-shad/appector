@@ -1,5 +1,8 @@
 __pycache__/
 *.py[cod]
+
+# Crash dumps from aborted tooling runs (e.g. git bundle crashes).
+core
 *.egg-info/
 .eggs/
 build/

@@ -6,12 +6,20 @@ subprocesses, no filesystem writes: this module answers questions, and
 
 Kept separate from execution so the rules can be read, reviewed, and tested on
 their own, and so both the package-manager and residual-purge subsystems share
-one definition of "safe".
+one definition of "safe" (F15: this is the *only* place shared package-name
+helpers and simulation parsing are defined).
+
+APT risk model (S11): risk is decided from dpkg metadata when the caller can
+provide it (``metadata`` mapping from `apt_metadata.get_apt_metadata_map`),
+plus a small exact-name list. Substring heuristics ("gnome", "desktop", ...)
+misfired on packages like gnome-calculator and desktop-file-utils.
 """
 
 import re
 
-BATCH_REMOVABLE_MANAGERS = {
+# The managers whose apps can be removed. Historically two identical sets
+# existed; one constant now backs both names (S11).
+REMOVABLE_MANAGERS = {
     "Snap",
     "Flatpak",
     "AppImage",
@@ -19,13 +27,9 @@ BATCH_REMOVABLE_MANAGERS = {
     "APT",
 }
 
-SINGLE_REMOVABLE_MANAGERS = {
-    "Snap",
-    "Flatpak",
-    "AppImage",
-    "Manual",
-    "APT",
-}
+# Compatibility aliases: callers and tests refer to these names.
+BATCH_REMOVABLE_MANAGERS = REMOVABLE_MANAGERS
+SINGLE_REMOVABLE_MANAGERS = REMOVABLE_MANAGERS
 
 BLOCKED_PACKAGE_IDS = {
     "appector",
@@ -70,6 +74,7 @@ BLOCKED_PACKAGE_IDS = {
     "plymouth",
     "policykit-1",
     "polkitd",
+    "pkexec",
     "sudo",
     "ca-certificates",
     "ubuntu-keyring",
@@ -91,6 +96,14 @@ FLATPAK_BLOCKED_PREFIXES = (
     "org.qtproject.qt",
     "com.github.libui",
 )
+
+# Snap runtime/base snaps: exactly "core" or "core<digits>" (S11). The old
+# startswith("core") rule also blocked unrelated snaps like corectrl.
+SNAP_CORE_RE = re.compile(r"^core[0-9]*$")
+
+# Snap names skipped by the scanner: the blocked set covers runtime snaps and
+# helpers; keep one definition (S11) instead of a second hand-maintained copy.
+SNAP_SKIP_NAMES = frozenset(BLOCKED_PACKAGE_IDS)
 
 APT_CRITICAL_PACKAGES = {
     "appector",
@@ -125,6 +138,7 @@ APT_CRITICAL_PACKAGES = {
     "plymouth",
     "policykit-1",
     "polkitd",
+    "pkexec",
     "procps",
     "sddm",
     "snapd",
@@ -142,6 +156,35 @@ APT_CRITICAL_PACKAGES = {
     "mutter",
     "kwin-wayland",
     "kwin-x11",
+    # Debian and derivatives (S11): the list above is Ubuntu-centric, so a
+    # Debian/Mint/Pop!_OS system would let these through.
+    "debian-archive-keyring",
+    "libc6",
+    "libc-bin",
+    "login",
+    "passwd",
+    "mount",
+    "base-files",
+    "netplan.io",
+    "openssh-server",
+    "ufw",
+    "cryptsetup",
+    "lvm2",
+    "shim-signed",
+    "efibootmgr",
+    "dbus",
+    "udev",
+    "gnome-core",
+    "plasma-desktop",
+    "xfce4",
+    "cinnamon-desktop-environment",
+    "mate-desktop-environment",
+    "task-cinnamon-desktop",
+    "task-gnome-desktop",
+    "task-kde-desktop",
+    "task-lxde-desktop",
+    "task-mate-desktop",
+    "task-xfce-desktop",
 }
 
 APT_CRITICAL_PACKAGES_LOWER = {
@@ -173,28 +216,28 @@ APT_CRITICAL_PREFIXES_LOWER = tuple(
     for prefix in APT_CRITICAL_PREFIXES
 )
 
-APT_HIGH_RISK_SUBSTRINGS = (
-    "desktop",
-    "session",
-    "shell",
-    "display-manager",
-    "login",
-    "gdm",
-    "lightdm",
-    "sddm",
-    "xorg",
-    "wayland",
-    "gnome",
-    "kde",
-    "xfce",
-    "cinnamon",
-    "mate",
-    "budgie",
-    "kernel",
-    "firmware",
-    "bootloader",
-    "grub",
-)
+# Exact names that stay "high risk" without dpkg metadata (S11). Kept small
+# on purpose: the metadata-driven rules below carry the general cases.
+APT_HIGH_RISK_EXACT = {
+    "gnome-control-center",
+    "gnome-tweaks",
+    "gnome-software",
+    "snapd-desktop-integration",
+    "ubuntu-release-upgrader-gtk",
+    "update-manager",
+    "update-notifier",
+    "software-properties-gtk",
+    "xserver-xorg",
+    "wayland-protocols",
+    "tasksel",
+}
+
+# dpkg priorities that make a package part of the base system.
+APT_CRITICAL_PRIORITIES = {"required", "important"}
+
+# dpkg sections whose packages are system-critical by nature.
+APT_HIGH_RISK_SECTIONS = {"kernel", "admin", "metapackages"}
+
 
 # An APT removal that would take more than this many packages at once is
 # blocked: that scale indicates a dependency cascade, not an app removal.
@@ -203,7 +246,7 @@ APT_MAX_REMOVALS = 100
 
 # Package names must survive being passed as an argv element to apt, dpkg,
 # flatpak and snap. This rejects anything that could be read as an option or
-# as shell syntax rather than a name.
+# as shell syntax rather than a name. Single definition (F15).
 SAFE_PACKAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:-]*$")
 
 
@@ -213,6 +256,16 @@ def _normalize_package_id(name: str) -> str:
 
 def _base_package_name(name: str) -> str:
     return str(name or "").split(":", 1)[0]
+
+
+def _package_arch(name: str) -> str:
+    _, separator, arch = str(name or "").partition(":")
+    return arch if separator else ""
+
+
+def is_snap_runtime(name: str) -> bool:
+    """True for snap base/runtime snaps (core, core18, ...)."""
+    return bool(SNAP_CORE_RE.match(_normalize_package_id(name)))
 
 
 def _is_safe_package_id(name: str) -> bool:
@@ -234,6 +287,17 @@ def is_critical_apt_package_name(name: str) -> bool:
         if base.startswith(prefix):
             return True
 
+    return False
+
+
+def is_critical_apt_metadata(metadata) -> bool:
+    """dpkg-metadata view of "the system needs this package" (S11)."""
+    if not isinstance(metadata, dict):
+        return False
+    if str(metadata.get("essential", "")).strip().lower() == "yes":
+        return True
+    if str(metadata.get("priority", "")).strip().lower() in APT_CRITICAL_PRIORITIES:
+        return True
     return False
 
 
@@ -259,6 +323,38 @@ def _split_safe_package_ids(package_ids):
             invalid.append(package_id)
     return valid, invalid
 
+
+def _parse_apt_simulation_removed_packages(output: str):
+    """Extract package tokens from `Remv`/`Purg` lines of an apt simulation.
+
+    Architecture-qualified (S2): `Purg libfoo:i386` yields ``libfoo:i386``,
+    not ``libfoo`` — callers compare exact `name:arch` identities.
+    """
+    removed = []
+    for line in output.splitlines():
+        if line.startswith(("Remv ", "Purg ")):
+            parts = line.split()
+            if len(parts) >= 2:
+                removed.append(parts[1])
+
+    seen = set()
+    unique_removed = []
+
+    for package_name in removed:
+        if package_name not in seen:
+            seen.add(package_name)
+            unique_removed.append(package_name)
+
+    return unique_removed
+
+
+def _format_package_list(packages, limit=50):
+    lines = [f"• {name}" for name in packages[:limit]]
+    if len(packages) > limit:
+        lines.append(f"• …and {len(packages) - limit} more")
+    return "\n".join(lines)
+
+
 def is_blocked(app) -> bool:
     manager = str(getattr(app, "manager", "") or "").strip()
     package_id = str(getattr(app, "package_id", "") or "").strip()
@@ -272,7 +368,7 @@ def is_blocked(app) -> bool:
         return True
 
     if manager == "Snap":
-        if normalized.startswith("core"):
+        if is_snap_runtime(package_id):
             return True
 
     if manager == "Flatpak":
@@ -305,7 +401,7 @@ def can_remove_single(app) -> bool:
     return manager in SINGLE_REMOVABLE_MANAGERS and not is_blocked(app)
 
 
-def get_removal_risk(app):
+def get_removal_risk(app, metadata=None):
     """
     Returns:
 
@@ -317,6 +413,10 @@ def get_removal_risk(app):
         "medium"
         "high"
         "blocked"
+
+    ``metadata`` is an optional dpkg metadata mapping (see
+    `apt_metadata.get_apt_metadata_map`) used for APT risk decisions; when
+    absent, decisions fall back to the exact-name lists.
     """
 
     if is_blocked(app):
@@ -341,7 +441,7 @@ def get_removal_risk(app):
         return "low", "Removes a Flatpak application."
 
     if manager == "Snap":
-        if normalized.startswith("core"):
+        if is_snap_runtime(package_id):
             return "blocked", "Snap runtime/base snaps are blocked."
         return "normal", ""
 
@@ -349,12 +449,32 @@ def get_removal_risk(app):
         if is_critical_apt_package_name(package_id):
             return "blocked", "Critical APT package."
 
-        for substring in APT_HIGH_RISK_SUBSTRINGS:
-            if substring in normalized:
+        if is_critical_apt_metadata(metadata):
+            return (
+                "blocked",
+                "dpkg marks this package as essential or base-system "
+                "(required/important priority).",
+            )
+
+        if normalized in APT_HIGH_RISK_EXACT:
+            return (
+                "high",
+                "This package is part of the desktop or update infrastructure.",
+            )
+
+        section = str((metadata or {}).get("section", "")).strip().lower()
+        if section in APT_HIGH_RISK_SECTIONS and section:
+            if section == "metapackages":
                 return (
                     "high",
-                    "This package may affect your desktop session or core system.",
+                    "Metapackage: removing it can drag whole desktop stacks "
+                    "with it.",
                 )
+            return (
+                "high",
+                "This package belongs to a system-critical section "
+                f"({section}).",
+            )
 
         if normalized.startswith("lib"):
             return (

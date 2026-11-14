@@ -1,0 +1,19 @@
+# Keep CI actions and pip tooling current; every update is pinned-by-SHA in
+# the workflows, so Dependabot PRs are the review point for those bumps.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: monthly
+    allow:
+      - dependency-name: ruff
+      - dependency-name: coverage
