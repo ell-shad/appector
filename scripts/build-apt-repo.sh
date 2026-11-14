@@ -63,8 +63,26 @@ POOL_DIR="$OUTPUT_ROOT/pool/$COMPONENT/a/appector"
 DISTS_DIR="$OUTPUT_ROOT/dists/$SUITE"
 BINARY_DIR="$DISTS_DIR/$COMPONENT/binary-$ARCHITECTURE"
 
+# Pool retention (S12): publish the newest releases and keep the previous
+# two in the pool so users on the last release still receive the files
+# their apt lists reference. The pool is rebuilt from this retention set,
+# not from the whole history.
+POOL_RETENTION=3
+
 rm -rf "$OUTPUT_ROOT"
 mkdir -p "$POOL_DIR" "$BINARY_DIR"
+
+# Retention seeding (S12): when a previous repository snapshot is provided
+# (checked out by CI next to this tree), carry its pool forward so the new
+# index keeps listing the previous releases users may still reference; the
+# retention trim below then keeps only the newest $POOL_RETENTION files.
+if [ -n "${APPECTOR_PREVIOUS_REPO:-}" ] && [ -d "$APPECTOR_PREVIOUS_REPO/pool" ]; then
+    find "$APPECTOR_PREVIOUS_REPO/pool" -name 'appector_*.deb' -type f -print \
+        | while IFS= read -r previous; do
+            cp "$previous" "$POOL_DIR/$(basename "$previous")"
+            log "carried over $(basename "$previous")"
+        done
+fi
 
 while IFS= read -r package; do
     [ -n "$package" ] || continue
@@ -72,6 +90,13 @@ while IFS= read -r package; do
     cp "$package" "$POOL_DIR/$name"
     log "pooled $name"
 done < "$PACKAGE_LIST"
+
+# Retention trim (S12): keep the newest $POOL_RETENTION .debs in the pool.
+ls -1v "$POOL_DIR"/appector_*.deb 2>/dev/null | head -n -"$POOL_RETENTION" \
+    | while IFS= read -r stale; do
+        rm -f "$stale"
+        log "retention removed $(basename "$stale")"
+    done
 
 # ---------------------------------------------------------------------------
 # Packages index
@@ -115,8 +140,27 @@ for relative in sorted([
     path = dists / relative
     data = path.read_bytes()
     entries.append((relative, hashlib.sha256(data).hexdigest(), len(data)))
+    # The By-Hash copy of this index is itself an index file: it belongs
+    # in the Release checksums (clients with Acquire-By-Hash: yes fetch
+    # exactly this name) and in the on-disk layout.
+    hashed_relative = (
+        f"{component}/binary-{architecture}/by-hash/SHA256/"
+        f"{hashlib.sha256(data).hexdigest()}"
+    )
+    entries.append((hashed_relative, hashlib.sha256(data).hexdigest(), len(data)))
 
 date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+
+# Valid-Until (S12): bound the metadata's lifetime (7 days) so a
+# man-in-the-middle cannot serve stale Release files forever; apt refreshes
+# and refuses metadata past this date.
+valid_until = (
+    datetime.now(timezone.utc).timetuple()
+)
+from datetime import timedelta  # noqa: E402
+
+valid_until = datetime.now(timezone.utc) + timedelta(days=7)
+valid_until_text = valid_until.strftime("%a, %d %b %Y %H:%M:%S +0000")
 
 lines = [
     "Origin: Appector",
@@ -128,13 +172,29 @@ lines = [
     f"Section: {section}",
     "Description: Appector Debian package repository",
     f"Date: {date}",
-    "Acquire-By-Hash: no",
+    f"Valid-Until: {valid_until_text}",
+    # By-Hash indexes (S12): apt fetches index files by checksum, so an
+    # in-flight mirror update can never serve a mixed state.
+    "Acquire-By-Hash: yes",
     "SHA256:",
 ]
 for relative, digest, size in entries:
     lines.append(f" {digest} {size:>16} {relative}")
 
 (dists / "Release").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+# By-Hash indexes: for each *plain* index file, copy it to
+# by-hash/SHA256/<checksum>. The hashed copies are already part of
+# `entries` (and therefore of the Release checksums) via the loop above.
+for relative, digest, _size in entries:
+    if "/by-hash/" in relative:
+        continue
+    plain = dists / relative
+    hashed_dir = plain.parent / "by-hash" / "SHA256"
+    hashed_dir.mkdir(parents=True, exist_ok=True)
+    hashed_file = hashed_dir / digest
+    if not hashed_file.exists():
+        hashed_file.write_bytes(plain.read_bytes())
 PY
 
 log "wrote $DISTS_DIR/Release"

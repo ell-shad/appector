@@ -1,0 +1,11 @@
+# Default owner: everything needs a review from the maintainer.
+* @ell-shad
+
+# The security-critical code additionally needs review from someone who
+# knows the ADR-0003 threat model.
+/appector/helper.py          @ell-shad
+/appector/helper_client.py   @ell-shad
+/appector/residual.py        @ell-shad
+/appector/policy.py          @ell-shad
+/appector/plans.py           @ell-shad
+/helper/                     @ell-shad

@@ -154,3 +154,129 @@ therefore cannot see pre-releases.
 - Show local Debian package metadata, file hash and APT transaction preview
   before installation.
 - Generate GitHub build-provenance attestations for release Debian packages.
+## [0.3.0] - 2026-11-14 — security and data-safety remediation (review round 1)
+
+### Security
+- **S2**: residual APT identities are now `name:arch`; purges are refused
+  when another architecture instance of the same package is installed
+  (multiarch protection), before and after the conffile backup.
+- **S3**: plain-HTTP `.flatpakref` URLs and plain-HTTP repositories declared
+  inside ref files are refused; `.flatpakref` files are reviewed before
+  installation and re-checked for changes; app-ID installs pass the Flathub
+  remote explicitly; the `Url=` fallback install was removed.
+- **S4**: every removal/autoremove/upgrade execution is bound to the plan
+  the user confirmed — re-simulations that grew, critical packages, or
+  update transactions containing removals are refused. Autoremove and
+  updates previously ran with no gate at all.
+- **S7**: unified process runner — non-UTF-8 output no longer fails
+  exit-0 commands, timeouts kill whole process groups (with a root-side
+  `timeout` under pkexec), output is bounded, cancellation is supported,
+  `LC_ALL=C` is forced, pkexec argv carries the non-interactive settings.
+  The activity log escapes newlines (no forged log lines), uses timezone
+  aware timestamps, and rotates at 1 MiB × 3.
+- **S8**: standalone AppImage removal goes through the same
+  allowlist/ownership/regular-file validation as managed removals;
+  launcher ownership uses exact desktop-key values; symlink-parent escapes
+  are resolved and refused.
+- **S9**: conffile backup parents are created without following symlinks;
+  backups for purges that never start are discarded; pruning deletes
+  incomplete backups first and keeps the newest 10 *complete* ones;
+  root-only conffiles can be skipped behind an explicit, logged choice.
+- **S10**: CSV export escapes formula-injection cells; exports are atomic,
+  0600, and include exec/details/duplicate columns.
+
+### Fixed
+- **F1** Flatpak install dates are used instead of discarded; **F2** real
+  Flatpak display names and ID-based duplicate identity (no more
+  "Client"/"client" false duplicates); **F3** `normalize_exec` handles
+  quoted paths and wrapper commands; **F4** APT installed-state uses
+  `${db:Status-Abbrev}` `ii` and `name:arch` keys; **F5** history.log
+  parsing handles `(version, automatic)` and falls back to
+  `/var/lib/dpkg/info/<pkg>.list` mtimes; **F7** the desktop parser honours
+  `[Desktop Entry]` group boundaries, TryExec, ShowIn and Type;
+  **F15/F16** shared helpers have single definitions (enforced by test);
+  batch-removal progress reaches 100% and an APT backup failure no longer
+  aborts Snap/Flatpak removals.
+- **F6**: all scanner subprocesses carry timeouts, dpkg ownership lookups
+  are batched, scans run in parallel, and each source reports status
+  (ok / tool-missing / failed); marks are no longer pruned for sources
+  that failed to scan.
+- **F8**: APT source labels work on Debian/Mint/Pop!_OS/Raspbian; PPAs are
+  matched on their launchpad host.
+- **F10**: manual scanner marks CLI-only executables as non-GUI, uses
+  common per-user tool directories, derives removal paths from the
+  resolved Exec target only, and classifies Chrome/Steam/Wine launchers.
+- **F11**: Flatpak installation scope comes from the recorded installation
+  name; "already installed" detection uses `flatpak info` exit codes.
+- **F14**: XDG_STATE_HOME/XDG_CACHE_HOME are honoured with one-time
+  migration from the legacy `app-manager` directories (old data kept).
+
+### Removed
+- Duplicate `_parse_apt_simulation_removed_packages`,
+  `_format_package_list`, `_deduplicate_package_ids`,
+  `_split_safe_package_ids` and `SAFE_PACKAGE_ID_RE` definitions; the
+  `Url=` flatpakref fallback; the substring APT "high risk" heuristic.
+
+### Changed
+- `appector --version` and the root-refusal check no longer require GTK;
+  files can be passed on the command line (`appector foo.deb`) and are
+  routed into the install flow (HANDLES_OPEN).
+
+### Privileged helper and UI correctness (phases 2–3)
+
+### Added
+- **ADR-0003 and the privileged helper**: `appector-helper` (installed
+  root-owned at `/usr/lib/appector/appector-helper`) with a per-operation
+  polkit policy; strict JSON request schema, root-side re-validation,
+  nonce-echoing JSON-lines events; `appector/helper_client.py` fails fast
+  when the helper or pkexec is missing. .deb installs, APT
+  remove/purge/autoremove/upgrade, Snap and system-Flatpak removals, and
+  the residual purge (including its conffile backup) all run through it.
+- `appector/ui/` package: `run_async` worker plumbing (errors surfaced,
+  tracebacks logged, controls always re-enabled), the cancellable
+  `TaskProgressDialog`, and the scrollable `ConfirmPlanDialog` whose
+  "also removed" list is never truncated.
+
+### Changed
+- Batch confirmation shows the full dependency cascade and exact file
+  paths, computes the disk estimate in a worker, and disables Remove while
+  the plan is loading or blocked; Cancel has the default focus.
+- `Ctrl+Delete` replaces the bare `Delete` shortcut; mark-all/remove-marked
+  ignore activation while a text entry has focus.
+- Cancelling an export file chooser no longer reports an error; search
+  text is markup-escaped.
+
+### Removed
+- Every `pkexec sh -c` call, the `APP_MANAGER_*` text protocol, and the
+  silent unprivileged fallbacks when pkexec is unavailable.
+
+## Unreleased — review milestones completed (phases 3–5 continuation)
+
+### Added
+- Scan-status banner naming failed or missing sources, with a per-source
+  details dialog (F6/U8); PACKAGE SOURCE filter chips with live counts (U9);
+  a redesigned details card with risk badge and duplicate collisions (U9).
+- Structured .deb review: maintainer scripts, setuid files, /etc/apt paths
+  and systemd units extracted per package and shown in a structured dialog
+  (F13/U10); .flatpakref review dialog.
+- AppImage install hardening: type-1/type-2 magic validation, content-hash
+  identity, atomic copy and launcher writes (F9).
+- i18n scaffolding (gettext, APECTOR_LOCALEDIR); German desktop strings.
+
+### Changed
+- The update check refreshes APT package lists first and reports
+  /var/run/reboot-required and needrestart output (F12).
+- The residual-purge confirmation simulates off-thread and shows the full
+  plan on the confirm dialog (U1/U2).
+- libadwaita 1.5 is the declared minimum (Depends + metainfo) (U4).
+- The APT repository publishes the attested release artifact (never
+  rebuilt), retains the newest three pool releases, and signs metadata
+  with Valid-Until and Acquire-By-Hash (S12).
+
+### Fixed
+- dpkg ownership lookups crashed every call (stderr mixed with
+  capture_output) and parsed `dpkg -S` output inverted — APT desktop
+  files were listed as Manual entries; verified against the real
+  dpkg-query.
+- Search input no longer refilters on every keystroke (debounced) and the
+  list keeps selection and scroll position across rescans (U8).

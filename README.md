@@ -39,6 +39,7 @@ Behavior-changing decisions are recorded in `docs/decisions/`:
 
 - [ADR-0001: Gate every APT residual purge behind a full pre-flight](docs/decisions/0001-gate-apt-residual-purge.md)
 - [ADR-0002: Split safety policy, process execution, and the residual subsystem](docs/decisions/0002-split-safety-policy-and-residual.md)
+- [ADR-0003: A dedicated privileged helper replaces `pkexec sh -c`](docs/decisions/0003-privileged-helper.md)
 
 Module layout:
 
@@ -48,8 +49,22 @@ Module layout:
 | `appector/_proc.py` | Command execution, apt lock, activity log. |
 | `appector/residual.py` | APT residual-configuration purge end to end. |
 | `appector/actions.py` | Install/update/remove across apt, snap, Flatpak, AppImage. |
+| `appector/managers/flatpak.py` | The Flatpak surface (remotes, installs, cleanup). |
 | `appector/scanners.py` | Discovery of installed apps. |
-| `appector/window.py` | GTK/libadwaita user interface. |
+| `appector/plans.py` | Confirmed-transaction plans (consent binding). |
+| `appector/paths.py` | XDG-aware state/cache locations + legacy migration. |
+| `appector/helper.py` + `helper/` | The privileged helper and its polkit policy (ADR-0003). |
+| `appector/helper_client.py` | Client side of the helper protocol. |
+| `appector/window.py` | GTK/libadwaita main window (composition). |
+| `appector/ui/` | Dialogs and task plumbing (progress, confirm, review, details, install). |
+
+Every privileged operation — .deb installs, APT remove/purge/autoremove,
+Snap and system-Flatpak removals, updates and residual purges — runs
+through `appector-helper`, a dedicated root-owned program with one polkit
+action per operation, so the authorization prompt names exactly what will
+happen. Running Appector from a source checkout without the packaged
+helper refuses privileged operations with an explanation instead of
+silently degrading.
 
 ## Limitations
 - Appector only supports Debian based distributions at the moment.
@@ -220,7 +235,7 @@ When Appector purges APT residual configurations it first backs up dpkg-listed
 conffiles under:
 
 ```text
-~/.local/state/app-manager/purge-backups/
+~/.local/state/appector/purge-backups/
 ```
 
 The backup includes a `manifest.json` and copies under `files/`. Appector
@@ -244,12 +259,12 @@ additional files, which is why the simulation is the authoritative preview.
 
 App data and activity state are stored per user:
 
-- `~/.local/share/app-manager/appimages/` — managed AppImage copies.
+- `~/.local/share/appector/appimages/` — managed AppImage copies.
 - `~/.local/share/applications/` — Appector-created AppImage launchers.
-- `~/.local/state/app-manager/actions.log` — activity log.
-- `~/.local/state/app-manager/marked.json` — staged removal marks.
-- `~/.local/state/app-manager/ui.json` — window and view preferences.
-- `~/.local/state/app-manager/purge-backups/` — pre-purge conffile backups.
+- `~/.local/state/appector/actions.log` — activity log (rotated at 1 MiB, three generations kept).
+- `~/.local/state/appector/marked.json` — staged removal marks.
+- `~/.local/state/appector/ui.json` — window and view preferences.
+- `~/.local/state/appector/purge-backups/` — pre-purge conffile backups.
 
 The activity log, staged removal marks, purge backups, and newly generated
 CSV/JSON exports are written with user-only permissions. The activity log can

@@ -1,49 +1,190 @@
-import os
+"""Installed-application discovery.
+
+Scanners for APT, Snap, Flatpak, AppImage and "manual" installs, plus the
+residual-configuration (leftover) scanner. Every subprocess call carries a
+timeout (F6), every parse is locale-independent (LC_ALL=C), and dpkg owner
+lookups are batched into a single call per scan.
+
+The desktop-file parser honours group boundaries ([Desktop Entry] only,
+F7), and APT identities are `name:arch` everywhere (F4, S2).
+"""
+
+import configparser
 import gzip
+import os
 import re
+import shlex
+import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
 from urllib.parse import unquote, urlsplit
 
 from .models import AppEntry
+from .paths import appimage_dir, legacy_appimage_dir
+from .policy import SNAP_SKIP_NAMES, _base_package_name
+
+# Per-call timeouts: a hung snapd or flatpak must never freeze the scan.
+SCAN_TIMEOUT = 60
+LIST_TIMEOUT = 30
+
+# Wrapper commands whose argument is the real program (F3). Unwrapped while
+# another candidate token remains.
+EXEC_WRAPPERS = {
+    "env",
+    "exec",
+    "sh",
+    "bash",
+    "dash",
+    "sudo",
+    "pkexec",
+    "flatpak",
+    "snap",
+    "gtk-launch",
+    "gamemoderun",
+    "gamemoderun-wrapper",
+    "dbus-launch",
+    "nice",
+    "nohup",
+    "optirun",
+    "primusrun",
+    "vglrun",
+}
+
+# Sub-commands to skip while unwrapping a wrapper before the real target.
+EXEC_SUBCOMMANDS = {"run", "spread", "launch", "shell"}
+
+# Shell names whose `-c` argument is itself a command line.
+_EXEC_SHELLS = {"sh", "bash", "dash", "rbash", "zsh"}
+
+FIELD_CODE_RE = re.compile(r"%[a-zA-Z%]")
+ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 # ------------------------------------------------------------
 # Desktop file helpers
 # ------------------------------------------------------------
 
-def parse_desktop_file(path: str) -> Tuple[str, List[str], bool, bool, str, str]:
-    name = ""
-    categories: List[str] = []
-    no_display = False
-    hidden = False
-    icon = ""
-    exec_line = ""
 
+def _read_desktop_entry(path) -> configparser.ConfigParser:
+    """Parse only the [Desktop Entry] group of a .desktop file (F7).
+
+    `configparser` with interpolation off and strict off accepts the real
+    world's desktop files (duplicate keys, % placeholders) while keeping
+    group boundaries, so `NoDisplay` inside a [Desktop Action ...] group no
+    longer hides the whole application.
+    """
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        strict=False,
+        delimiters=("=",),
+        inline_comment_prefixes=("#",),
+    )
+    parser.optionxform = str.lower
     try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for raw in f:
-                line = raw.strip()
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            parser.read_file(handle)
+    except (OSError, configparser.Error):
+        pass
+    return parser
 
-                if line.startswith("NoDisplay=true"):
-                    no_display = True
-                elif line.startswith("Hidden=true"):
-                    hidden = True
-                elif line.startswith("Name=") and not name:
-                    name = line.split("=", 1)[1].strip()
-                elif line.startswith("Categories="):
-                    value = line.split("=", 1)[1].strip()
-                    categories = [c for c in value.split(";") if c]
-                elif line.startswith("Icon=") and not icon:
-                    icon = line.split("=", 1)[1].strip()
-                elif line.startswith("Exec=") and not exec_line:
-                    exec_line = line.split("=", 1)[1].strip()
-    except Exception:
+
+def _entry_value(parser, key: str, locale: str = "") -> str:
+    if not parser.has_section("Desktop Entry"):
+        return ""
+    entry = parser["Desktop Entry"]
+    if key in entry and str(entry[key] or "").strip():
+        return str(entry[key]).strip()
+    if locale:
+        for suffix in (f"[{locale}]", f"[{locale.split('_', 1)[0]}]"):
+            for candidate in entry:
+                if candidate.lower() == f"{key}{suffix}".lower():
+                    value = str(entry[candidate] or "").strip()
+                    if value:
+                        return value
+    else:
+        # Any localized variant beats an empty plain key.
+        for candidate in entry:
+            if candidate.lower().startswith(f"{key}["):
+                value = str(entry[candidate] or "").strip()
+                if value:
+                    return value
+    return ""
+
+
+def _desktop_visible(parser) -> bool:
+    """F7: every hide/show rule evaluated for the [Desktop Entry] group."""
+    entry = parser["Desktop Entry"] if parser.has_section("Desktop Entry") else {}
+
+    def flag(key: str) -> bool:
+        return str(entry.get(key, "")).strip().lower() in {"true", "1"}
+
+    if flag("nodisplay") or flag("hidden"):
+        return False
+
+    entry_type = str(entry.get("type", "")).strip().lower()
+    if entry_type and entry_type != "application":
+        return False
+
+    try_exec = str(entry.get("tryexec", "")).strip()
+    if try_exec and not shutil.which(try_exec):
+        # A resolved path (with a slash) that is not executable also hides.
+        if "/" in try_exec or not shutil.which(try_exec):
+            if not (Path(try_exec).is_file() and os.access(try_exec, os.X_OK)):
+                return False
+
+    current_desktops = {
+        value.strip().lower()
+        for value in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":")
+        if value.strip()
+    }
+    not_show_in = {
+        value.strip().lower()
+        for value in str(entry.get("notshowin", "")).split(";")
+        if value.strip()
+    }
+    only_show_in = {
+        value.strip().lower()
+        for value in str(entry.get("onlyshowin", "")).split(";")
+        if value.strip()
+    }
+    if current_desktops:
+        if current_desktops & not_show_in:
+            return False
+        if only_show_in and not (current_desktops & only_show_in):
+            return False
+    elif only_show_in:
+        # Restricted to desktops we cannot identify; an uninstaller should
+        # still let the user see and remove the entry.
         pass
 
-    return name, categories, no_display, hidden, icon, exec_line
+    return True
+
+
+def parse_desktop_file(path: str) -> tuple[str, list[str], bool, bool, str, str]:
+    """Return (name, categories, no_display, hidden, icon, exec) for one file.
+
+    `no_display` is True when the entry must not be listed at all (F7):
+    NoDisplay/Hidden, non-Application types, missing TryExec, or a ShowIn
+    restriction that excludes the running desktop.
+    """
+    parser = _read_desktop_entry(path)
+    if not parser.has_section("Desktop Entry"):
+        return "", [], False, False, "", ""
+
+    entry = parser["Desktop Entry"]
+    name = _entry_value(parser, "name")
+    icon = _entry_value(parser, "icon")
+    exec_line = _entry_value(parser, "exec")
+    categories = [
+        value for value in str(entry.get("categories", "")).split(";") if value
+    ]
+
+    visible = _desktop_visible(parser)
+    explicit_hidden = str(entry.get("hidden", "")).strip().lower() in {"true", "1"}
+    return name, categories, not visible, explicit_hidden, icon, exec_line
 
 
 def find_flatpak_icon(app_id: str) -> str:
@@ -61,12 +202,30 @@ def find_flatpak_icon(app_id: str) -> str:
     return ""
 
 
-def find_snap_icon(snap_name: str) -> str:
-    desktop_dir = Path("/var/lib/snapd/desktop/applications")
+_SNAP_ICON_CACHE: dict[str, tuple[float, str]] = {}
 
+
+def find_snap_icon(snap_name: str) -> str:
+    """Snap launcher icon, cached per snapd desktop directory generation (F6)."""
+    desktop_dir = Path("/var/lib/snapd/desktop/applications")
     if not desktop_dir.exists():
         return ""
 
+    try:
+        generation = desktop_dir.stat().st_mtime
+    except OSError:
+        generation = 0.0
+
+    cached = _SNAP_ICON_CACHE.get(snap_name)
+    if cached and cached[0] == generation:
+        return cached[1]
+
+    icon = _find_snap_icon_uncached(desktop_dir, snap_name)
+    _SNAP_ICON_CACHE[snap_name] = (generation, icon)
+    return icon
+
+
+def _find_snap_icon_uncached(desktop_dir: Path, snap_name: str) -> str:
     patterns = [
         f"{snap_name}.desktop",
         f"{snap_name}_*.desktop",
@@ -87,7 +246,7 @@ def find_snap_icon(snap_name: str) -> str:
     try:
         for path in desktop_dir.glob("*.desktop"):
             try:
-                text = path.read_text(encoding="utf-8", errors="ignore")
+                text = path.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 continue
 
@@ -103,10 +262,11 @@ def find_snap_icon(snap_name: str) -> str:
         pass
 
     return ""
-    
+
+
 def get_desktop_icon(path) -> str:
     try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             for raw in f:
                 line = raw.strip()
                 if line.startswith("Icon="):
@@ -115,7 +275,8 @@ def get_desktop_icon(path) -> str:
         pass
     return ""
 
-def map_categories(categories: List[str]) -> str:
+
+def map_categories(categories: list[str]) -> str:
     mapping = {
         "audiovideo": "Multimedia",
         "audio": "Multimedia",
@@ -146,113 +307,168 @@ def map_categories(categories: List[str]) -> str:
     return "Other"
 
 
-def get_package_owner(path: str) -> Optional[str]:
+# ------------------------------------------------------------
+# dpkg ownership (batched, F6)
+# ------------------------------------------------------------
+
+
+def _dpkg_env():
+    return {**os.environ, "LC_ALL": "C"}
+
+
+def get_package_owners(paths) -> dict[str, str]:
+    """Map each path to its owning dpkg package in one dpkg-query call.
+
+    Paths that no package owns (or that cannot be resolved) are absent from
+    the result. Diversion lines are ignored.
+    """
+    unique_paths = list(dict.fromkeys(str(p) for p in paths if str(p or "").strip()))
+    if not unique_paths:
+        return {}
+
     try:
-        out = subprocess.check_output(
-            ["dpkg", "-S", path],
+        # stderr=DEVNULL is redundant with capture_output and would raise
+        # ValueError ("stdout and stderr arguments may not be used with
+        # capture_output") on every call; stdout/stderr come from
+        # capture_output instead.
+        result = subprocess.run(
+            ["dpkg-query", "-S", "--", *unique_paths],
             text=True,
-            stderr=subprocess.DEVNULL,
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=SCAN_TIMEOUT,
+            env=_dpkg_env(),
         )
-        return out.split(":", 1)[0].strip()
-    except Exception:
-        return None
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+
+    owners: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        # dpkg-query -S prints "package[, local: ...]: /absolute/path".
+        # The path follows the LAST colon on the line: package names can
+        # contain colons (name:arch), paths cannot (they are absolute).
+        package, separator, path = line.rpartition(":")
+        if not separator:
+            continue
+        # Multi-owner lines list several packages, comma-separated;
+        # the first owner wins.
+        package = package.split(",")[0].strip()
+        path = path.strip()
+        if not path.startswith("/") or not package:
+            continue
+        # "diversion by <pkg> from:" and "local:" are dpkg annotations,
+        # not ownership records.
+        if package.startswith("diversion") or package in {"local", "local:"}:
+            continue
+        if path not in owners:
+            owners[path] = package
+    return owners
+
+
+def get_package_owner(path: str) -> str | None:
+    return get_package_owners([path]).get(str(path))
 
 
 # ------------------------------------------------------------
 # Leftover scanner
 # ------------------------------------------------------------
 
-def scan_leftover_configs() -> List[AppEntry]:
-    """Find APT packages in dpkg's residual-config state (removed, config remains)."""
 
-    apps: List[AppEntry] = []
+def scan_leftover_configs() -> list[AppEntry]:
+    """Find APT packages in dpkg's residual-config state (removed, config remains).
 
-    out = subprocess.check_output(
+    Identities are ``name:arch`` (S2): a bare name would let
+    ``apt-get purge libfoo`` resolve to the native architecture and purge an
+    installed instance of another architecture.
+    """
+    result = subprocess.run(
         [
             "dpkg-query",
             "-W",
-            "-f=${db:Status-Abbrev}\t${Package}\n",
+            "-f=${db:Status-Abbrev}\t${binary:Package}\n",
         ],
         text=True,
+        errors="replace",
         stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
-        timeout=30,
-        env={**os.environ, "LC_ALL": "C"},
+        capture_output=True,
+        timeout=LIST_TIMEOUT,
+        env=_dpkg_env(),
     )
+    if result.returncode != 0:
+        raise OSError(
+            result.stderr.strip() or "Could not list residual configurations."
+        )
 
-    for line in out.splitlines():
+    apps: list[AppEntry] = []
+    for line in result.stdout.splitlines():
         parts = line.split("\t", 1)
-
         if len(parts) < 2:
             continue
-
         status = parts[0].strip()
         package_name = parts[1].strip()
-
-        if status[:2] == "rc" and package_name:
-            # Defense-in-depth: dpkg package names are constrained; skip
-            # anything unexpected rather than turning it into UI state.
-            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+:-]*", package_name):
-                continue
-            apps.append(
-                AppEntry(
-                    name=package_name,
-                    manager="Leftover",
-                    source="APT residual configuration",
-                    package_id=package_name,
-                    version="",
-                    installed_at=None,
-                    category="System",
-                    is_gui_app=False,
-                    details=(
-                        "Package is already removed; only its configuration files remain. "
-                        "Purging deletes those files."
-                    ),
-                    icon="",
-                )
+        if status[:2] != "rc" or not package_name:
+            continue
+        # Defense-in-depth: dpkg package names are constrained; skip
+        # anything unexpected rather than turning it into UI state.
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+:-]*", package_name):
+            continue
+        apps.append(
+            AppEntry(
+                name=package_name,
+                manager="Leftover",
+                source="APT residual configuration",
+                package_id=package_name,
+                version="",
+                installed_at=None,
+                category="System",
+                is_gui_app=False,
+                details=(
+                    "Package is already removed; only its configuration files "
+                    "remain. Purging deletes those files."
+                ),
+                icon="",
             )
-
+        )
     return apps
 
 
 # ------------------------------------------------------------
-# Scanners
+# Install dates
 # ------------------------------------------------------------
 
-def _read_log_lines(path: Path) -> List[str]:
+
+def _read_log_lines(path: Path) -> list[str]:
     try:
         if path.suffix == ".gz":
-            with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as f:
+            with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
                 return f.readlines()
         else:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(path, encoding="utf-8", errors="replace") as f:
                 return f.readlines()
     except Exception:
         return []
 
-def get_apt_install_dates() -> Dict[str, str]:
+
+# "libfoo:amd64 (1.0, automatic), libbar (2.0)" — name[:arch], not the old
+# split(",") which produced the bogus package "automatic)" (F5).
+APT_HISTORY_ENTRY_RE = re.compile(
+    r"\b([A-Za-z0-9][A-Za-z0-9.+~_-]*)(?::([A-Za-z0-9][A-Za-z0-9._-]*))?"
+    r"\s*\(([^)]*)\)"
+)
+
+
+def get_apt_install_dates(package_ids=None) -> dict[str, str]:
+    """First install date per package, keyed by ``name:arch`` (F5).
+
+    Sources, in order: /var/log/dpkg.log*, /var/log/apt/history.log*,
+    then the mtime of /var/lib/dpkg/info/<pkg>.list for packages whose
+    install predates every retained log (the review's rotation fallback).
     """
-    Attempts to find the first install date for APT packages.
-
-    Sources:
-    - /var/log/dpkg.log*
-    - /var/log/apt/history.log*
-
-    Returns:
-        {
-            package_name: "YYYY-MM-DD"
-        }
-    """
-
-    dates: Dict[str, str] = {}
-
+    dates: dict[str, str] = {}
     log_dir = Path("/var/log")
 
-    # ------------------------------------------------------------
-    # Parse dpkg logs
-    # Example:
-    # 2024-05-01 10:11:10 install vlc:amd64 <none> 3.0.20
-    # ------------------------------------------------------------
     if log_dir.exists():
         dpkg_logs = [
             p
@@ -266,7 +482,7 @@ def get_apt_install_dates() -> Dict[str, str]:
 
                 if len(parts) >= 5 and parts[2] == "install":
                     date_str = parts[0]
-                    package_name = parts[3].split(":", 1)[0]
+                    package_name = parts[3]
                     previous_state = parts[4]
 
                     if previous_state == "<none>" and package_name:
@@ -275,12 +491,6 @@ def get_apt_install_dates() -> Dict[str, str]:
                         if not existing or date_str < existing:
                             dates[package_name] = date_str
 
-    # ------------------------------------------------------------
-    # Parse APT history logs as fallback
-    # Example:
-    # Start-Date: 2024-05-01  10:11:12
-    # Install: vlc:amd64 (3.0.20-1), ...
-    # ------------------------------------------------------------
     apt_log_dir = Path("/var/log/apt")
 
     if apt_log_dir.exists():
@@ -302,40 +512,76 @@ def get_apt_install_dates() -> Dict[str, str]:
                     except Exception:
                         current_date = None
 
-                elif line.startswith("Install:") and current_date:
+                elif line.startswith(("Install:", "Upgrade:")) and current_date:
                     value = line.split(":", 1)[1]
 
-                    for token in value.split(","):
-                        token = token.strip()
+                    for match in APT_HISTORY_ENTRY_RE.finditer(value):
+                        name = match.group(1)
+                        arch = match.group(2)
+                        entry_id = f"{name}:{arch}" if arch else name
+                        existing = dates.get(entry_id)
 
-                        if not token:
-                            continue
+                        if not existing or current_date < existing:
+                            dates[entry_id] = current_date
 
-                        package_name = token.split(":", 1)[0].split()[0]
-
-                        if package_name:
-                            existing = dates.get(package_name)
-
-                            if not existing or current_date < existing:
-                                dates[package_name] = current_date
+    if package_ids:
+        for package_id in package_ids:
+            if dates.get(package_id):
+                continue
+            fallback = _dpkg_list_date(package_id)
+            if fallback:
+                dates[package_id] = fallback
 
     return dates
 
-def get_apt_source_map(package_names: List[str]) -> Dict[str, str]:
+
+def _dpkg_list_date(package_id: str) -> str | None:
+    """mtime of /var/lib/dpkg/info/<pkg>.list (F5 rotation fallback)."""
+    info_dir = Path("/var/lib/dpkg/info")
+    candidates = [info_dir / f"{package_id}.list"]
+    base = _base_package_name(package_id)
+    if base != package_id:
+        candidates.append(info_dir / f"{base}.list")
+    else:
+        # The id has no arch; accept the native-arch list too.
+        try:
+            candidates.extend(info_dir.glob(f"{base}:*.list"))
+        except OSError:
+            pass
+    for candidate in candidates:
+        try:
+            return datetime.fromtimestamp(candidate.stat().st_mtime).date().isoformat()
+        except OSError:
+            continue
+    return None
+
+
+# ------------------------------------------------------------
+# APT source labels (F8)
+# ------------------------------------------------------------
+
+_KNOWN_APT_ORIGINS = (
+    ("debian", "Debian"),
+    ("ubuntu", "Ubuntu repository"),
+    ("raspbian", "Raspbian"),
+    ("linux mint", "Linux Mint"),
+    ("linuxmint", "Linux Mint"),
+    ("pop!os", "Pop!_OS"),
+    ("pop_os", "Pop!_OS"),
+    ("system76", "Pop!_OS"),
+    ("kali", "Kali"),
+)
+
+
+def get_apt_source_map(package_names: list[str]) -> dict[str, str]:
+    """Detect where an installed APT package came from.
+
+    Works from the Origin/Label/Site fields of the index files, generically
+    across Debian/Ubuntu/Mint/Pop!_OS/Raspbian; PPAs are matched on the
+    ppa.launchpad(content).net host rather than any path containing "ppa".
+    python3-apt is optional — without it no labels are produced.
     """
-    Attempts to detect where an APT package came from.
-
-    Uses python-apt if available.
-
-    Possible labels:
-    - Ubuntu repository
-    - PPA
-    - Third-party repository
-    - Local .deb
-    - APT / Debian
-    """
-
-    source_map: Dict[str, str] = {}
+    source_map: dict[str, str] = {}
 
     if not package_names:
         return source_map
@@ -374,6 +620,7 @@ def get_apt_source_map(package_names: List[str]) -> Dict[str, str]:
                 filename = getattr(file_item, "filename", "") or ""
                 origin = getattr(file_item, "origin", "") or ""
                 site = getattr(file_item, "site", "") or ""
+                index_label = getattr(file_item, "label", "") or ""
             except Exception:
                 continue
 
@@ -382,27 +629,30 @@ def get_apt_source_map(package_names: List[str]) -> Dict[str, str]:
 
             has_repository = True
 
-            low_filename = filename.lower()
-            low_origin = origin.lower()
-            low_site = site.lower()
+            combined = " ".join((filename, site, origin, index_label)).lower()
 
-            if (
-                "ppa" in low_filename
-                or "ppa" in low_site
-                or "ppa.launchpad" in low_filename
-                or "ppa.launchpad" in low_site
-            ):
+            if re.search(r"ppa\.launchpad(?:content)?\.net", combined):
                 label = "PPA"
                 break
 
-            if (
-                low_origin == "ubuntu"
-                or "archive.ubuntu.com" in low_filename
-                or "security.ubuntu.com" in low_filename
-                or ".ubuntu.com" in low_site
-            ):
-                label = "Ubuntu repository"
-            elif label == "Local .deb":
+            matched = False
+            for needle, display in _KNOWN_APT_ORIGINS:
+                if needle in origin.lower() or needle in index_label.lower():
+                    label = display
+                    matched = True
+                    break
+            if matched:
+                continue
+
+            for needle, display in _KNOWN_APT_ORIGINS:
+                if f"{needle}.com" in site.lower() or f"{needle}.org" in site.lower():
+                    label = display
+                    matched = True
+                    break
+            if matched:
+                continue
+
+            if label == "Local .deb":
                 label = "Third-party repository"
 
         if not has_repository:
@@ -412,148 +662,256 @@ def get_apt_source_map(package_names: List[str]) -> Dict[str, str]:
 
     return source_map
 
+
+# ------------------------------------------------------------
+# Exec parsing (F3)
+# ------------------------------------------------------------
+
+
 def normalize_exec(exec_line: str) -> str:
-    """
-    Extracts the base executable name from a desktop Exec= line.
-    Example: 'env FIREFOX_SNAP=1 firefox %u' -> 'firefox'
+    """Extract the identifying executable from a desktop Exec= line.
+
+    Wrappers (env, flatpak run, snap run, gamemoderun, pkexec, sh -c ...)
+    are unwrapped, field codes (%u, %f, ...) are dropped, and quoted paths
+    survive via shlex. Returns the lowercased basename of the real target,
+    or "" when nothing identifiable remains.
     """
     if not exec_line:
         return ""
-    
-    parts = exec_line.split()
-    for part in parts:
-        if "=" in part and not part.startswith("/"):
-            continue # skip env vars
-        if part.startswith("%"):
-            continue # skip desktop args like %u, %f
-        
-        base = Path(part).name.lower()
-        if base and base not in ("env", "sh", "bash", "sudo"):
-            return base
-            
+
+    try:
+        tokens = shlex.split(exec_line, posix=True)
+    except ValueError:
+        tokens = exec_line.split()
+
+    return _extract_exec_target(tokens)
+
+
+def _extract_exec_target(tokens: list[str]) -> str:
+    index = 0
+    total = len(tokens)
+
+    while index < total:
+        token = tokens[index]
+        index += 1
+
+        if token.startswith("%"):
+            continue
+        if ENV_ASSIGNMENT_RE.match(token):
+            continue
+
+        base = Path(token).name.lower()
+
+        if base in _EXEC_SHELLS:
+            # `sh -c 'exec foo'`: the token after -c is a script, parse it.
+            script = None
+            while index < total:
+                candidate = tokens[index]
+                if candidate == "-c":
+                    index += 1
+                    if index < total:
+                        script = tokens[index]
+                        index += 1
+                    break
+                if candidate.startswith("-"):
+                    index += 1
+                    continue
+                script = candidate
+                break
+            if script:
+                try:
+                    inner = shlex.split(script, posix=True) if " " in script else [script]
+                except ValueError:
+                    inner = [script]
+                result = _extract_exec_target(inner)
+                if result:
+                    return result
+            continue
+
+        if base in EXEC_WRAPPERS:
+            # Skip wrapper options, env assignments and subcommands
+            # ("flatpak run", "snap run") to reach the real target.
+            while index < total:
+                candidate = tokens[index]
+                if candidate.startswith("-") and not ENV_ASSIGNMENT_RE.match(candidate):
+                    index += 1
+                    continue
+                if ENV_ASSIGNMENT_RE.match(candidate):
+                    index += 1
+                    continue
+                if Path(candidate).name.lower() in EXEC_SUBCOMMANDS:
+                    index += 1
+                    continue
+                break
+            continue
+
+        return base
+
     return ""
 
-def scan_apt() -> List[AppEntry]:
-    """
-    APT scanner.
 
-    Current strategy:
-    - find .desktop files
-    - map them to dpkg packages
-    - show them as GUI apps
-    """
+# ------------------------------------------------------------
+# APT scanner
+# ------------------------------------------------------------
 
-    versions = {}
+
+def _desktop_directories() -> list[Path]:
+    return [
+        Path("/usr/share/applications"),
+        Path("/usr/local/share/applications"),
+        Path.home() / ".local/share/applications",
+    ]
+
+
+def _resolve_apt_id(owner: str, versions: dict[str, str]) -> str | None:
+    """Match a dpkg -S owner (name or name:arch) to a scanned identity."""
+    if owner in versions:
+        return owner
+    base = _base_package_name(owner)
+    if base != owner and base in versions:
+        return base
+    # Owner without arch: prefer the native/first scanned instance.
+    candidates = sorted(
+        package_id
+        for package_id in versions
+        if _base_package_name(package_id) == base
+    )
+    return candidates[0] if len(candidates) == 1 else (candidates[0] if candidates else None)
+
+
+def scan_apt() -> list[AppEntry]:
+    """APT scanner: installed (ii) packages that own a .desktop launcher.
+
+    Identities are ``name:arch`` (F4): the status comes from
+    ${db:Status-Abbrev}, so half-configured (iU), not-installed and
+    residual (rc) entries never appear as installed apps.
+    """
+    versions: dict[str, str] = {}
 
     try:
         out = subprocess.check_output(
-            ["dpkg-query", "-W", "-f=${Package}\t${Version}\t${Status}\n"],
+            [
+                "dpkg-query",
+                "-W",
+                "-f=${binary:Package}\t${db:Status-Abbrev}\t${Version}\n",
+            ],
             text=True,
+            errors="replace",
             stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            timeout=SCAN_TIMEOUT,
+            env=_dpkg_env(),
         )
 
         for line in out.splitlines():
             parts = line.split("\t")
-
             if len(parts) < 3:
                 continue
-
-            pkg, version, status = parts[0], parts[1], parts[2]
-
-            if "installed" in status:
-                versions[pkg] = version
-
+            package_id, status_abbrev, version = parts[0], parts[1], parts[2]
+            if status_abbrev[:2] == "ii" and package_id:
+                versions[package_id] = version
     except Exception:
         return []
 
-    apps: List[AppEntry] = []
+    apps: list[AppEntry] = []
     seen_packages = set()
 
-    desktop_dirs = [
-        "/usr/share/applications",
-        "/usr/local/share/applications",
-        os.path.expanduser("~/.local/share/applications"),
-    ]
-
-    for directory in desktop_dirs:
-        if not os.path.isdir(directory):
+    # Deterministic order; multi-app packages prefer the entry whose file
+    # name matches the package name (F6).
+    for directory in _desktop_directories():
+        if not directory.is_dir():
             continue
 
         try:
-            entries = os.listdir(directory)
+            entries = sorted(os.listdir(directory), key=str.lower)
         except Exception:
             continue
 
-        for filename in entries:
-            if not filename.endswith(".desktop"):
+        desktop_files = [name for name in entries if name.endswith(".desktop")]
+        owners = get_package_owners(
+            [str(directory / name) for name in desktop_files]
+        )
+
+        by_package: dict[str, list[str]] = {}
+        for name in desktop_files:
+            path = str(directory / name)
+            owner = owners.get(path)
+            if not owner:
+                continue
+            resolved = _resolve_apt_id(owner, versions)
+            if not resolved:
+                continue
+            by_package.setdefault(resolved, []).append(name)
+
+        for package_id, names in by_package.items():
+            if package_id in seen_packages:
                 continue
 
-            path = os.path.join(directory, filename)
+            preferred = next(
+                (
+                    name for name in names
+                    if name.rsplit(".", 1)[0].lower()
+                    == _base_package_name(package_id).lower()
+                ),
+                names[0],
+            )
+            path = directory / preferred
 
-            name, categories, no_display, hidden, icon, exec_line = parse_desktop_file(path)
-
+            name, categories, no_display, hidden, icon, exec_line = (
+                parse_desktop_file(str(path))
+            )
             if no_display or hidden or not name:
                 continue
 
-            package = get_package_owner(path)
+            seen_packages.add(package_id)
 
-            if not package or package not in versions:
-                continue
-
-            if package in seen_packages:
-                continue
-
-            seen_packages.add(package)
-            
-            exec_name = normalize_exec(exec_line) or package.lower()
+            exec_name = normalize_exec(exec_line) or package_id.lower()
 
             apps.append(
                 AppEntry(
                     name=name,
                     manager="APT",
                     source="APT / Debian",
-                    package_id=package,
-                    version=versions.get(package, ""),
+                    package_id=package_id,
+                    version=versions.get(package_id, ""),
                     installed_at=None,
                     category=map_categories(categories),
                     is_gui_app=True,
-                    details=path,
+                    details=str(path),
                     icon=icon,
                     exec_name=exec_name,
                 )
             )
 
     if apps:
-        install_dates = get_apt_install_dates()
-        source_map = get_apt_source_map(list(seen_packages))
+        package_ids = [app.package_id for app in apps]
+        install_dates = get_apt_install_dates(package_ids)
+        source_map = get_apt_source_map(
+            sorted({_base_package_name(pid) for pid in package_ids})
+        )
 
         for app in apps:
-            app.installed_at = install_dates.get(app.package_id)
+            app.installed_at = (
+                install_dates.get(app.package_id)
+                or install_dates.get(_base_package_name(app.package_id))
+            )
 
-            source = source_map.get(app.package_id)
+            source = source_map.get(_base_package_name(app.package_id))
             if source:
                 app.source = source
 
     return apps
 
-def get_snap_install_dates(revisions: Dict[str, str]) -> Dict[str, str]:
-    """
-    Attempts to find Snap install dates.
 
-    Primary source:
-    - snap changes
+# ------------------------------------------------------------
+# Snap scanner
+# ------------------------------------------------------------
 
-    Fallback:
-    - timestamps of /var/lib/snapd/snaps/*.snap files
-    """
 
-    dates: Dict[str, str] = {}
+def get_snap_install_dates(revisions: dict[str, str]) -> dict[str, str]:
+    """First install date per snap (changes log, then snap file mtimes)."""
+    dates: dict[str, str] = {}
 
-    # ------------------------------------------------------------
-    # Try snap changes
-    # Example summary:
-    # Install "firefox" snap
-    # ------------------------------------------------------------
     commands = [
         ["snap", "changes", "--abs-time"],
         ["snap", "changes"],
@@ -564,8 +922,11 @@ def get_snap_install_dates(revisions: Dict[str, str]) -> Dict[str, str]:
             out = subprocess.check_output(
                 cmd,
                 text=True,
+                errors="replace",
                 stderr=subprocess.DEVNULL,
-                env={**os.environ, "LC_ALL": "C"},
+                stdin=subprocess.DEVNULL,
+                timeout=SCAN_TIMEOUT,
+                env=_dpkg_env(),
             )
         except Exception:
             continue
@@ -591,9 +952,6 @@ def get_snap_install_dates(revisions: Dict[str, str]) -> Dict[str, str]:
         if dates:
             break
 
-    # ------------------------------------------------------------
-    # Fallback: use snap file timestamps
-    # ------------------------------------------------------------
     snap_dir = Path("/var/lib/snapd/snaps")
 
     if snap_dir.exists():
@@ -628,36 +986,28 @@ def get_snap_install_dates(revisions: Dict[str, str]) -> Dict[str, str]:
 
     return dates
 
-def scan_snap() -> List[AppEntry]:
+
+def scan_snap() -> list[AppEntry]:
     try:
         out = subprocess.check_output(
             ["snap", "list"],
             text=True,
+            errors="replace",
             stderr=subprocess.DEVNULL,
-            env={**os.environ, "LC_ALL": "C"},
+            stdin=subprocess.DEVNULL,
+            timeout=SCAN_TIMEOUT,
+            env=_dpkg_env(),
         )
     except Exception:
         return []
 
     apps = []
-    revisions: Dict[str, str] = {}
+    revisions: dict[str, str] = {}
 
     lines = out.splitlines()
 
     if len(lines) < 2:
         return []
-
-    skip_names = {
-        "snapd",
-        "core",
-        "core18",
-        "core20",
-        "core22",
-        "core24",
-        "bare",
-        "gtk-common-themes",
-        "snapd-desktop-integration",
-    }
 
     for line in lines[1:]:
         parts = line.split()
@@ -671,7 +1021,8 @@ def scan_snap() -> List[AppEntry]:
         notes = " ".join(parts[5:]) if len(parts) > 5 else ""
         normalized_name = name.lower()
 
-        if name in skip_names:
+        # One shared definition of runtime/base snaps (S11): the policy set.
+        if normalized_name in {pid.lower() for pid in SNAP_SKIP_NAMES}:
             continue
 
         if "base" in notes.lower():
@@ -715,18 +1066,14 @@ def scan_snap() -> List[AppEntry]:
 
     return apps
 
-def find_flatpak_install_date(app_id: str, installation: str) -> Optional[str]:
-    """
-    Best-effort Flatpak install date detection.
 
-    Uses filesystem metadata from Flatpak app directories and exported
-    desktop entries.
+# ------------------------------------------------------------
+# Flatpak scanner
+# ------------------------------------------------------------
 
-    Note:
-    This may sometimes reflect the last update time rather than the
-    original install time.
-    """
 
+def find_flatpak_install_date(app_id: str, installation: str) -> str | None:
+    """Best-effort Flatpak install date from deployment/desktop metadata."""
     installation_lower = (installation or "").lower()
 
     user_app_dir = Path.home() / ".local/share/flatpak/app" / app_id
@@ -735,11 +1082,9 @@ def find_flatpak_install_date(app_id: str, installation: str) -> Optional[str]:
     candidates = []
 
     if "user" in installation_lower:
-        candidates.append(user_app_dir)
-        candidates.append(system_app_dir)
+        candidates.extend((user_app_dir, system_app_dir))
     else:
-        candidates.append(system_app_dir)
-        candidates.append(user_app_dir)
+        candidates.extend((system_app_dir, user_app_dir))
 
     expanded_candidates = []
 
@@ -752,7 +1097,6 @@ def find_flatpak_install_date(app_id: str, installation: str) -> Optional[str]:
         if current.exists():
             expanded_candidates.append(current)
 
-    # Fallback desktop entry timestamps.
     user_desktop = (
         Path.home()
         / ".local/share/flatpak/exports/share/applications"
@@ -765,11 +1109,9 @@ def find_flatpak_install_date(app_id: str, installation: str) -> Optional[str]:
     )
 
     if "user" in installation_lower:
-        expanded_candidates.append(user_desktop)
-        expanded_candidates.append(system_desktop)
+        expanded_candidates.extend((user_desktop, system_desktop))
     else:
-        expanded_candidates.append(system_desktop)
-        expanded_candidates.append(user_desktop)
+        expanded_candidates.extend((system_desktop, user_desktop))
 
     timestamps = []
 
@@ -786,17 +1128,48 @@ def find_flatpak_install_date(app_id: str, installation: str) -> Optional[str]:
 
     return datetime.fromtimestamp(earliest).date().isoformat()
 
-def scan_flatpak() -> List[AppEntry]:
+
+def _flatpak_exec_name(app_id: str, installation: str) -> str:
+    """Exec identity from the exported .desktop entry (F2), else empty."""
+    if "user" in (installation or "").lower():
+        candidates = [
+            Path.home() / ".local/share/flatpak/exports/share/applications",
+            Path("/var/lib/flatpak/exports/share/applications"),
+        ]
+    else:
+        candidates = [
+            Path("/var/lib/flatpak/exports/share/applications"),
+            Path.home() / ".local/share/flatpak/exports/share/applications",
+        ]
+
+    for directory in candidates:
+        desktop = directory / f"{app_id}.desktop"
+        if not desktop.exists():
+            continue
+        _name, _categories, _no_display, _hidden, _icon, exec_line = (
+            parse_desktop_file(str(desktop))
+        )
+        exec_name = normalize_exec(exec_line)
+        if exec_name and exec_name not in {"flatpak", "app"}:
+            return exec_name
+    return ""
+
+
+def scan_flatpak() -> list[AppEntry]:
     try:
         out = subprocess.check_output(
             [
                 "flatpak",
                 "list",
                 "--app",
-                "--columns=application,version,origin,installation",
+                "--columns=name,application,version,origin,installation",
             ],
             text=True,
+            errors="replace",
             stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            timeout=SCAN_TIMEOUT,
+            env=_dpkg_env(),
         )
     except Exception:
         return []
@@ -806,22 +1179,27 @@ def scan_flatpak() -> List[AppEntry]:
     for line in out.splitlines():
         cols = line.split("\t")
 
-        if len(cols) < 4:
+        if len(cols) < 5:
             continue
 
-        app_id = cols[0]
-        version = cols[1]
-        origin = cols[2]
-        installation = cols[3]
+        display_name = cols[0].strip()
+        app_id = cols[1].strip()
+        version = cols[2].strip()
+        origin = cols[3].strip()
+        installation = cols[4].strip()
 
-        name = app_id.split(".")[-1].replace("_", " ").replace("-", " ").title()
+        if not app_id:
+            continue
+
+        # Real display name from flatpak itself (F2); the ID's last segment
+        # is only a fallback and never an identity for duplicate matching.
+        name = display_name or app_id.split(".")[-1].replace("_", " ").replace("-", " ").title()
         source = origin if origin else installation
 
         icon = find_flatpak_icon(app_id)
         installed_at = find_flatpak_install_date(app_id, installation)
+        exec_name = _flatpak_exec_name(app_id, installation)
 
-        exec_name = app_id.split(".")[-1].lower()
-        
         apps.append(
             AppEntry(
                 name=name,
@@ -829,19 +1207,51 @@ def scan_flatpak() -> List[AppEntry]:
                 source=source,
                 package_id=app_id,
                 version=version,
-                installed_at=None,
+                installed_at=installed_at,
                 category="Apps",
                 is_gui_app=True,
                 details=f"Installation: {installation}",
                 icon=icon,
                 exec_name=exec_name,
+                installation=installation,
             )
         )
 
     return apps
 
 
-def scan_appimage() -> List[AppEntry]:
+# ------------------------------------------------------------
+# AppImage scanner
+# ------------------------------------------------------------
+
+
+def _managed_appimage_roots() -> list[Path]:
+    return [appimage_dir(), legacy_appimage_dir()]
+
+
+def _is_managed_appimage_path(raw_path: str) -> bool:
+    """S8: the launcher must point lexically inside a managed AppImage dir.
+
+    The value is resolved *without* following symlinks (".." is rejected by
+    normalization escaping the root), so `.../appimages/../../evil` fails.
+    """
+    if not raw_path:
+        return False
+    if ".." in Path(raw_path).parts:
+        return False
+    normalized = Path(os.path.normpath(raw_path))
+    if not normalized.is_absolute():
+        return False
+    for root in _managed_appimage_roots():
+        try:
+            if normalized.is_relative_to(Path(os.path.normpath(str(root)))):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def scan_appimage() -> list[AppEntry]:
     apps = []
     home = Path.home()
     integrated_sources = set()
@@ -864,12 +1274,10 @@ def scan_appimage() -> List[AppEntry]:
             ),
             "",
         )
-        if not appimage_path:
+        if not appimage_path or not _is_managed_appimage_path(appimage_path):
             continue
         appimage = Path(appimage_path)
-        if not appimage.is_file() or not appimage_path.startswith(
-            str(home / ".local/share/app-manager/appimages") + "/"
-        ):
+        if not appimage.is_file():
             continue
         source_uri = next(
             (
@@ -918,7 +1326,7 @@ def scan_appimage() -> List[AppEntry]:
             continue
 
         try:
-            for path in directory.iterdir():
+            for path in sorted(directory.iterdir(), key=lambda p: p.name.lower()):
                 if not path.is_file() or path.suffix.lower() != ".appimage":
                     continue
                 try:
@@ -959,11 +1367,74 @@ def scan_appimage() -> List[AppEntry]:
     return apps
 
 
+# ------------------------------------------------------------
+# Manual-install scanner
+# ------------------------------------------------------------
+
+
+def _default_binary_dirs(home: Path) -> list[Path]:
+    """Common per-user tool locations (F10); developer-specific paths are
+    no longer hard-coded into discovery."""
+    return [
+        home / ".local/bin",
+        home / "bin",
+        home / ".cargo/bin",
+        home / "go/bin",
+        home / ".npm-global/bin",
+        home / "Applications",
+        Path("/usr/local/bin"),
+        Path("/opt"),
+    ]
+
+
+def _classify_manual_launcher(exec_line: str) -> tuple[str, str]:
+    """Return (source, category) hints for known non-app launcher types (F10)."""
+    lowered = exec_line.lower()
+    if re.search(r"(google-chrome|chromium|chrome).*--app=", lowered):
+        return "Chrome/Chromium web app", "Internet"
+    if re.search(r"\b(steam|steamcmd)\b|steam://", lowered):
+        return "Steam shortcut", "Games"
+    if re.search(r"\bwine(\b|\.exe)", lowered) or lowered.endswith(".exe"):
+        return "Wine program", "Other"
+    if re.search(r"\belectron\b", lowered) or "appimage" in lowered:
+        return "Bundled app", "Other"
+    return "Manual installation", ""
+
+
+def _resolve_exec_target(exec_line: str) -> Path | None:
+    """Absolute path of the executed target, without running anything (F10).
+
+    Only the first non-wrapper token is considered; the result must exist.
+    """
+    if not exec_line:
+        return None
+    try:
+        tokens = shlex.split(exec_line, posix=True)
+    except ValueError:
+        tokens = exec_line.split()
+    for token in tokens:
+        if not token or token.startswith("-") or token.startswith("%"):
+            continue
+        if ENV_ASSIGNMENT_RE.match(token):
+            continue
+        candidate = Path(token).expanduser()
+        if candidate.is_absolute():
+            return candidate if candidate.is_file() else None
+        resolved = shutil.which(token)
+        return Path(resolved) if resolved else None
+    return None
+
+
 def scan_manual_apps(
     desktop_dirs=None,
     binary_dirs=None,
-) -> List[AppEntry]:
-    """Detect unmanaged desktop launchers and standalone user-installed executables."""
+    extra_dirs=None,
+) -> list[AppEntry]:
+    """Detect unmanaged desktop launchers and standalone user executables.
+
+    ``extra_dirs`` (F10) are additional user-chosen scan directories; they
+    extend, never replace, the defaults.
+    """
     home = Path.home()
     if desktop_dirs is None:
         desktop_dirs = [
@@ -971,77 +1442,95 @@ def scan_manual_apps(
             Path("/usr/local/share/applications"),
         ]
     if binary_dirs is None:
-        binary_dirs = [
-            home / ".local/bin",
-            home / "bin",
-            home / ".opencode/bin",
-            home / "Applications",
-            Path("/usr/local/bin"),
-            Path("/opt"),
-        ]
+        binary_dirs = _default_binary_dirs(home)
+    if extra_dirs:
+        # User-configured scan locations; existing entries are skipped so a
+        # directory cannot be scanned twice.
+        for extra in extra_dirs:
+            candidate = Path(str(extra)).expanduser()
+            if candidate not in binary_dirs:
+                binary_dirs.append(candidate)
 
     apps = []
     manual_exec_names = set()
     seen_paths = set()
 
+    launcher_paths = []
     for directory in desktop_dirs:
         if not directory.is_dir():
             continue
-
         try:
-            desktop_files = directory.glob("*.desktop")
-            for desktop_path in desktop_files:
-                name, categories, no_display, hidden, icon, exec_line = parse_desktop_file(
-                    str(desktop_path)
-                )
-                try:
-                    with desktop_path.open("r", encoding="utf-8", errors="replace") as desktop_file:
-                        if any(
-                            line.strip() == "X-AppManager-Installed-AppImage=true"
-                            for line in desktop_file
-                        ):
-                            continue
-                except OSError:
-                    continue
-                if no_display or hidden or not name or not exec_line:
-                    continue
-
-                if get_package_owner(str(desktop_path)):
-                    continue
-
-                exec_name = normalize_exec(exec_line)
-                if not exec_name:
-                    continue
-
-                try:
-                    installed_at = datetime.fromtimestamp(
-                        desktop_path.stat().st_mtime
-                    ).date().isoformat()
-                except OSError:
-                    installed_at = None
-
-                manual_exec_names.add(exec_name)
-                try:
-                    seen_paths.add(desktop_path.resolve())
-                except (OSError, RuntimeError):
-                    pass
-                apps.append(
-                    AppEntry(
-                        name=name,
-                        manager="Manual",
-                        source="Manual installation",
-                        package_id=str(desktop_path),
-                        installed_at=installed_at,
-                        category=map_categories(categories),
-                        is_gui_app=True,
-                        details=str(desktop_path),
-                        icon=icon,
-                        exec_name=exec_name,
-                        removal_paths=[str(desktop_path)],
-                    )
-                )
+            launcher_paths.extend(
+                directory.glob("*.desktop")
+            )
         except OSError:
             continue
+
+    launcher_owners = get_package_owners([str(p) for p in launcher_paths])
+
+    for desktop_path in launcher_paths:
+        name, categories, no_display, hidden, icon, exec_line = parse_desktop_file(
+            str(desktop_path)
+        )
+        try:
+            with desktop_path.open("r", encoding="utf-8", errors="replace") as desktop_file:
+                if any(
+                    line.strip() == "X-AppManager-Installed-AppImage=true"
+                    for line in desktop_file
+                ):
+                    continue
+        except OSError:
+            continue
+        if no_display or hidden or not name or not exec_line:
+            continue
+
+        if launcher_owners.get(str(desktop_path)):
+            continue
+
+        exec_name = normalize_exec(exec_line)
+        if not exec_name:
+            continue
+
+        try:
+            installed_at = datetime.fromtimestamp(
+                desktop_path.stat().st_mtime
+            ).date().isoformat()
+        except OSError:
+            installed_at = None
+
+        manual_exec_names.add(exec_name)
+        try:
+            seen_paths.add(desktop_path.resolve())
+        except (OSError, RuntimeError):
+            pass
+
+        source, category_hint = _classify_manual_launcher(exec_line)
+        removal_paths = [str(desktop_path)]
+        # F10: paths derived from the resolved Exec target only, never by
+        # name-matching executables in other directories.
+        exec_target = _resolve_exec_target(exec_line)
+        if (
+            exec_target is not None
+            and exec_target.is_file()
+            and str(exec_target) != str(desktop_path)
+        ):
+            removal_paths.append(str(exec_target))
+
+        apps.append(
+            AppEntry(
+                name=name,
+                manager="Manual",
+                source=source,
+                package_id=str(desktop_path),
+                installed_at=installed_at,
+                category=category_hint or map_categories(categories),
+                is_gui_app=True,
+                details=str(desktop_path),
+                icon=icon,
+                exec_name=exec_name,
+                removal_paths=removal_paths,
+            )
+        )
 
     executable_candidates = []
     for directory in binary_dirs:
@@ -1049,7 +1538,7 @@ def scan_manual_apps(
             continue
 
         try:
-            for path in directory.iterdir():
+            for path in sorted(directory.iterdir(), key=lambda p: p.name.lower()):
                 if path.name.startswith("."):
                     continue
 
@@ -1079,13 +1568,16 @@ def scan_manual_apps(
         except OSError:
             continue
 
+    executable_owners = get_package_owners(
+        [str(path) for path in executable_candidates]
+    )
     executable_candidates = [
         path
         for path in executable_candidates
         if (
             path.suffix.lower() != ".appimage"
             and os.access(path, os.X_OK)
-            and not get_package_owner(str(path))
+            and not executable_owners.get(str(path))
         )
     ]
 
@@ -1103,8 +1595,8 @@ def scan_manual_apps(
             continue
 
         try:
-            stat = path.stat()
-            installed_at = datetime.fromtimestamp(stat.st_mtime).date().isoformat()
+            st = path.stat()
+            installed_at = datetime.fromtimestamp(st.st_mtime).date().isoformat()
         except OSError:
             installed_at = None
 
@@ -1117,44 +1609,80 @@ def scan_manual_apps(
                 package_id=str(path),
                 installed_at=installed_at,
                 category="Other",
-                is_gui_app=True,
+                # F10: a bare executable with no .desktop launcher is a CLI
+                # tool, not a GUI app; it stays listed but is not treated
+                # as a duplicate candidate or an "Application".
+                is_gui_app=False,
                 details=str(path),
                 exec_name=exec_name,
                 removal_paths=[str(path)],
             )
         )
 
-    executables_by_name = {}
-    for path in executable_candidates:
-        executables_by_name.setdefault(path.name.lower(), []).append(str(path))
-
-    for app in apps:
-        if app.source != "Manual installation":
-            continue
-        app.removal_paths.extend(
-            executables_by_name.get(app.exec_name.lower(), [])
-        )
-
     return apps
 
 
-def scan_all() -> List[AppEntry]:
-    apps: List[AppEntry] = []
+# ------------------------------------------------------------
+# Combined scan
+# ------------------------------------------------------------
 
-    scanners = [
-        scan_apt,
-        scan_snap,
-        scan_flatpak,
-        scan_appimage,
-        scan_manual_apps,
-    ]
 
-    for scanner in scanners:
-        try:
-            apps.extend(scanner())
-        except Exception as e:
-            print(f"{scanner.__name__} failed: {e}")
+@dataclass
+class ScanResult:
+    """Outcome of a full scan (F6): apps plus per-source status.
 
-    apps.sort(key=lambda x: (x.manager, x.name.lower()))
+    `source_status` entries are ``(source, status, message)`` with status one
+    of "ok", "tool-missing", "failed" — so the UI can tell "Snap is not
+    installed" from "the Snap scan failed", instead of showing a silent
+    short count.
+    """
 
-    return apps
+    apps: list[AppEntry] = field(default_factory=list)
+    source_status: list[tuple[str, str, str]] = field(default_factory=list)
+
+    # Sequence protocol: callers may treat a ScanResult as the app list.
+    def __iter__(self):
+        return iter(self.apps)
+
+    def __len__(self):
+        return len(self.apps)
+
+    def __bool__(self):
+        return bool(self.apps)
+
+
+_SCANNERS = (
+    ("APT", "dpkg-query", scan_apt),
+    ("Snap", "snap", scan_snap),
+    ("Flatpak", "flatpak", scan_flatpak),
+    ("AppImage", None, scan_appimage),
+    ("Manual", None, scan_manual_apps),
+)
+
+
+def _run_one_scanner(source: str, tool: str | None, scanner):
+    if tool is not None and shutil.which(tool) is None:
+        return source, [], (source, "tool-missing", f"{tool} is not installed.")
+    try:
+        apps = scanner() or []
+        return source, apps, (source, "ok", f"{len(apps)} item(s)")
+    except Exception as error:  # a failing source must not abort the scan
+        return source, [], (source, "failed", str(error))
+
+
+def scan_all() -> ScanResult:
+    """Run every scanner (in parallel, F6) and report per-source status."""
+    result = ScanResult()
+
+    with ThreadPoolExecutor(max_workers=len(_SCANNERS)) as pool:
+        futures = [
+            pool.submit(_run_one_scanner, source, tool, scanner)
+            for source, tool, scanner in _SCANNERS
+        ]
+        for future in futures:
+            _source, apps, status = future.result()
+            result.apps.extend(apps)
+            result.source_status.append(status)
+
+    result.apps.sort(key=lambda x: (x.manager, x.name.lower()))
+    return result

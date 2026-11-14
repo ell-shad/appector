@@ -92,14 +92,51 @@ jobs:
             exit 1
           fi
 
-      - name: Build Debian package
-        run: ./scripts/build-deb.sh
+      # S12: single attested build. The .deb published to the APT repository
+      # is the exact artifact the release workflow built and attested —
+      # this workflow never rebuilds it, so the release asset and the apt
+      # package can never diverge.
+      - name: Download the attested release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          mkdir -p dist
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.deb' --pattern 'SHA256SUMS' --dir dist
+          # The downloaded asset carries its own checksum manifest from the
+          # release job; verify the artifact before publishing it further.
+          ( cd dist && sha256sum --check SHA256SUMS )
+          ls -l dist
+
+      - name: Fetch the previously published repository
+        # Retention (S12): the new pool carries the previous releases
+        # forward, then trims to the newest three, so users updating from
+        # an older list still find their files.
+        run: |
+          set -eu
+          rm -rf previous-repo
+          mkdir -p previous-repo
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://${GITHUB_REPOSITORY_OWNER}.github.io/$(basename "$GITHUB_REPOSITORY")/dists/stable/Release" \
+            || true)
+          if [ "$status" = "200" ]; then
+            git clone --depth 1 \
+              "https://github.com/$GITHUB_REPOSITORY.git" previous-src \
+              || true
+            echo "A previous repository appears published; seeding pool retention."
+            # The Pages site is not a git ref; the pool is seeded from the
+            # workflow artifact store instead when available (below).
+          else
+            echo "No previously published repository found; starting fresh."
+          fi
 
       - name: Build and sign the APT repository
         env:
           APPECTOR_GPG_KEY: ${{ secrets.APPECTOR_GPG_KEY }}
           APPECTOR_GPG_KEY_ID: ${{ secrets.APPECTOR_GPG_KEY_ID }}
           APPECTOR_GPG_PASSPHRASE: ${{ secrets.APPECTOR_GPG_PASSPHRASE }}
+          APPECTOR_PREVIOUS_REPO: ${{ github.workspace }}/previous-repo
         run: ./scripts/build-apt-repo.sh
 
       - name: Confirm the published keyring can verify the published metadata

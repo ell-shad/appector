@@ -2,10 +2,15 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test-and-package:
@@ -19,13 +24,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes \
             desktop-file-utils dpkg-dev gir1.2-adw-1 gir1.2-gdkpixbuf-2.0 \
-            gir1.2-gtk-4.0 gnupg lintian python3-gi shellcheck
+            gir1.2-gtk-4.0 gnupg lintian python3-gi shellcheck \
+            libxml2-utils
 
-      - name: Run unit tests
-        run: python3 -m unittest discover -s tests -v
+      - name: Set up Python tooling
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: "3.12"
+
+      - name: Lint (ruff)
+        run: |
+          python3 -m pip install --disable-pip-version-check ruff
+          ruff check appector tests
+
+      - name: Run unit tests with coverage
+        run: |
+          python3 -m pip install --disable-pip-version-check coverage
+          coverage run -m unittest discover -s tests
+          coverage report --fail-under=55
+          coverage report
 
       - name: Compile application modules
         run: python3 -m compileall -q appector
+
+      - name: Validate the polkit policy
+        run: |
+          # Validated against the DTD when available; the schema-less
+          # xmllint fallback still catches malformed XML.
+          if ls /usr/share/polkit-1/actions/*.policy >/dev/null 2>&1; then
+            xmllint --noout --dtdvalid \
+              /usr/share/polkit-1/actions/org.freedesktop.policykit.policy \
+              helper/com.appector.appector.policy
+          else
+            xmllint --noout helper/com.appector.appector.policy
+          fi
 
       - name: Check packaging shell script
         run: |
@@ -47,6 +79,14 @@ jobs:
           dpkg-deb --info "$package"
           lintian --pedantic "$package"
           desktop-file-validate build/appector_*/usr/share/applications/com.appector.appector.desktop
+
+      - name: Validate AppStream metainfo
+        run: |
+          if command -v appstreamcli >/dev/null 2>&1; then
+            appstreamcli validate build/appector_*/usr/share/metainfo/com.appector.appector.metainfo.xml
+          else
+            xmllint --noout assets/metainfo/com.appector.appector.metainfo.xml
+          fi
 
       - name: Build the APT repository
         run: |

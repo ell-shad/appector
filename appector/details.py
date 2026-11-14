@@ -1,116 +1,43 @@
+"""App details window (U9 redesign).
+
+The removal flows (APT simulation -> confirm -> helper; non-APT confirm;
+AppImage/Manual validation in execute_removal) keep their behaviour; they
+are presented on the redesigned card layout from
+`appector/ui/details_window.py`, use ConfirmPlanDialog (U1) and run_async
+workers (U3) instead of raw threads.
+"""
+
 import gi
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
 
 from gi.repository import Gtk, GLib
 
-import threading
-
 from .actions import (
-    get_removal_preview,
-    can_remove_single,
-    execute_removal,
-    prepare_apt_removal,
     execute_apt_removal,
+    execute_removal,
+    get_removal_preview,
     get_removal_size_estimate,
+    prepare_apt_removal,
 )
+from .ui.confirm_dialog import ConfirmPlanDialog
+from .ui.details_window import DetailsWindow as _DetailsCard
+from .ui.tasks import run_async
 
 
-class DetailsWindow(Gtk.Window):
+class DetailsWindow(_DetailsCard):
+    """Details card with the removal flows attached."""
+
     def __init__(self, parent, app):
-        super().__init__(
-            title="App Details",
-            transient_for=parent,
-            modal=True,
-            default_width=560,
-            default_height=600,
-        )
-
-        self.app = app
-        self.remove_button = None
-        self._removal_in_progress = False
-
-        header = Gtk.HeaderBar()
-        header.set_show_title_buttons(False)
-
-        title_label = Gtk.Label(label=getattr(app, "name", "App Details"))
-        title_label.add_css_class("heading")
-
-        header.set_title_widget(title_label)
-
-        if can_remove_single(app):
-            self.remove_button = Gtk.Button(label="Remove")
-            self.remove_button.add_css_class("destructive-action")
-            self.remove_button.connect("clicked", self.on_remove_clicked)
-            header.pack_start(self.remove_button)
-
-        close_button = Gtk.Button(label="Close")
-        close_button.connect("clicked", self.on_close_clicked)
-        header.pack_end(close_button)
-
-        self.set_titlebar(header)
-
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        content.set_margin_top(18)
-        content.set_margin_bottom(18)
-        content.set_margin_start(18)
-        content.set_margin_end(18)
-
-        grid = Gtk.Grid()
-        grid.set_column_spacing(18)
-        grid.set_row_spacing(10)
-        grid.set_hexpand(True)
-        grid.set_vexpand(True)
-
-        installed_value = getattr(app, "installed_at", "") or "Unknown"
-
-        fields = [
-            ("Name", getattr(app, "name", "") or "-"),
-            ("Manager", getattr(app, "manager", "") or "-"),
-            ("Source", getattr(app, "source", "") or "-"),
-            ("Package ID", getattr(app, "package_id", "") or "-"),
-            ("Version", getattr(app, "version", "") or "-"),
-            ("Installed", installed_value),
-            ("Category", getattr(app, "category", "") or "-"),
-            ("Details", getattr(app, "details", "") or "-"),
-            ("Removal preview", get_removal_preview(app)),
-        ]
-
-        for i, (label_text, value_text) in enumerate(fields):
-            key_label = Gtk.Label(label=label_text)
-            key_label.add_css_class("dim-label")
-            key_label.set_halign(Gtk.Align.START)
-            key_label.set_valign(Gtk.Align.START)
-            key_label.set_xalign(0.0)
-
-            value_label = Gtk.Label(label=str(value_text))
-            value_label.set_wrap(True)
-            value_label.set_selectable(True)
-            value_label.set_halign(Gtk.Align.START)
-            value_label.set_valign(Gtk.Align.START)
-            value_label.set_xalign(0.0)
-            value_label.set_hexpand(True)
-
-            grid.attach(key_label, 0, i, 1, 1)
-            grid.attach(value_label, 1, i, 1, 1)
-
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scrolled.set_child(grid)
-        scrolled.set_hexpand(True)
-        scrolled.set_vexpand(True)
-
-        content.append(scrolled)
-        self.set_child(content)
-
-    def on_close_clicked(self, button):
-        self.close()
+        super().__init__(parent, app, on_remove=self.start_removal)
+        self._parent_window = parent
 
     # ------------------------------------------------------------
     # Removal entry point
     # ------------------------------------------------------------
 
-    def on_remove_clicked(self, button):
+    def start_removal(self, _dialog=None):
         if self._removal_in_progress:
             return
 
@@ -118,59 +45,64 @@ class DetailsWindow(Gtk.Window):
 
         if manager == "APT":
             self._removal_in_progress = True
-
             if self.remove_button:
                 self.remove_button.set_sensitive(False)
-
-            thread = threading.Thread(
-                target=self.apt_simulation_worker,
-                daemon=True,
+            run_async(
+                self.apt_simulation_worker,
+                on_error=lambda error: self._recovery(f"{error}"),
+                name="details-apt-preview",
             )
-            thread.start()
         else:
             self.show_non_apt_confirm()
+
+    def _recovery(self, message):
+        """A crashed worker must re-enable the Remove button."""
+        self._removal_in_progress = False
+        if self.remove_button:
+            self.remove_button.set_sensitive(True)
+        self.show_result(False, f"The removal preview failed:\n{message}")
+        return False
 
     # ------------------------------------------------------------
     # Non-APT removal flow
     # ------------------------------------------------------------
 
+    def _removal_files(self):
+        paths = getattr(self.app, "removal_paths", None) or []
+        if isinstance(paths, str):
+            paths = paths.splitlines()
+        return [str(path) for path in paths] or None
+
     def show_non_apt_confirm(self):
         name = getattr(self.app, "name", "this app")
-        preview = get_removal_preview(self.app)
-        preview += "\n\n" + get_removal_size_estimate([self.app])
 
-        dialog = Gtk.MessageDialog(
-            transient_for=self,
-            modal=True,
+        def on_confirm():
+            self._removal_in_progress = True
+            if self.remove_button:
+                self.remove_button.set_sensitive(False)
+            run_async(
+                self.removal_worker,
+                on_error=lambda error: self._recovery(f"{error}"),
+                name="details-removal",
+            )
+
+        dialog = ConfirmPlanDialog(
+            self._parent_window,
+            f"Remove {name}?",
+            heading="Review what will be removed before continuing.",
+            selected=[f"{name} ({getattr(self.app, 'manager', '')})"],
+            files_to_delete=self._removal_files(),
+            notes=[get_removal_preview(self.app)],
+            confirm_label="Remove",
+            destructive=True,
+            on_confirm=on_confirm,
         )
+        dialog.set_disk_estimate_async(
+            lambda: get_removal_size_estimate([self.app])
+        )
+        dialog.present(self._parent_window)
 
-        dialog.set_property("message-type", Gtk.MessageType.WARNING)
-        dialog.set_property("text", f"Remove {name}?")
-        dialog.set_property("secondary-text", preview)
-
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-
-        remove_button = dialog.add_button("Remove", Gtk.ResponseType.OK)
-        remove_button.add_css_class("destructive-action")
-
-        dialog.connect("response", self.on_non_apt_confirm_response)
-        dialog.present()
-
-    def on_non_apt_confirm_response(self, dialog, response):
-        dialog.close()
-
-        if response != Gtk.ResponseType.OK:
-            return
-
-        self._removal_in_progress = True
-
-        if self.remove_button:
-            self.remove_button.set_sensitive(False)
-
-        thread = threading.Thread(target=self.remove_worker, daemon=True)
-        thread.start()
-
-    def remove_worker(self):
+    def removal_worker(self):
         success, message = execute_removal(self.app)
         GLib.idle_add(self.on_removal_finished, success, message)
 
@@ -179,17 +111,18 @@ class DetailsWindow(Gtk.Window):
     # ------------------------------------------------------------
 
     def apt_simulation_worker(self):
-        success, message, removed_packages, warnings = prepare_apt_removal(self.app)
-
+        success, message, plan, warnings = prepare_apt_removal(self.app)
         GLib.idle_add(
             self.on_apt_simulation_finished,
             success,
             message,
-            removed_packages,
+            plan,
             warnings,
         )
 
-    def on_apt_simulation_finished(self, success, message, removed_packages, warnings):
+    def on_apt_simulation_finished(self, success, message, plan=None, warnings=None):
+        warnings = warnings or ""
+        self._apt_plan = plan
         self._removal_in_progress = False
 
         if self.remove_button:
@@ -199,49 +132,50 @@ class DetailsWindow(Gtk.Window):
             self.show_result(False, message)
             return False
 
-        text = message
-
-        if warnings:
-            text += "\n\nWarnings:\n"
-            text += warnings
-
         name = getattr(self.app, "name", "this package")
 
-        dialog = Gtk.MessageDialog(
-            transient_for=self,
-            modal=True,
+        # The simulation's bullet list is the exact "also removed" set.
+        removed_preview = [
+            line[2:] for line in message.splitlines()
+            if line.startswith("• ")
+        ]
+
+        def on_confirm():
+            self._removal_in_progress = True
+            if self.remove_button:
+                self.remove_button.set_sensitive(False)
+            run_async(
+                self.apt_removal_worker,
+                on_error=lambda error: self._recovery(f"{error}"),
+                name="details-apt-removal",
+            )
+
+        dialog = ConfirmPlanDialog(
+            self._parent_window,
+            f"Remove {name} using APT?",
+            heading=(
+                "APT simulation preview — no changes have been made. "
+                "Everything the simulation says will be removed is listed "
+                "below; the list is complete and copyable."
+            ),
+            selected=[name],
+            also_removed=[
+                entry for entry in removed_preview if entry != name
+            ] or None,
+            warnings=[warnings] if warnings else None,
+            notes=[message],
+            confirm_label="Remove",
+            destructive=True,
+            on_confirm=on_confirm,
         )
-
-        dialog.set_property("message-type", Gtk.MessageType.WARNING)
-        dialog.set_property("text", f"Remove {name} using APT?")
-        dialog.set_property("secondary-text", text)
-
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-
-        remove_button = dialog.add_button("Remove", Gtk.ResponseType.OK)
-        remove_button.add_css_class("destructive-action")
-
-        dialog.connect("response", self.on_apt_confirm_response)
-        dialog.present()
-
+        dialog.present(self._parent_window)
         return False
 
-    def on_apt_confirm_response(self, dialog, response):
-        dialog.close()
-
-        if response != Gtk.ResponseType.OK:
-            return
-
-        self._removal_in_progress = True
-
-        if self.remove_button:
-            self.remove_button.set_sensitive(False)
-
-        thread = threading.Thread(target=self.apt_removal_worker, daemon=True)
-        thread.start()
-
     def apt_removal_worker(self):
-        success, message = execute_apt_removal(self.app)
+        success, message = execute_apt_removal(
+            self.app,
+            plan=getattr(self, "_apt_plan", None),
+        )
         GLib.idle_add(self.on_removal_finished, success, message)
 
     # ------------------------------------------------------------
@@ -255,34 +189,41 @@ class DetailsWindow(Gtk.Window):
             if self.remove_button:
                 self.remove_button.set_label("Removed")
                 self.remove_button.set_sensitive(False)
-        else:
-            if self.remove_button:
-                self.remove_button.set_sensitive(True)
+        elif self.remove_button:
+            self.remove_button.set_sensitive(True)
 
         self.show_result(success, message)
 
         if success:
-            parent = self.get_transient_for()
+            parent = self._parent_window
             if parent and hasattr(parent, "reload"):
-                parent.reload()
+                GLib.idle_add(parent.reload)
+            self.close()
 
         return False
 
     def show_result(self, success, message):
-        dialog = Gtk.MessageDialog(
-            transient_for=self,
-            modal=True,
-        )
+        GLib.idle_add(self._show_result_idle, success, message)
+        return False
 
-        if success:
-            dialog.set_property("message-type", Gtk.MessageType.INFO)
-            dialog.set_property("text", "Removal completed")
-        else:
-            dialog.set_property("message-type", Gtk.MessageType.ERROR)
-            dialog.set_property("text", "Removal failed")
-
-        dialog.set_property("secondary-text", message)
-        dialog.add_button("Close", Gtk.ResponseType.CLOSE)
-
-        dialog.connect("response", lambda d, response: d.close())
-        dialog.present()
+    @staticmethod
+    def _show_result_idle(success, message):
+        try:
+            dialog = Gtk.MessageDialog(
+                transient_for=None,
+                modal=True,
+            )
+            dialog.set_property(
+                "message-type",
+                Gtk.MessageType.INFO if success else Gtk.MessageType.ERROR,
+            )
+            dialog.set_property(
+                "text", "Removal completed" if success else "Removal failed"
+            )
+            dialog.set_property("secondary-text", message)
+            dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+            dialog.connect("response", lambda d, _r: d.close())
+            dialog.present()
+        except Exception:
+            pass
+        return False

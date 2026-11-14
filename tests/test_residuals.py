@@ -9,6 +9,14 @@ from unittest.mock import patch
 
 from appector import actions, policy, residual
 
+try:
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    GTK_AVAILABLE = True
+except Exception:  # pragma: no cover - exercised on headless runners
+    GTK_AVAILABLE = False
+
 
 class ResidualValidationTests(unittest.TestCase):
     def test_purge_simulation_passes_packages_after_terminator(self):
@@ -67,7 +75,7 @@ class ResidualValidationTests(unittest.TestCase):
 
     def test_purge_blocks_invalid_names_without_touching_system(self):
         with (
-            patch("appector.residual._dpkg_residual_package_set") as rc,
+            patch("appector.residual._dpkg_status_map") as rc,
             patch("appector.residual._backup_residual_conffiles") as backup,
         ):
             success, message = residual.purge_leftover_configs(["good-pkg", "-bad"])
@@ -79,7 +87,7 @@ class ResidualValidationTests(unittest.TestCase):
     def test_purge_blocks_oversized_batch(self):
         many = [f"pkg{i}" for i in range(residual.RESIDUAL_MAX_PACKAGES + 1)]
         with (
-            patch("appector.residual._dpkg_residual_package_set") as rc,
+            patch("appector.residual._dpkg_status_map") as rc,
             patch("appector.residual._backup_residual_conffiles") as backup,
         ):
             success, message = residual.purge_leftover_configs(many)
@@ -90,7 +98,7 @@ class ResidualValidationTests(unittest.TestCase):
 
     def test_purge_requires_rc_state(self):
         with patch(
-            "appector.residual._dpkg_residual_package_set", return_value={"other-pkg"}
+            "appector.residual._dpkg_status_map", return_value={"other-pkg": "rc"}
         ):
             success, message = residual.purge_leftover_configs(["my-pkg"])
         self.assertFalse(success)
@@ -99,8 +107,8 @@ class ResidualValidationTests(unittest.TestCase):
     def test_purge_simulation_failure_blocks(self):
         with (
             patch(
-                "appector.residual._dpkg_residual_package_set",
-                return_value={"my-pkg"},
+                "appector.residual._dpkg_status_map",
+                return_value={"my-pkg": "rc"},
             ),
             patch(
                 "appector.residual.simulate_leftover_purge",
@@ -116,8 +124,8 @@ class ResidualValidationTests(unittest.TestCase):
     def test_purge_blocks_extra_simulated_removals(self):
         with (
             patch(
-                "appector.residual._dpkg_residual_package_set",
-                return_value={"my-pkg"},
+                "appector.residual._dpkg_status_map",
+                return_value={"my-pkg": "rc"},
             ),
             patch(
                 "appector.residual.simulate_leftover_purge",
@@ -131,29 +139,57 @@ class ResidualValidationTests(unittest.TestCase):
         backup.assert_not_called()
 
     def test_purge_reverifies_after_backup(self):
+        """The rc re-check after the backup lives in the helper (ADR-0003).
+
+        A package that leaves rc state during the (slow) backup must not be
+        purged as if it were still residual configuration.
+        """
+        from appector import helper as helper_module
+        from appector.plans import Plan
+
         calls = {"rc": 0}
 
-        def fake_rc():
+        def fake_status():
             calls["rc"] += 1
             if calls["rc"] == 1:
-                return {"my-pkg"}
-            return set()  # reinstalled / left rc state after backup
+                return {"my-pkg": "rc"}
+            return {}  # reinstalled / left rc state after backup
 
+        plan = Plan(
+            action="purge",
+            package_ids=["my-pkg"],
+            removed_preview=["my-pkg"],
+        )
+        request = {
+            "version": 1,
+            "action": "purge-residual",
+            "nonce": "a" * 32,
+            "packages": ["my-pkg"],
+            "plan": {
+                "action": plan.action,
+                "package_ids": plan.package_ids,
+                "removed_preview": plan.removed_preview,
+                "text": "",
+                "plan_hash": plan.plan_hash,
+            },
+            "plan_hash": plan.plan_hash,
+        }
         with (
-            patch("appector.residual._dpkg_residual_package_set", side_effect=fake_rc),
             patch(
-                "appector.residual.simulate_leftover_purge",
-                return_value=(True, "Purg my-pkg", ["my-pkg"]),
+                "appector.helper.shutil.which", return_value="/usr/bin/apt-get"
+            ),
+            patch(
+                "appector.residual._dpkg_status_map", side_effect=fake_status
             ),
             patch(
                 "appector.residual._backup_residual_conffiles",
                 return_value=(Path("/tmp/fake-backup"), 1),
             ),
-            patch("appector.actions._run_command_stream") as run,
+            patch("appector.helper._run_streaming") as run,
         ):
-            success, message = residual.purge_leftover_configs(["my-pkg"])
-        self.assertFalse(success)
-        self.assertIn("after the backup", message)
+            result = helper_module.process_request(request)
+        self.assertFalse(result["ok"])
+        self.assertIn("during the backup", result["message"])
         run.assert_not_called()
 
     def test_size_estimate_uses_shared_conffile_pattern(self):
@@ -231,6 +267,7 @@ class ResidualValidationTests(unittest.TestCase):
         cmd = run.call_args_list[0].args[0]
         self.assertEqual(cmd[-3:], ["--", "vim", "nano"])
 
+@unittest.skipUnless(GTK_AVAILABLE, "GTK 4 / gi is not available")
 class SignalSignatureTests(unittest.TestCase):
     """GTK callbacks must accept the arguments their signal delivers.
 
@@ -387,6 +424,7 @@ class FlatpakPreviewDetectionTests(unittest.TestCase):
             self.assertIsNone(actions.FLATPAK_PROMPT_RE.search(text), text)
 
 
+@unittest.skipUnless(GTK_AVAILABLE, "GTK 4 / gi is not available")
 class MarkPersistenceTests(unittest.TestCase):
     """Staged removal marks are stored privately and parsed defensively."""
 
@@ -403,7 +441,9 @@ class MarkPersistenceTests(unittest.TestCase):
         return stub
 
     def _mark_file(self, home):
-        return home / ".local" / "state" / "app-manager" / "marked.json"
+        from appector.paths import state_dir
+
+        return state_dir() / "marked.json"
 
     def test_marks_round_trip_with_user_only_permissions(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -449,6 +489,7 @@ class MarkPersistenceTests(unittest.TestCase):
                 self.assertEqual(stub.load_marked_keys(), set())
 
 
+@unittest.skipUnless(GTK_AVAILABLE, "GTK 4 / gi is not available")
 class ScopeFilterTests(unittest.TestCase):
     """`filter_func` decides visibility from the unified scope selector."""
 
@@ -619,7 +660,7 @@ class ResidualBackupLimitTests(unittest.TestCase):
         """`purge_leftover_configs` enforces its own batch cap before backup."""
         many = [f"pkg{i}" for i in range(residual.RESIDUAL_MAX_PACKAGES + 1)]
         with (
-            patch("appector.residual._dpkg_residual_package_set") as rc,
+            patch("appector.residual._dpkg_status_map") as rc,
             patch("appector.residual._backup_residual_conffiles") as backup,
         ):
             success, message = residual.purge_leftover_configs(many)
@@ -850,17 +891,25 @@ class PurgeBackupPruningTests(unittest.TestCase):
     def test_prune_keeps_newest(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            backup_root = home / ".local/state/app-manager/purge-backups"
-            backup_root.mkdir(parents=True)
-            for name in ("20240101T000000-a", "20240102T000000-b", "20240103T000000-c"):
-                (backup_root / name).mkdir()
             with patch.object(Path, "home", return_value=home):
+                from appector.paths import state_dir
+
+                backup_root = state_dir() / "purge-backups"
+                backup_root.mkdir(parents=True)
+                import json as _json
+
+                for name in ("20240101T000000-a", "20240102T000000-b", "20240103T000000-c"):
+                    (backup_root / name).mkdir()
+                    (backup_root / name / "manifest.json").write_text(
+                        _json.dumps({"status": "complete", "files": [], "packages": []}),
+                        encoding="utf-8",
+                    )
                 removed, kept = residual.prune_old_purge_backups(keep=2)
-            self.assertEqual((removed, kept), (1, 2))
-            remaining = sorted(p.name for p in backup_root.iterdir())
-            self.assertEqual(
-                remaining, ["20240102T000000-b", "20240103T000000-c"]
-            )
+                self.assertEqual((removed, kept), (1, 2))
+                remaining = sorted(p.name for p in backup_root.iterdir())
+                self.assertEqual(
+                    remaining, ["20240102T000000-b", "20240103T000000-c"]
+                )
 
 
 if __name__ == "__main__":

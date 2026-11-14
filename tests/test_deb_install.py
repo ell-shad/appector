@@ -236,14 +236,34 @@ class DebReviewResilienceTests(unittest.TestCase):
         shutil.rmtree(staged.parent)
         self.assertFalse(staged.exists())
 
-        with self._which(), self._field(), patch(
-            "appector.actions._run_command_stream", return_value=(True, "ok")
-        ) as install:
+        from appector.helper_client import HelperResult
+
+        fake = HelperResult(ok=True, message="Installed reviewed packages.")
+        with (
+            self._which(),
+            self._field(),
+            patch(
+                "appector.actions._run_command_raw",
+                side_effect=lambda command, **kwargs: (
+                    (0, "amd64")
+                    if command[1:] == ["--print-architecture"]
+                    else (0, "Inst appector [0.2.0]")
+                ),
+            ),
+            patch(
+                "appector.actions.helper_client.install_deb",
+                return_value=fake,
+            ) as install,
+        ):
             success, message = actions.install_deb_batch(
                 review.staged_paths, review=review
             )
         self.assertTrue(success, message)
         install.assert_called_once()
+        # S1: the helper must receive the reviewed hashes, so root never
+        # installs unverified bytes.
+        files = install.call_args.args[0]
+        self.assertEqual(files[0]["sha256"], review.hashes[0])
 
     def test_changed_original_refuses_instead_of_installing(self):
         review = self._review(contents=b"original bytes")

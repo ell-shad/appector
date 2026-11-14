@@ -60,8 +60,14 @@ def check_for_update(current_version):
         },
     )
 
+    # S310: only the fixed https:// GitHub API endpoint is ever opened;
+    # the check makes that explicit instead of relying on the constant.
+    if urlsplit(LATEST_RELEASE_URL).scheme != "https":
+        raise RuntimeError("Refusing to check updates over a non-HTTPS URL.")
+
     try:
-        with urlopen(request, timeout=10) as response:
+        # S310: the URL is the module constant checked above (https only).
+        with urlopen(request, timeout=10) as response:  # noqa: S310
             release = json.load(response)
     except HTTPError as error:
         if error.code == 404:

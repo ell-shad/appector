@@ -1,35 +1,19 @@
+"""Command-line entry point.
+
+Deliberately free of GTK imports at module level so `appector --version`,
+the root-refusal check, and CLI error paths work (and are tested) on
+headless systems where libadwaita is not installed. The GUI is imported
+lazily only after those checks pass.
+"""
+
 import argparse
 import os
 import sys
 
-import gi
-
-gi.require_version("Gtk", "4.0")
-gi.require_version("Adw", "1")
-
-from gi.repository import Adw, Gio
-
 from . import __version__
-from .window import MainWindow
 
 
-class AppectorApp(Adw.Application):
-    def __init__(self):
-        super().__init__(
-            application_id="com.appector.appector",
-            flags=Gio.ApplicationFlags.FLAGS_NONE,
-        )
-
-        self.window = None
-
-    def do_activate(self):
-        if not self.window:
-            self.window = MainWindow(self)
-
-        self.window.present()
-
-
-def main(argv=None):
+def build_argument_parser():
     parser = argparse.ArgumentParser(
         prog="appector",
         description="Open the Appector Linux application manager.",
@@ -39,7 +23,18 @@ def main(argv=None):
         action="version",
         version=f"%(prog)s {__version__}",
     )
-    parser.parse_args(argv)
+    parser.add_argument(
+        "files",
+        metavar="FILE",
+        nargs="*",
+        help="install files to review (.deb, .flatpakref, .AppImage)",
+    )
+    return parser
+
+
+def main(argv=None):
+    parser = build_argument_parser()
+    arguments = parser.parse_args(argv)
 
     if os.geteuid() == 0:
         print(
@@ -48,5 +43,10 @@ def main(argv=None):
         )
         return 1
 
+    # Imported lazily: this is the first point that genuinely needs GTK.
+    from .app import AppectorApp
+
     app = AppectorApp()
+    if arguments.files:
+        app.hold_files_to_open(arguments.files)
     return app.run(None)

@@ -29,3 +29,49 @@ checksums are not separately signed. Users can verify package provenance with
 `gh attestation verify ./appector_<version>_all.deb --repo ell-shad/appector`.
 The in-app checker only opens a release page; it does not download or install
 package files.
+
+## APT repository signing key
+
+The APT repository metadata is signed with a dedicated archive key held as
+the `APPECTOR_GPG_KEY` repository secret (see ADR-0003's release notes and
+`scripts/generate-apt-signing-key.sh`). The matching public key is committed
+at `apt/keys/appector-archive-keyring.asc` so it is reviewable in pull
+requests; the release workflow refuses a mismatch between the committed key
+and the signing secret.
+
+### Key rotation
+
+1. Generate a new key: `./scripts/generate-apt-signing-key.sh` (never reuse
+   the old key material).
+2. Commit the new public key to `apt/keys/appector-archive-keyring.asc`
+   **alongside** the old one, and ship *both* in the published
+   `appector-archive-keyring.asc` for at least one release cycle, so
+   existing users can roll forward without manual steps.
+3. Update the `APPECTOR_GPG_KEY`, `APPECTOR_GPG_KEY_ID` and
+   `APPECTOR_GPG_PASSPHRASE` secrets.
+4. Publish the next release; verify the published metadata verifies under
+   both keys.
+5. Remove the old public half only after the minimum supported version has
+   shipped with the new key (one release cycle).
+
+### Key revocation / compromise
+
+1. Revoke the compromised key and commit the revocation certificate to
+   `apt/keys/`.
+2. Immediately stop publishing: disable the `public-release` environment so
+   the APT workflow cannot sign with the compromised key.
+3. Announce the compromise with the revocation fingerprint in the release
+   notes of the next release and in the repository README.
+4. Rotate per "Key rotation" above; the first release signed with the new
+   key must instruct users to re-import the keyring (the announcement
+   covers this).
+5. A `workflow_dispatch` run of the APT workflow prints the archive public
+   key; use it to confirm which key is currently configured.
+
+### Repository metadata hygiene
+
+Release metadata carries `Valid-Until` (7 days) so a stale mirror cannot be
+served indefinitely, and `Acquire-By-Hash: yes` indexes so mirror updates
+are atomic for clients. The pool retains the newest three releases; older
+packages are removed only after the retention window, so in-flight updates
+from the previous release still resolve.

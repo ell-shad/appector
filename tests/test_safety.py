@@ -1,4 +1,5 @@
 import io
+import sys
 import os
 import stat
 import tempfile
@@ -11,13 +12,24 @@ from appector import __version__
 from appector import _proc, actions
 from appector import main as main_module
 
+try:
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    GTK_AVAILABLE = True
+except Exception:  # pragma: no cover - exercised on headless runners
+    GTK_AVAILABLE = False
+
 
 class RemovalSafetyTests(unittest.TestCase):
     def test_gui_refuses_to_start_as_root(self):
         stderr = io.StringIO()
+        application = Mock()
         with (
             patch("appector.main.os.geteuid", return_value=0),
-            patch("appector.main.AppectorApp") as application,
+            patch.dict(
+                sys.modules, {"appector.app": Mock(AppectorApp=application)}
+            ),
             patch("sys.stderr", stderr),
         ):
             self.assertEqual(main_module.main([]), 1)
@@ -28,8 +40,11 @@ class RemovalSafetyTests(unittest.TestCase):
         )
 
     def test_version_option_exits_without_starting_gui(self):
+        application = Mock()
         with (
-            patch("appector.main.AppectorApp") as application,
+            patch.dict(
+                sys.modules, {"appector.app": Mock(AppectorApp=application)}
+            ),
             patch("sys.stdout", new_callable=io.StringIO) as stdout,
         ):
             with self.assertRaises(SystemExit) as exit_info:
@@ -79,12 +94,15 @@ class RemovalSafetyTests(unittest.TestCase):
             with patch.object(Path, "home", return_value=home):
                 _proc._log_action("TEST event")
 
-            log_dir = home / ".local/state/app-manager"
-            log_file = log_dir / "actions.log"
-            self.assertEqual(os.stat(log_dir).st_mode & 0o777, 0o700)
-            self.assertEqual(os.stat(log_file).st_mode & 0o777, 0o600)
-            self.assertIn("TEST event", log_file.read_text(encoding="utf-8"))
+                from appector.paths import state_dir
 
+                log_dir = state_dir()
+                log_file = log_dir / "actions.log"
+                self.assertEqual(os.stat(log_dir).st_mode & 0o777, 0o700)
+                self.assertEqual(os.stat(log_file).st_mode & 0o777, 0o600)
+                self.assertIn("TEST event", log_file.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(GTK_AVAILABLE, "GTK 4 / gi is not available")
     def test_app_list_export_is_private_and_replaces_symlinks(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -133,7 +151,7 @@ class RemovalSafetyTests(unittest.TestCase):
             outside.mkdir()
             (home / ".local").mkdir()
             (home / ".local/state").mkdir()
-            (home / ".local/state/app-manager").symlink_to(outside)
+            (home / ".local/state/appector").symlink_to(outside)
 
             with (
                 patch.object(Path, "home", return_value=home),

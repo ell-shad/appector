@@ -23,6 +23,7 @@ class AppItem(GObject.Object):
     exec_name = GObject.Property(type=str, default="")
     is_duplicate = GObject.Property(type=bool, default=False)
     removal_paths = GObject.Property(type=str, default="")
+    installation = GObject.Property(type=str, default="")
 
     def __init__(self, app: AppEntry):
         super().__init__()
@@ -44,3 +45,4 @@ class AppItem(GObject.Object):
         self.exec_name = getattr(app, "exec_name", "") or ""
         self.is_duplicate = getattr(app, "is_duplicate", False)
         self.removal_paths = "\n".join(getattr(app, "removal_paths", []) or [])
+        self.installation = getattr(app, "installation", "") or ""

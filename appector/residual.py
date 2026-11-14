@@ -13,6 +13,13 @@ The rc re-check after the backup closes the reinstall-then-purge window: the
 backup is slow, and a package reinstalled during it must not be purged as if
 it were only residual configuration.
 
+Multiarch (S2): every identity in this flow is ``name:arch`` as printed by
+``${binary:Package}``. A bare name could mean any architecture, and
+``apt-get purge libfoo`` resolves to the *native* architecture — purging an
+installed package when only the ``:i386`` instance was residual. Packages
+whose base name has any non-rc instance on another architecture are refused
+outright.
+
 Backups cover dpkg-registered conffiles only. Maintainer `postrm` scripts can
 delete more, which is why the APT simulation is the authoritative preview.
 Appector never restores automatically.
@@ -30,59 +37,21 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from ._proc import _log_action, _run_command_raw, _run_command_stream
+from . import helper_client
+from .helper_client import HelperUnavailable
+from ._proc import _log_action, _run_command_raw
+from .paths import is_acceptable_private_dir, state_dir
+from .plans import Plan
 from .policy import (
     _base_package_name,
+    _deduplicate_package_ids,
+    _format_package_list,
     _is_safe_package_id,
+    _package_arch,
+    _parse_apt_simulation_removed_packages,
+    _split_safe_package_ids,
     is_critical_apt_package_name,
 )
-
-
-def _deduplicate_package_ids(package_ids):
-    """Deduplicate while preserving order and dropping empty entries."""
-    seen = set()
-    result = []
-    for package_id in package_ids or []:
-        value = str(package_id or "").strip()
-        if value and value not in seen:
-            seen.add(value)
-            result.append(value)
-    return result
-
-
-def _split_safe_package_ids(package_ids):
-    valid = []
-    invalid = []
-    for package_id in _deduplicate_package_ids(package_ids):
-        if _is_safe_package_id(package_id):
-            valid.append(package_id)
-        else:
-            invalid.append(package_id)
-    return valid, invalid
-
-
-def _parse_apt_simulation_removed_packages(output: str):
-    """Extract package names from `Remv`/`Purg` lines of an apt simulation."""
-    removed = []
-    for line in output.splitlines():
-        if line.startswith(("Remv ", "Purg ")):
-            parts = line.split()
-            if len(parts) >= 2:
-                removed.append(_base_package_name(parts[1]))
-    seen = set()
-    unique = []
-    for package_name in removed:
-        if package_name not in seen:
-            seen.add(package_name)
-            unique.append(package_name)
-    return unique
-
-
-def _format_package_list(packages, limit=50):
-    lines = [f"• {name}" for name in packages[:limit]]
-    if len(packages) > limit:
-        lines.append(f"• …and {len(packages) - limit} more")
-    return "\n".join(lines)
 
 
 # Residual-config purge limits. Purging only deletes configuration files of
@@ -92,8 +61,6 @@ RESIDUAL_MAX_PACKAGES = 100
 RESIDUAL_MAX_BACKUP_FILES = 2000
 RESIDUAL_MAX_BACKUP_BYTES = 100 * 1024 * 1024
 RESIDUAL_PURGE_BACKUP_KEEP = 10
-
-SAFE_PACKAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:-]*$")
 
 # dpkg conffile lines look like "<absolute path> <md5>" with an optional
 # trailing marker such as "obsolete".
@@ -111,17 +78,22 @@ CONFFILE_LINE_RE = re.compile(
 )
 
 
-def _dpkg_residual_package_set(timeout=30):
-    """Return the set of packages currently in dpkg's rc state."""
+def _dpkg_status_map(timeout=30):
+    """Return ``{name:arch: status-abbrev}`` for every dpkg entry.
+
+    Architecture-qualified (S2): this is the shared basis for the residual
+    set and for the multiarch cross-instance check.
+    """
     result = subprocess.run(
         [
             "dpkg-query",
             "-W",
-            "-f=${db:Status-Abbrev}\t${Package}\n",
+            "-f=${db:Status-Abbrev}\t${binary:Package}\n",
         ],
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
+        errors="replace",
         timeout=timeout,
         env={**os.environ, "LC_ALL": "C"},
     )
@@ -130,14 +102,41 @@ def _dpkg_residual_package_set(timeout=30):
             result.stderr.strip()
             or "Could not verify residual APT configurations."
         )
-    residual = set()
+    status_map = {}
     for line in result.stdout.splitlines():
         status, separator, package = line.partition("\t")
-        if separator and status[:2] == "rc":
-            package = package.strip()
-            if package:
-                residual.add(package)
-    return residual
+        if separator and package:
+            status_map[package.strip()] = status.strip()
+    return status_map
+
+
+def _dpkg_residual_package_set(timeout=30):
+    """Return the set of ``name:arch`` packages currently in dpkg's rc state."""
+    return {
+        package
+        for package, status in _dpkg_status_map(timeout=timeout).items()
+        if status[:2] == "rc"
+    }
+
+
+def _multiarch_conflicts(package_ids, status_map):
+    """S2: refuse a residual whose base name has a non-rc instance elsewhere.
+
+    ``apt-get purge libfoo`` targets the native architecture, so a bare-name
+    request next to an installed other-arch instance can purge the installed
+    package. Even arch-qualified requests are refused here, because the
+    simulation's confirmation gate compares base names and could be satisfied
+    by the wrong instance.
+    """
+    conflicts = {}
+    for package_id in package_ids:
+        base = _base_package_name(package_id)
+        for other, status in status_map.items():
+            if other == package_id or _base_package_name(other) != base:
+                continue
+            if status[:2] != "rc":
+                conflicts.setdefault(package_id, []).append(other)
+    return conflicts
 
 
 def _dpkg_conffile_entries(package_id, timeout=30):
@@ -149,6 +148,7 @@ def _dpkg_conffile_entries(package_id, timeout=30):
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
+        errors="replace",
         timeout=timeout,
         env={**os.environ, "LC_ALL": "C"},
     )
@@ -214,6 +214,7 @@ def simulate_leftover_purge(package_ids, timeout=120):
         cmd,
         timeout=timeout,
         env_overrides={"LC_ALL": "C"},
+        uses_apt=True,
     )
     if returncode != 0:
         _log_action("LEFTOVER_PURGE_SIMULATION_FAILED")
@@ -221,6 +222,22 @@ def simulate_leftover_purge(package_ids, timeout=120):
     purged = _parse_apt_simulation_removed_packages(output)
     _log_action(f"LEFTOVER_PURGE_SIMULATION_SUCCESS purged_count={len(purged)}")
     return True, output, purged
+
+
+def _same_package_instance(requested, simulated):
+    """Compare a requested `name[:arch]` against a simulation token (S2)."""
+    if requested == simulated:
+        return True
+    requested_base = _base_package_name(requested)
+    simulated_base = _base_package_name(simulated)
+    if requested_base != simulated_base:
+        return False
+    # A simulation token without an architecture is only an acceptable match
+    # for a request without one, and only on a single-architecture system;
+    # when either side carries an arch, demand agreement.
+    requested_arch = _package_arch(requested)
+    simulated_arch = _package_arch(simulated)
+    return not requested_arch or not simulated_arch
 
 
 def _write_json_private(path, data):
@@ -241,8 +258,61 @@ def _write_json_private(path, data):
         raise
 
 
-def _backup_residual_conffiles(package_ids):
-    """Securely copy dpkg-authoritative conffiles before irreversible purge."""
+def _write_json_private_update(path, data):
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    _write_json_private(temporary, data)
+    os.replace(temporary, path)
+    os.chmod(path, 0o600)
+
+
+def _ensure_backup_parents(directory: Path, files_dir: Path):
+    """S9: create backup directories without ever following a symlink.
+
+    ``mkdir(parents=True)`` happily descends through a symlink planted in an
+    existing parent, letting a later ``O_CREAT|O_NOFOLLOW`` open escape the
+    backup tree through that intermediate link. Creating one level at a time
+    and refusing symlinks keeps every parent a real directory inside
+    ``files_dir``.
+    """
+    relative = directory.relative_to(files_dir)
+    current = files_dir
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise OSError(
+                "Refusing to back up through a symlinked directory inside "
+                f"the backup area: {current}"
+            )
+        if not current.exists():
+            current.mkdir(mode=0o700)
+        elif not current.is_dir():
+            raise OSError(
+                f"Backup destination parent is not a directory: {current}"
+            )
+
+
+def _discard_backup(backup_dir: Path):
+    """Delete an unused backup directory (purge never started)."""
+    try:
+        root = backup_root_dir()
+        if backup_dir.parent != root or backup_dir.is_symlink():
+            return
+        shutil.rmtree(backup_dir)
+    except OSError:
+        pass
+
+
+def backup_root_dir() -> Path:
+    return state_dir() / "purge-backups"
+
+
+def _backup_residual_conffiles(package_ids, skip_unreadable=False):
+    """Securely copy dpkg-authoritative conffiles before irreversible purge.
+
+    ``skip_unreadable`` (S9) records root-only conffiles as "unreadable" in
+    the manifest instead of aborting the whole purge; the choice is surfaced
+    to the user by the caller, and recorded in the activity log.
+    """
     package_ids = _deduplicate_package_ids(package_ids)
     _valid, invalid = _split_safe_package_ids(package_ids)
     if invalid:
@@ -254,19 +324,17 @@ def _backup_residual_conffiles(package_ids):
             f"Refusing to back up {len(package_ids)} packages at once "
             f"(limit is {RESIDUAL_MAX_PACKAGES}). Purge in smaller batches."
         )
-    state_dir = Path.home() / ".local" / "state" / "app-manager"
-    backup_root = state_dir / "purge-backups"
-    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    home_dir = Path.home().resolve()
-    if (
-        state_dir.is_symlink()
-        or not state_dir.resolve().is_relative_to(home_dir)
-    ):
-        raise OSError(f"Backup state directory is outside the home directory: {state_dir}")
+    state_root = state_dir()
+    state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not is_acceptable_private_dir(state_root):
+        raise OSError(
+            f"Backup state directory is not private: {state_root}"
+        )
+    backup_root = state_root / "purge-backups"
     backup_root.mkdir(mode=0o700, exist_ok=True)
-    if backup_root.is_symlink() or not backup_root.resolve().is_relative_to(home_dir):
-        raise OSError(f"Backup directory is outside the home directory: {backup_root}")
-    os.chmod(state_dir, 0o700)
+    if backup_root.is_symlink() or not is_acceptable_private_dir(backup_root):
+        raise OSError(f"Backup directory is not private: {backup_root}")
+    os.chmod(state_root, 0o700)
     os.chmod(backup_root, 0o700)
 
     backup_dir = backup_root / (
@@ -318,9 +386,32 @@ def _backup_residual_conffiles(package_ids):
                     })
                     records_by_path[source_value] = manifest["files"][-1]
                     continue
+                except PermissionError as permission_error:
+                    if not skip_unreadable:
+                        raise OSError(
+                            "A configuration file could not be read with user "
+                            "permissions (it is probably root-only):\n\n"
+                            f"  {source_value}\n\n"
+                            "Purging is blocked so that no file is deleted "
+                            "without a backup copy. You can retry with "
+                            "\"skip unreadable files\" if you accept that "
+                            "this specific file will not be backed up."
+                        ) from permission_error
+                    _log_action(
+                        "PURGE_BACKUP_SKIPPED_UNREADABLE "
+                        f"package={package_id} path={source_value}"
+                    )
+                    manifest["files"].append({
+                        "package": package_id,
+                        "packages": [package_id],
+                        "path": source_value,
+                        "status": "unreadable",
+                    })
+                    records_by_path[source_value] = manifest["files"][-1]
+                    continue
 
                 destination = files_dir / source_value.lstrip("/")
-                destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                _ensure_backup_parents(destination.parent, files_dir)
                 if backed_up_files + 1 > RESIDUAL_MAX_BACKUP_FILES:
                     raise OSError(
                         f"Refusing to back up more than {RESIDUAL_MAX_BACKUP_FILES} "
@@ -445,13 +536,6 @@ def _backup_residual_conffiles(package_ids):
     )
 
 
-def _write_json_private_update(path, data):
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    _write_json_private(temporary, data)
-    os.replace(temporary, path)
-    os.chmod(path, 0o600)
-
-
 def _purge_backup_note(backup_dir, file_count):
     noun = "file" if file_count == 1 else "files"
     return (
@@ -542,7 +626,7 @@ def get_purge_backup_summaries():
 
 def list_purge_backups():
     """List existing pre-purge backup directories, newest first."""
-    backup_root = Path.home() / ".local" / "state" / "app-manager" / "purge-backups"
+    backup_root = backup_root_dir()
     try:
         if not backup_root.is_dir() or backup_root.is_symlink():
             return []
@@ -554,45 +638,80 @@ def list_purge_backups():
 
 
 def prune_old_purge_backups(keep=RESIDUAL_PURGE_BACKUP_KEEP):
-    """Keep only the newest `keep` purge backups. Returns (removed, kept)."""
+    """Keep only the newest `keep` *usable* purge backups (S9).
+
+    Incomplete or error-marked backups are deleted first — they are the
+    debris of blocked attempts — and only then are the newest `keep`
+    complete backups retained. Previously the newest 10 by *name* were kept
+    regardless of status, so ten blocked attempts could evict every good
+    backup. Returns (removed, kept).
+    """
     backups = list_purge_backups()
     if keep < 0:
         keep = 0
-    to_remove = backups[keep:]
+
+    root = backup_root_dir()
+    usable = []
     removed = 0
+    for path in backups:
+        summary = read_purge_backup(path)
+        is_usable = (
+            summary is not None
+            and summary.get("status") == "complete"
+            and not summary.get("error")
+        )
+        if not is_usable:
+            try:
+                if path.is_symlink() or path.parent != root:
+                    continue
+                shutil.rmtree(path)
+                removed += 1
+            except OSError:
+                usable.append(path)
+            continue
+        usable.append(path)
+
+    to_remove = usable[keep:]
     for path in to_remove:
         try:
             if path.is_symlink() or not path.is_dir():
                 continue
             # Refuse to delete anything outside the backup root.
-            if path.parent != (
-                Path.home() / ".local" / "state" / "app-manager" / "purge-backups"
-            ):
+            if path.parent != root:
                 continue
             shutil.rmtree(path)
             removed += 1
         except OSError:
             continue
-    return removed, len(backups) - removed
+    return removed, len(usable) - len(to_remove)
 
 
-def purge_leftover_configs(package_ids, output_callback=None):
+def purge_leftover_configs(
+    package_ids,
+    output_callback=None,
+    skip_unreadable_backup=False,
+):
     """
     Purges leftover APT configuration packages.
 
     These packages are already removed, but their configuration files remain.
 
     Safety model:
-    - Validate names, verify dpkg rc state, and simulate the purge first.
+    - Validate names (``name:arch``), verify dpkg rc state, and simulate the
+      purge first.
+    - Refuse any package whose base name has a non-rc instance on another
+      architecture (S2): the bare-name purge could hit the installed one.
     - Back up dpkg-registered conffiles; abort if the backup is incomplete.
     - Re-verify rc state after the backup (TOCTOU): a package reinstalled
       between verification and purge must not be purged as if it were only
-      residual config.
-    - Purge with `pkexec apt-get purge -y ...`, then verify residuals are gone.
+      residual config. Backups made for a purge that never starts are
+      discarded again (S9).
+    - Purge with `pkexec apt-get purge -y ...`, then verify residuals are
+      gone.
 
     Uses:
 
-        pkexec apt-get purge -y package1 package2 ...
+        pkexec apt-get purge -y name:arch ...
     """
 
     requested = _deduplicate_package_ids(package_ids)
@@ -614,16 +733,63 @@ def purge_leftover_configs(package_ids, output_callback=None):
         )
 
     try:
-        residual_packages = _dpkg_residual_package_set()
+        status_map = _dpkg_status_map()
     except (OSError, subprocess.TimeoutExpired) as error:
         return False, f"Could not verify residual APT configurations: {error}"
 
-    packages_to_purge = [p for p in valid if p in residual_packages]
-    skipped_packages = [p for p in valid if p not in residual_packages]
+    residual_packages = {
+        package
+        for package, status in status_map.items()
+        if status[:2] == "rc"
+    }
+    # Resolve the request against arch-qualified rc identities. A bare name
+    # (legacy marks, older callers) expands to its residual instances so the
+    # purge can never be resolved by apt to an *installed* architecture.
+    resolved = []
+    skipped_packages = []
+    for package_id in valid:
+        if package_id in residual_packages:
+            resolved.append(package_id)
+            continue
+        if ":" not in package_id:
+            arch_instances = sorted(
+                candidate
+                for candidate in residual_packages
+                if _base_package_name(candidate) == package_id
+            )
+            if arch_instances:
+                resolved.extend(arch_instances)
+                continue
+        skipped_packages.append(package_id)
+
+    packages_to_purge = _deduplicate_package_ids(resolved)
     if not packages_to_purge:
         return False, (
             "None of the selected packages are currently in dpkg's "
             "residual-configuration state. No packages were purged."
+        )
+
+    # S2: block when another architecture instance of the same base name is
+    # in a non-rc state — apt resolves bare names to the native arch.
+    conflicts = _multiarch_conflicts(packages_to_purge, status_map)
+    if conflicts:
+        blocked_lines = []
+        for package_id, others in conflicts.items():
+            for other in others:
+                blocked_lines.append(
+                    f"• {package_id} is residual, but {other} is still "
+                    "installed (different architecture). Purging by name "
+                    "could remove the installed instance, so Appector "
+                    "refuses; purge from a terminal with the explicit "
+                    f"':{other.split(':')[-1]}' suffix if you really mean it."
+                )
+        _log_action(
+            "LEFTOVER_PURGE_BLOCKED reason=multiarch "
+            f"packages={','.join(sorted(conflicts))}"
+        )
+        return False, (
+            "Blocked by safety policy (multi-arch conflict):\n\n"
+            + "\n".join(blocked_lines)
         )
 
     # Simulate first: catches broken APT state and shows what purge would do.
@@ -636,10 +802,9 @@ def purge_leftover_configs(package_ids, output_callback=None):
             "APT purge simulation failed; no packages were purged.\n\n"
             f"{sim_output}"
         )
-    sim_purged_bases = {_base_package_name(p) for p in sim_purged}
     not_confirmed = [
         p for p in packages_to_purge
-        if _base_package_name(p) not in sim_purged_bases
+        if not any(_same_package_instance(p, s) for s in sim_purged)
     ]
     if not_confirmed:
         return False, (
@@ -647,8 +812,8 @@ def purge_leftover_configs(package_ids, output_callback=None):
             f"{_format_package_list(not_confirmed)}\n\n{sim_output}"
         )
     extra_purged = sorted(
-        p for p in sim_purged_bases
-        if p not in {_base_package_name(p) for p in packages_to_purge}
+        s for s in sim_purged
+        if not any(_same_package_instance(p, s) for p in packages_to_purge)
     )
     if extra_purged:
         return False, (
@@ -660,56 +825,45 @@ def purge_leftover_configs(package_ids, output_callback=None):
         p for p in packages_to_purge if is_critical_apt_package_name(p)
     ]
 
-    apt_get_command = shutil.which("apt-get") or "/usr/bin/apt-get"
-    pkexec_command = shutil.which("pkexec")
+    # The privileged tail — conffile backup as root (S9), rc/multiarch
+    # re-verification, plan binding, and the purge itself — runs inside the
+    # helper (ADR-0003). The plan binds the purge to the simulated set.
+    plan = Plan(
+        action="purge",
+        package_ids=list(packages_to_purge),
+        removed_preview=list(sim_purged),
+        text="",
+    )
+
+    _log_action(
+        f"LEFTOVER_PURGE_START helper=purge-residual packages={len(packages_to_purge)}"
+    )
 
     try:
-        backup_dir, backed_up_count = _backup_residual_conffiles(packages_to_purge)
+        result = helper_client.purge_residual(
+            packages_to_purge,
+            plan=plan,
+            skip_unreadable_backup=skip_unreadable_backup,
+            output_callback=output_callback,
+        )
+    except HelperUnavailable as error:
+        _log_action("LEFTOVER_PURGE_BLOCKED reason=helper-unavailable")
+        return False, f"{error}"
     except OSError as error:
-        _log_action(f"LEFTOVER_PURGE_BLOCKED backup_error={error}")
-        return False, (
-            "Purge was not started because Appector could not securely back up "
-            f"the remaining configuration files.\n\n{error}"
-        )
+        _log_action("LEFTOVER_PURGE_BLOCKED reason=helper-start-failed")
+        return False, f"Could not start the privileged helper: {error}"
 
-    # Re-verify after the (potentially slow) backup: if a package left rc
-    # state meanwhile (e.g. reinstalled), purging it now would remove an
-    # installed package, not just residual config.
-    try:
-        residual_after_backup = _dpkg_residual_package_set()
-    except (OSError, subprocess.TimeoutExpired) as error:
-        _log_action(f"LEFTOVER_PURGE_BLOCKED reason=reverify-failed backup={backup_dir}")
-        return False, (
-            "Purge was not started because residual state could not be "
-            f"re-verified after backup.\n\n{error}\n\n"
-            f"{_purge_backup_note(backup_dir, backed_up_count)}"
-        )
-    changed = [p for p in packages_to_purge if p not in residual_after_backup]
-    if changed:
-        _log_action(f"LEFTOVER_PURGE_BLOCKED reason=state-changed backup={backup_dir}")
-        return False, (
-            "Purge was not started because these packages left "
-            "residual-configuration state after the backup (they may have been "
-            "reinstalled):\n\n"
-            + "\n".join(changed)
-            + f"\n\n{_purge_backup_note(backup_dir, backed_up_count)}"
-        )
+    success = result.ok
+    message = result.message
 
-    cmd = [
-        apt_get_command,
-        "purge",
-        "-y",
-        "--",
-    ] + packages_to_purge
-
-    if pkexec_command:
-        cmd = [pkexec_command] + cmd
-
-    _log_action(f"LEFTOVER_PURGE_START cmd={shlex.join(cmd)}")
-
-    success, message = _run_command_stream(cmd, output_callback)
-
-    notes = [f"{_purge_backup_note(backup_dir, backed_up_count)}"]
+    notes = []
+    for event in result.events:
+        if event.get("type") == "backup":
+            notes.append(
+                _purge_backup_note(
+                    event.get("path"), int(event.get("files", 0) or 0)
+                )
+            )
     notes.append(
         "This backup covers dpkg-registered conffiles only; maintainer purge "
         "scripts may have removed additional files. There is no automatic "
@@ -746,15 +900,16 @@ def purge_leftover_configs(package_ids, output_callback=None):
                 "\n\nWarning: these packages are still in residual state:\n"
                 + "\n".join(lingering)
             )
-        message += "\n\n" + "\n\n".join(notes)
+        if notes:
+            message += "\n\n" + "\n\n".join(notes)
         if skipped_packages:
             message += (
                 "\n\nSkipped packages no longer in residual-configuration state:\n"
                 + "\n".join(skipped_packages)
             )
     else:
-        _log_action(f"LEFTOVER_PURGE_FAILED backup={backup_dir} error={message}")
-        message += "\n\n" + "\n\n".join(notes)
+        _log_action(f"LEFTOVER_PURGE_FAILED error={message[:200]}")
+        if notes:
+            message += "\n\n" + "\n\n".join(notes)
 
     return success, message
-    
