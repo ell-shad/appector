@@ -125,7 +125,9 @@ class RemovalSafetyTests(unittest.TestCase):
                 show_message=Mock(),
             )
 
-            main_module.MainWindow._export_installed_apps(
+            from appector.window import MainWindow
+
+            MainWindow._export_installed_apps(
                 exporter,
                 str(destination),
                 "csv",
