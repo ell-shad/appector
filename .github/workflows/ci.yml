@@ -49,15 +49,10 @@ jobs:
 
       - name: Validate the polkit policy
         run: |
-          # Validated against the DTD when available; the schema-less
-          # xmllint fallback still catches malformed XML.
-          if ls /usr/share/polkit-1/actions/*.policy >/dev/null 2>&1; then
-            xmllint --noout --dtdvalid \
-              /usr/share/polkit-1/actions/org.freedesktop.policykit.policy \
-              helper/com.appector.appector.policy
-          else
-            xmllint --noout helper/com.appector.appector.policy
-          fi
+          # No DTD ships with polkit and the runner cannot resolve the
+          # external PUBLIC identifier offline, so this is a
+          # well-formedness check; it still catches malformed XML.
+          xmllint --noout helper/com.appector.appector.policy
 
       - name: Check packaging shell script
         run: |
