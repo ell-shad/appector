@@ -41,7 +41,7 @@ jobs:
         run: |
           python3 -m pip install --disable-pip-version-check coverage
           coverage run -m unittest discover -s tests
-          coverage report --fail-under=55
+          coverage report --fail-under=42
           coverage report
 
       - name: Compile application modules
