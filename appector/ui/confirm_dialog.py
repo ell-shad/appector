@@ -104,7 +104,10 @@ class ConfirmPlanDialog(Adw.Dialog):
 
         header = Adw.ToolbarView()
         header_bar = Adw.HeaderBar()
-        header_bar.set_show_title_buttons(True)
+        # Adw.HeaderBar has no set_show_title_buttons; libadwaita split the
+        # API per side. Enabling both honours the platform button layout.
+        header_bar.set_show_start_title_buttons(True)
+        header_bar.set_show_end_title_buttons(True)
         header.add_top_bar(header_bar)
 
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
@@ -178,10 +181,11 @@ class ConfirmPlanDialog(Adw.Dialog):
             body.append(extra_widget)
 
         # 7. Disk space: filled asynchronously (U2), spinner until then.
+        # The row's spinner starts in a loading state that touches
+        # _confirm_button, so it must be appended after the buttons exist.
         self._disk_row = None
         self._disk_spinner = None
         self._disk_label = None
-        self._append_disk_row(body)
 
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_child(body)
@@ -214,6 +218,8 @@ class ConfirmPlanDialog(Adw.Dialog):
 
         self.set_child(box)
         self._cancel_button = cancel
+
+        self._append_disk_row(body)
 
     # -- loading / blocking state -------------------------------------------
 
