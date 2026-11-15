@@ -26,7 +26,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes \
             desktop-file-utils gir1.2-adw-1 gir1.2-gdkpixbuf-2.0 \
-            gir1.2-gtk-4.0 lintian python3-gi shellcheck
+            gir1.2-gtk-4.0 lintian python3-gi shellcheck xvfb
 
       - name: Verify tag matches application version
         run: |
@@ -41,8 +41,12 @@ jobs:
           }
 
       - name: Run release checks
+        # The suite uses the system Python, which imports python3-gi: the
+        # GTK-dependent tests (including the UI smoke tests) really run,
+        # under Xvfb. 0.3.0 shipped dialog-construction bugs that this
+        # gate caught — running them for real is the point of this step.
         run: |
-          python3 -m unittest discover -s tests -v
+          xvfb-run -a python3 -m unittest discover -s tests -v
           python3 -m compileall -q appector
           sh -n scripts/build-deb.sh
           shellcheck scripts/build-deb.sh

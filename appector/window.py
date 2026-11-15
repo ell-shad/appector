@@ -1489,7 +1489,8 @@ class MainWindow(Adw.ApplicationWindow):
             update_state=self.update_flatpak_install_dialog_state,
             initial_paths=initial_paths,
         )
-        dialog.present(self)
+        # A plain Gtk.Dialog: present() takes no parent argument.
+        dialog.present()
 
     def _add_file_drop_target(self, widget, callback, *user_data):
         if not hasattr(Gtk, "DropTarget") or not hasattr(Gdk, "FileList"):

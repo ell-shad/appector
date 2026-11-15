@@ -222,3 +222,5 @@ def build_install_dialog(
 
     update_state(dialog)
 
+    return dialog
+

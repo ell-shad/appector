@@ -93,3 +93,24 @@ jobs:
           # No signing key exists in CI. The release workflow is what must
           # produce signatures; publishing unsigned metadata would be
           # rejected by apt, so it is guarded there instead.
+
+  # The main job runs the suite with actions/setup-python's Python, which
+  # cannot import the system python3-gi — so every GTK-dependent test
+  # silently skips there (0.3.0 shipped dialog-construction bugs this
+  # hid). This job runs the UI smoke tests with the system Python and a
+  # real display so broken widget construction fails at PR time.
+  ui-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install GTK runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            gir1.2-adw-1 gir1.2-gdkpixbuf-2.0 gir1.2-gtk-4.0 \
+            python3-gi xvfb
+
+      - name: Construct the real dialogs under Xvfb
+        run: xvfb-run -a python3 -m unittest tests.test_ui_smoke -v

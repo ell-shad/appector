@@ -10,6 +10,26 @@ published as a GitHub pre-release, which GitHub excludes from
 `/releases/latest`; Appector's in-app update check reads that endpoint and
 therefore cannot see pre-releases.
 
+## [0.3.1] - 2026-11-15
+
+### Fixed
+
+- The "Install apps" dialog opens again (Ctrl+O, the main menu item, and
+  every file-open route). The dialog builder extracted in 0.3.0 never
+  returned the dialog it built, and its presenter then used an argument
+  form that a plain `Gtk.Dialog` does not accept, so the whole install
+  flow crashed before anything appeared.
+- "Remove marked" works again (button, `Ctrl+Delete`, and the context
+  menu entry). The batch confirmation dialog crashed while being
+  constructed: `set_show_title_buttons()` does not exist on
+  `Adw.HeaderBar`, and the asynchronous disk-estimate row started before
+  the confirm button existed. The app details window had the same header
+  crash and opens again.
+- A new UI smoke test constructs the real dialogs, and CI plus the
+  release checks run it under Xvfb with the system Python, so broken
+  dialog construction now fails the build instead of silently
+  disabling features.
+
 ## [0.2.1] - 2026-10-10
 
 ### Added

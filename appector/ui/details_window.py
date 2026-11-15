@@ -68,7 +68,9 @@ class DetailsWindow(Adw.Dialog):
 
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
-        header.set_show_title_buttons(True)
+        # Adw.HeaderBar has no set_show_title_buttons; enable both sides.
+        header.set_show_start_title_buttons(True)
+        header.set_show_end_title_buttons(True)
         toolbar.add_top_bar(header)
 
         if can_remove_single(app):
