@@ -18,8 +18,16 @@ class AppectorApp(Adw.Application):
 
         self.window = None
         self._pending_open_paths = None
+
+        quit_action = Gio.SimpleAction.new("quit", None)
+        quit_action.connect("activate", self._on_quit)
+        self.add_action(quit_action)
+
         # U11: bind translations before any widget is built.
         init_translations()
+
+    def _on_quit(self, *_args):
+        self.quit()
 
     def hold_files_to_open(self, paths):
         """Remember CLI-provided files until the window can receive them.

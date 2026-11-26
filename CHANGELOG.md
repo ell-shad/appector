@@ -10,6 +10,22 @@ published as a GitHub pre-release, which GitHub excludes from
 `/releases/latest`; Appector's in-app update check reads that endpoint and
 therefore cannot see pre-releases.
 
+## [Unreleased]
+
+### Added
+
+- The table can show an optional Installed column, toggled from the View
+  menu and remembered in `ui.json`.
+- The primary menu has a Quit item backed by an application action.
+- A spinner in the header runs for the whole scan, from the refresh request
+  until results are shown or the scan fails.
+
+### Changed
+
+- The Version column sorts with Debian version rules instead of plain text,
+  so `1.10` follows `1.9` and epochs, revisions, and `~` pre-releases order
+  correctly.
+
 ## [0.3.1] - 2026-11-15
 
 ### Fixed
