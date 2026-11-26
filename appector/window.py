@@ -15,7 +15,7 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gtk, Adw, Gio, GLib, Gdk, GdkPixbuf, Pango
 
 from .scanners import scan_all, scan_leftover_configs
-from .models import mark_duplicate_apps
+from .models import compare_debian_versions, mark_duplicate_apps
 from .app_item import AppItem
 from .details import DetailsWindow
 from .ui.confirm_dialog import ConfirmPlanDialog
@@ -140,6 +140,14 @@ def _set_accessible_label(widget, label):
         pass
 
 
+def compare_version_items(first, second, _user_data=None):
+    """Sort two app rows by their package versions."""
+    return compare_debian_versions(
+        getattr(first, "version", ""),
+        getattr(second, "version", ""),
+    )
+
+
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(
@@ -154,6 +162,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.marked_only = False
         self.duplicates_only = False
         self.scope = "all"
+        self.show_installed_column = False
         # Scope-derived visibility flags, kept in sync by
         # `_sync_legacy_scope_flags`.
         self.show_leftovers = True
@@ -241,6 +250,13 @@ class MainWindow(Adw.ApplicationWindow):
         self.reload_button.set_action_name("win.refresh")
         header.pack_end(self.reload_button)
 
+        self.scan_spinner = Gtk.Spinner()
+        self.scan_spinner.set_tooltip_text("Scanning installed apps")
+        self.scan_spinner.set_visible(False)
+        self.scan_spinner.set_valign(Gtk.Align.CENTER)
+        _set_accessible_label(self.scan_spinner, "Scanning installed apps")
+        header.pack_end(self.scan_spinner)
+
         # ------------------------------------------------------------
         # Primary menu
         # ------------------------------------------------------------
@@ -267,6 +283,13 @@ class MainWindow(Adw.ApplicationWindow):
         export_section.append("Export as JSON…", "win.export-app-list-json")
         primary_menu_model.append_section("Export", export_section)
 
+        view_section = Gio.Menu()
+        view_section.append(
+            "Show installed column",
+            "win.toggle-installed-column",
+        )
+        primary_menu_model.append_section("View", view_section)
+
         # Tools / help
         tools_section = Gio.Menu()
         tools_section.append("Activity Log", "win.show-log")
@@ -275,6 +298,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         # About last, unlabelled so it renders as a plain trailing item.
         primary_menu_model.append("About Appector", "win.about")
+        primary_menu_model.append("Quit", "app.quit")
 
         if not hasattr(self, "primary_menu_btn"):
             self.primary_menu_btn = Gtk.MenuButton()
@@ -316,12 +340,29 @@ class MainWindow(Adw.ApplicationWindow):
         manager_column = self.create_manager_column()
         version_column = self.create_column("Version", "version", expand=False, min_width=120, fixed_width=160)
 
-        for column in [marked_column, name_column, source_column, manager_column, version_column]:
+        self.installed_column = self.create_column(
+            "Installed",
+            "installed_at",
+            expand=False,
+            min_width=110,
+            fixed_width=130,
+        )
+        self.installed_column.set_visible(False)
+
+        for column in [
+            marked_column,
+            name_column,
+            source_column,
+            manager_column,
+            version_column,
+            self.installed_column,
+        ]:
             self.column_view.append_column(column)
 
         self.column_widgets = {
             "marked": marked_column, "name": name_column, "source": source_column,
             "manager": manager_column, "version": version_column,
+            "installed": self.installed_column,
         }
 
         self.restore_ui_state()
@@ -525,6 +566,9 @@ class MainWindow(Adw.ApplicationWindow):
             except Exception:
                 pass
             state["view_mode"] = self.view_mode
+            state["show_installed_column"] = bool(
+                getattr(self, "show_installed_column", False)
+            )
 
             self._state_dir().mkdir(parents=True, exist_ok=True)
 
@@ -557,6 +601,20 @@ class MainWindow(Adw.ApplicationWindow):
                         column.set_fixed_width(int(width))
                     except Exception:
                         continue
+
+        shown = state.get("show_installed_column")
+        if isinstance(shown, bool):
+            self._set_installed_column_visible(shown)
+
+            try:
+                action = self.action_group.lookup_action(
+                    "toggle-installed-column"
+                )
+            except Exception:
+                action = None
+
+            if action is not None:
+                action.set_state(GLib.Variant.new_boolean(shown))
 
     def _on_map_once(self, *_args):
         """Re-assert the saved window size the first time the window is shown.
@@ -595,8 +653,23 @@ class MainWindow(Adw.ApplicationWindow):
         self.save_ui_state()
         return False
 
+    def _set_scanning(self, scanning):
+        """Show the header spinner only for the duration of a scan."""
+        spinner = getattr(self, "scan_spinner", None)
+        if spinner is None:
+            return
+
+        if scanning:
+            spinner.set_visible(True)
+            spinner.start()
+        else:
+            spinner.stop()
+            spinner.set_visible(False)
+
     def _worker_failed(self, what, error):
         """U3: a crashed worker must never leave a modal window behind."""
+        if what == "scan":
+            self._set_scanning(False)
         for attribute in ("progress_window", "install_progress_window"):
             dialog = getattr(self, attribute, None)
             if dialog is not None:
@@ -2273,6 +2346,16 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.action_group = Gio.SimpleActionGroup.new()
 
+        installed_action = Gio.SimpleAction.new_stateful(
+            "toggle-installed-column",
+            None,
+            GLib.Variant.new_boolean(False),
+        )
+        installed_action.connect(
+            "change-state", self.on_toggle_installed_column
+        )
+        self.action_group.add_action(installed_action)
+
         # ------------------------------------------------------------
         # Context menu / selection actions
         # ------------------------------------------------------------
@@ -3866,8 +3949,11 @@ class MainWindow(Adw.ApplicationWindow):
 
         column = Gtk.ColumnViewColumn.new(title, factory)
 
-        expression = Gtk.PropertyExpression.new(AppItem, None, prop)
-        sorter = Gtk.StringSorter.new(expression)
+        if prop == "version":
+            sorter = Gtk.CustomSorter.new(compare_version_items)
+        else:
+            expression = Gtk.PropertyExpression.new(AppItem, None, prop)
+            sorter = Gtk.StringSorter.new(expression)
 
         column.set_sorter(sorter)
         column.set_resizable(True)
@@ -3880,6 +3966,19 @@ class MainWindow(Adw.ApplicationWindow):
             pass
 
         return column
+
+    def _set_installed_column_visible(self, visible):
+        self.show_installed_column = bool(visible)
+        column = getattr(self, "installed_column", None)
+
+        if column is not None:
+            column.set_visible(self.show_installed_column)
+
+    def on_toggle_installed_column(self, action, value):
+        visible = bool(value.get_boolean())
+        action.set_state(GLib.Variant.new_boolean(visible))
+        self._set_installed_column_visible(visible)
+
     def create_manager_column(self):
         factory = Gtk.SignalListItemFactory()
         factory.connect("setup", self.on_setup_manager_cell)
@@ -4515,6 +4614,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.reload_button.set_sensitive(False)
         self.window_title.set_subtitle("Scanning…")
+        self._set_scanning(True)
 
         run_async(
             self.scan_worker,
@@ -4530,6 +4630,8 @@ class MainWindow(Adw.ApplicationWindow):
         GLib.idle_add(self.populate_apps, result.apps, result.source_status)
 
     def populate_apps(self, apps, source_status=None):
+        self._set_scanning(False)
+
         # Keep the last per-source scan status for the UI (F6/U8).
         self.scan_source_status = list(source_status or [])
         present_keys = {app_key(app) for app in apps}

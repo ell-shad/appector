@@ -103,3 +103,115 @@ def mark_duplicate_apps(apps):
             if len(managers) < 2:
                 continue
         _mark(group)
+
+
+def _version_is_digit(character):
+    # dpkg compares version bytes, so only ASCII 0-9 are numeric.
+    return "0" <= character <= "9"
+
+
+def _version_is_letter(character):
+    return "a" <= character <= "z" or "A" <= character <= "Z"
+
+
+def _version_order(character):
+    if character == "~":
+        return -1
+    if _version_is_digit(character):
+        return 0
+    if _version_is_letter(character):
+        return ord(character)
+    return ord(character) + 256
+
+
+def _compare_version_part(left, right):
+    """Compare one Debian version component, following dpkg's algorithm."""
+    left_index = right_index = 0
+
+    while left_index < len(left) or right_index < len(right):
+        while (
+            left_index < len(left) and not _version_is_digit(left[left_index])
+        ) or (
+            right_index < len(right) and not _version_is_digit(right[right_index])
+        ):
+            left_order = (
+                _version_order(left[left_index])
+                if left_index < len(left)
+                else 0
+            )
+            right_order = (
+                _version_order(right[right_index])
+                if right_index < len(right)
+                else 0
+            )
+
+            if left_order != right_order:
+                return -1 if left_order < right_order else 1
+
+            left_index += 1
+            right_index += 1
+
+        while left_index < len(left) and left[left_index] == "0":
+            left_index += 1
+        while right_index < len(right) and right[right_index] == "0":
+            right_index += 1
+
+        first_difference = 0
+
+        while (
+            left_index < len(left)
+            and _version_is_digit(left[left_index])
+            and right_index < len(right)
+            and _version_is_digit(right[right_index])
+        ):
+            if not first_difference:
+                first_difference = ord(left[left_index]) - ord(right[right_index])
+            left_index += 1
+            right_index += 1
+
+        if left_index < len(left) and _version_is_digit(left[left_index]):
+            return 1
+        if right_index < len(right) and _version_is_digit(right[right_index]):
+            return -1
+        if first_difference:
+            return -1 if first_difference < 0 else 1
+
+    return 0
+
+
+def compare_debian_versions(left, right):
+    """Compare Debian version strings, returning -1, 0, or 1.
+
+    The table shows versions from APT, Flatpak, Snap and other sources, but
+    Debian ordering handles all of them better than lexical ordering:
+    numeric segments compare as numbers, `~` sorts before a release, and
+    epochs/revisions are significant. Versions that are not Debian-shaped
+    still compare deterministically by their remaining segments.
+    """
+    def split(value):
+        text = str(value or "").strip()
+        epoch = 0
+
+        if ":" in text:
+            head, rest = text.split(":", 1)
+            if head.isascii() and head.isdigit():
+                epoch = int(head)
+                text = rest
+
+        if "-" in text:
+            upstream, revision = text.rsplit("-", 1)
+        else:
+            upstream, revision = text, ""
+
+        return epoch, upstream, revision
+
+    left_epoch, left_upstream, left_revision = split(left)
+    right_epoch, right_upstream, right_revision = split(right)
+
+    if left_epoch != right_epoch:
+        return -1 if left_epoch < right_epoch else 1
+
+    return (
+        _compare_version_part(left_upstream, right_upstream)
+        or _compare_version_part(left_revision, right_revision)
+    )
