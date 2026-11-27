@@ -714,8 +714,7 @@ def get_flatpak_unused_preview():
             for part in (result.stdout, result.stderr)
             if part.strip()
         )
-        outputs.append(f"[{scope.removeprefix('--')}]
-{output}".rstrip())
+        outputs.append(f"[{scope.removeprefix('--')}]\n{output}".rstrip())
 
         if result.returncode == 0 and "Nothing unused to uninstall" in output:
             continue
