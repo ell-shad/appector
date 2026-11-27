@@ -103,6 +103,10 @@ class TaskProgressDialog(Adw.Dialog):
 
         self._pulse_source = GLib.timeout_add(120, self._on_pulse)
         self._flush_source = GLib.timeout_add(_FLUSH_INTERVAL_MS, self._on_flush)
+        # Whatever closes the dialog (Close button, ESC, close_window(),
+        # the parent tearing down), the timer sources must stop with it —
+        # otherwise they keep firing forever on a dead dialog.
+        self.connect("closed", self._on_closed)
 
     # -- UI callbacks ------------------------------------------------------
 
@@ -163,6 +167,9 @@ class TaskProgressDialog(Adw.Dialog):
             text_view.scroll_mark_onscreen(mark)
         return False
 
+    def _on_closed(self, _dialog):
+        self._finish_ui()
+
     def _finish_ui(self, cancelled=False, success=True):
         if self._finished:
             return
@@ -170,6 +177,9 @@ class TaskProgressDialog(Adw.Dialog):
         if self._pulse_source is not None:
             GLib.source_remove(self._pulse_source)
             self._pulse_source = None
+        if self._flush_source is not None:
+            GLib.source_remove(self._flush_source)
+            self._flush_source = None
         self._cancel_button.set_visible(False)
         self._close_button.set_visible(True)
         self._details_expander.set_expanded(True)
@@ -224,8 +234,9 @@ class TaskProgressDialog(Adw.Dialog):
         """Compat: `_finish_ui` already stops the pulse."""
 
     def close_window(self):
-        """Compat: close after flushing pending output."""
+        """Compat: close after finishing the UI (stops both timers)."""
         self.flush_output()
+        self._finish_ui()
         self.close()
 
     def finish_update_results(self, message, success):
