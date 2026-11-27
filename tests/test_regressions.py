@@ -24,7 +24,7 @@ class S7bNonUtf8OutputTests(unittest.TestCase):
 
     def test_exit_zero_with_non_utf8_output_succeeds(self):
         returncode, output = _proc._run_command_raw(
-            ["sh", "-c", "printf 'ok \\377\\376'; exit 0"],
+            ["sh", "-c", "printf 'ok \\\\377\\\\376'; exit 0"],
             timeout=30,
         )
         self.assertEqual(returncode, 0)
@@ -44,7 +44,7 @@ class S7LogHardeningTests(unittest.TestCase):
 
                 log_file = state_dir() / "actions.log"
                 content = log_file.read_text(encoding="utf-8")
-        self.assertIn("FAKE event\\nFORGED extra line", content)
+        self.assertIn("FAKE event\\\\nFORGED extra line", content)
         # Exactly one physical log line must be written.
         lines = [line for line in content.splitlines() if "FAKE" in line or "FORGED" in line]
         self.assertEqual(len(lines), 1)
@@ -474,7 +474,7 @@ class F9AppImageInstallTests(unittest.TestCase):
             with (
                 patch.object(Path, "home", return_value=root),
                 patch(
-                    "appector.actions.shutil.copyfileobj",
+                    "appector.actions.os.fsync",
                     side_effect=OSError("disk full mid-copy"),
                 ),
             ):
