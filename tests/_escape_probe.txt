@@ -1,0 +1,4 @@
+L27a: ["sh", "-c", "printf 'ok \\\\377\\\\376'; exit 0"],
+L27b: ["sh", "-c", "printf 'ok \\\\\\\\377\\\\\\\\376'; exit 0"],
+L47a: self.assertIn("FAKE event\\\\nFORGED extra line", content)
+L47b: self.assertIn("FAKE event\\\\\\\\nFORGED extra line", content)
