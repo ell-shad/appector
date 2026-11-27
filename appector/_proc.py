@@ -39,7 +39,7 @@ from pathlib import Path
 
 from .paths import is_acceptable_private_dir, state_dir
 
-ANSI_ESCAPE_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+ANSI_ESCAPE_RE = re.compile(r'\x1B(?:[@-Z\\_-]|\[[0-?]*[ -/]*[@-~])')
 APT_COMMAND_LOCK = threading.Lock()
 APT_COMMAND_NAMES = {"apt", "apt-get", "dpkg"}
 
@@ -299,6 +299,11 @@ def run(
                 if not chunk:
                     break
                 pending += chunk
+                if len(pending) > keep_bytes:
+                    # A child that writes megabytes without a newline must
+                    # not grow the buffer unboundedly; keep the newest tail
+                    # (the already-collected lines stay bounded separately).
+                    pending = pending[-keep_bytes:]
                 while b"\n" in pending:
                     raw_line, pending = pending.split(b"\n", 1)
                     line = _strip_ansi(

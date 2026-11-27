@@ -6,6 +6,7 @@ metadata instead of substring heuristics, without per-package subprocesses
 (F6).
 """
 
+import os
 import subprocess
 
 from .policy import _is_safe_package_id
@@ -38,6 +39,7 @@ def get_apt_metadata_map(package_ids: list[str]) -> dict[str, dict]:
             text=True,
             errors="replace",
             timeout=_METADATA_TIMEOUT,
+            env={**os.environ, "LC_ALL": "C"},
         )
     except (OSError, subprocess.TimeoutExpired):
         return {}
