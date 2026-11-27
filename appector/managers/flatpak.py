@@ -799,3 +799,5 @@ def execute_flatpak_unused_cleanup(output_callback=None):
 
     _log_action("FLATPAK_UNUSED_CLEANUP_SUCCESS")
     return True, combined
+
+
