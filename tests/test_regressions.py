@@ -24,7 +24,7 @@ class S7bNonUtf8OutputTests(unittest.TestCase):
 
     def test_exit_zero_with_non_utf8_output_succeeds(self):
         returncode, output = _proc._run_command_raw(
-            ["sh", "-c", "printf 'ok \377\376'; exit 0"],
+            ["sh", "-c", "printf 'ok \\\\377\\\\376'; exit 0"],
             timeout=30,
         )
         self.assertEqual(returncode, 0)
