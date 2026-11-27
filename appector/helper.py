@@ -333,8 +333,10 @@ def _run_streaming(stream, cmd, uses_apt):
     return result
 
 
-def _critical_apt_gate(packages, plan, actual_removed):
-    ok, message = check_apt_removal_plan(plan, packages, actual_removed)
+def _critical_apt_gate(packages, plan, actual_removed, residual=False):
+    ok, message = check_apt_removal_plan(
+        plan, packages, actual_removed, residual=residual
+    )
     if ok:
         # check_apt_removal_plan already covers critical + cap + growth.
         return True, ""
@@ -545,38 +547,48 @@ def handle_purge_residual(request, stream):
             "backup", path=str(backup_dir), files=backed_up_count
         )
 
+    def _abort(message):
+        # S9: a backup made for a purge that never starts is discarded
+        # again, so aborted attempts cannot evict older, useful backups
+        # from the keep-count.
+        if backup_dir is not None:
+            residual_module._discard_backup(backup_dir)
+        return {"ok": False, "message": message}
+
     # Re-verify immediately before the purge (the backup was slow).
     try:
         status_after = residual_module._dpkg_status_map()
     except (OSError, subprocess.TimeoutExpired) as error:
-        return {"ok": False, "message": f"Re-verification failed:\n{error}"}
+        return _abort(f"Re-verification failed:\n{error}")
     changed = [
         p for p in packages
         if status_after.get(p, "")[:2] != "rc"
     ]
     if changed:
-        return {
-            "ok": False,
-            "message": (
-                "Left residual state during the backup (reinstalled?):\n"
-                + "\n".join(changed)
-                + f"\n{backup_note}"
-            ),
-        }
+        return _abort(
+            "Left residual state during the backup (reinstalled?):\n"
+            + "\n".join(changed)
+            + "\nThe pre-purge backup was discarded again."
+        )
     late_conflicts = residual_module._multiarch_conflicts(packages, status_after)
     if late_conflicts:
-        return {
-            "ok": False,
-            "message": "Multi-arch conflict appeared during the backup.",
-        }
+        return _abort(
+            "Multi-arch conflict appeared during the backup.\n"
+            "The pre-purge backup was discarded again."
+        )
 
-    # Plan binding for the purge set.
+    # Plan binding for the purge set. Residual purges are exempt from the
+    # critical-name rule (every identity was verified to be in rc state,
+    # i.e. only leftover configuration remains); plan binding, growth and
+    # the removal cap still apply.
     returncode, output, actual_removed = _simulate_apt(apt_get, ["purge"], packages)
     if returncode != 0:
-        return {"ok": False, "message": f"APT simulation failed:\n{output}"}
-    ok, message = _critical_apt_gate(packages, plan, actual_removed)
+        return _abort(f"APT simulation failed:\n{output}")
+    ok, message = _critical_apt_gate(
+        packages, plan, actual_removed, residual=True
+    )
     if not ok:
-        return {"ok": False, "message": f"{message}\n{backup_note}"}
+        return _abort(f"{message}\nThe pre-purge backup was discarded again.")
 
     command = _apt_command(apt_get, ["purge"], packages)
     result = _run_streaming(stream, command, uses_apt=True)
@@ -588,14 +600,24 @@ def handle_purge_residual(request, stream):
 
 
 def _chown_tree(root, uid, gid):
-    """Hand a root-written backup to the invoking user."""
+    """Hand a root-written backup to the invoking user.
+
+    Symlinks are never followed: the backup may legitimately contain
+    symlinks (recreated conffile links), and chowning their *targets* would
+    transfer ownership of arbitrary files to the invoking user.
+    """
     root = Path(root)
     try:
         for dirpath, _dirnames, filenames in os.walk(root):
-            os.chown(dirpath, uid, gid)
+            os.chown(dirpath, uid, gid, follow_symlinks=False)
             for filename in filenames:
                 try:
-                    os.chown(Path(dirpath) / filename, uid, gid)
+                    os.chown(
+                        Path(dirpath) / filename,
+                        uid,
+                        gid,
+                        follow_symlinks=False,
+                    )
                 except OSError:
                     pass
     except OSError:
