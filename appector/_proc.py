@@ -39,7 +39,7 @@ from pathlib import Path
 
 from .paths import is_acceptable_private_dir, state_dir
 
-ANSI_ESCAPE_RE = re.compile(r'\x1B(?:[@-Z\\_-]|\[[0-?]*[ -/]*[@-~])')
+ANSI_ESCAPE_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 APT_COMMAND_LOCK = threading.Lock()
 APT_COMMAND_NAMES = {"apt", "apt-get", "dpkg"}
 
