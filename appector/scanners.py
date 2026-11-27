@@ -16,6 +16,7 @@ import re
 import shlex
 import shutil
 import subprocess
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -316,6 +317,11 @@ def _dpkg_env():
     return {**os.environ, "LC_ALL": "C"}
 
 
+def _escape_dpkg_glob(path: str) -> str:
+    """Escape fnmatch metacharacters so dpkg-query -S matches literally."""
+    return re.sub(r"([*?\[\]\\])", r"\\\1", path)
+
+
 def get_package_owners(paths) -> dict[str, str]:
     """Map each path to its owning dpkg package in one dpkg-query call.
 
@@ -331,8 +337,17 @@ def get_package_owners(paths) -> dict[str, str]:
         # ValueError ("stdout and stderr arguments may not be used with
         # capture_output") on every call; stdout/stderr come from
         # capture_output instead.
+        #
+        # dpkg-query -S treats its arguments as glob patterns, so
+        # metacharacters in file names ([...] in a user launcher, say)
+        # must be escaped for a literal match (F11).
         result = subprocess.run(
-            ["dpkg-query", "-S", "--", *unique_paths],
+            [
+                "dpkg-query",
+                "-S",
+                "--",
+                *(_escape_dpkg_glob(p) for p in unique_paths),
+            ],
             text=True,
             errors="replace",
             stdin=subprocess.DEVNULL,
@@ -439,15 +454,33 @@ def scan_leftover_configs() -> list[AppEntry]:
 # ------------------------------------------------------------
 
 
-def _read_log_lines(path: Path) -> list[str]:
+def _read_log_lines(path: Path, max_bytes: int = 1 * 1024 * 1024) -> list[str]:
+    """Read the (bounded) tail of a log file.
+
+    Log files are root-owned in practice, but a hostile multi-gigabyte file
+    in a scanned location must not exhaust memory: at most ``max_bytes``
+    are read and only the tail is kept.
+    """
     try:
         if path.suffix == ".gz":
+            # Gzip cannot seek from the end cheaply; stream and keep the tail.
+            tail: deque[str] = deque()
+            tail_bytes = 0
             with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
-                return f.readlines()
-        else:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                return f.readlines()
-    except Exception:
+                for line in f:
+                    tail.append(line)
+                    tail_bytes += len(line)
+                    while tail_bytes > max_bytes and len(tail) > 1:
+                        tail_bytes -= len(tail.popleft())
+            return list(tail)
+        with open(path, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            if size > max_bytes:
+                f.seek(-max_bytes, os.SEEK_END)
+                f.readline()  # drop the likely partial first line
+            data = f.read(max_bytes)
+        return data.decode("utf-8", errors="replace").splitlines(keepends=True)
+    except (OSError, EOFError, UnicodeError):
         return []
 
 
@@ -802,16 +835,18 @@ def scan_apt() -> list[AppEntry]:
             timeout=SCAN_TIMEOUT,
             env=_dpkg_env(),
         )
-
-        for line in out.splitlines():
-            parts = line.split("\t")
-            if len(parts) < 3:
-                continue
-            package_id, status_abbrev, version = parts[0], parts[1], parts[2]
-            if status_abbrev[:2] == "ii" and package_id:
-                versions[package_id] = version
-    except Exception:
+    except FileNotFoundError:
+        # The tool is missing: scan_all reports this separately as
+        # "tool-missing", and direct callers get an empty source.
         return []
+
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        package_id, status_abbrev, version = parts[0], parts[1], parts[2]
+        if status_abbrev[:2] == "ii" and package_id:
+            versions[package_id] = version
 
     apps: list[AppEntry] = []
     seen_packages = set()
@@ -998,7 +1033,9 @@ def scan_snap() -> list[AppEntry]:
             timeout=SCAN_TIMEOUT,
             env=_dpkg_env(),
         )
-    except Exception:
+    except FileNotFoundError:
+        # The tool is missing: scan_all reports this separately as
+        # "tool-missing", and direct callers get an empty source.
         return []
 
     apps = []
@@ -1171,7 +1208,9 @@ def scan_flatpak() -> list[AppEntry]:
             timeout=SCAN_TIMEOUT,
             env=_dpkg_env(),
         )
-    except Exception:
+    except FileNotFoundError:
+        # The tool is missing: scan_all reports this separately as
+        # "tool-missing", and direct callers get an empty source.
         return []
 
     apps = []
