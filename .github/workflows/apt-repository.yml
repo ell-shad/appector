@@ -131,7 +131,7 @@ jobs:
 
       - name: Fetch the previously published pool
         # Retention (S12): the new pool carries the previous releases forward,
-        # then trims to the newest three, so users updating from an older list
+        # then trims to the newest five, so users updating from an older list
         # still find their files. The Pages deployment is not a git ref, so the
         # previous pool is read back from the served repository.
         run: |
@@ -140,6 +140,18 @@ jobs:
           mkdir -p previous-repo
           sh ./scripts/fetch-published-pool.sh previous-repo \
             "https://${GITHUB_REPOSITORY_OWNER}.github.io/$(basename "$GITHUB_REPOSITORY")"
+
+      - name: Backfill releases that never reached the pool
+        # Versions published while the pool was not carried forward exist only
+        # as GitHub Release assets, so a tag release has to recover them too;
+        # otherwise they reappear only after a manual refresh. Each asset is
+        # verified against its release's SHA256SUMS before it is served.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          sh ./scripts/fetch-release-debs.sh dist
+          ls -l dist
 
       - name: Build and sign the APT repository
         env:

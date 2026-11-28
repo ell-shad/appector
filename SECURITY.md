@@ -79,5 +79,6 @@ pool retains the newest five releases and the index lists every retained
 version, so in-flight updates from a previous release and explicit version
 pins still resolve; older packages are removed only after the retention
 window. Releases that were only ever attached to GitHub Releases are
-backfilled into the pool from their assets, and each asset is checked
-against that release's `SHA256SUMS` before it is served.
+backfilled into the pool from their assets — on every publish and on the
+weekly refresh — and each asset is checked against that release's
+`SHA256SUMS` before it is served.
