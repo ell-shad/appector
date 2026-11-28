@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -21,6 +23,7 @@ BUILD_SCRIPT = REPO_ROOT / "scripts" / "build-apt-repo.sh"
 SUITE = "stable"
 COMPONENT = "main"
 ARCHITECTURE = "all"
+MAIN_DIR = Path("main") / "a" / "appector"
 
 HAVE_SCANPACKAGES = shutil.which("dpkg-scanpackages") is not None
 HAVE_DPKG_DEB = shutil.which("dpkg-deb") is not None
@@ -144,6 +147,23 @@ class AptRepositoryLayoutTests(unittest.TestCase):
         self.assertEqual(fields.get("Components"), COMPONENT)
         self.assertTrue(fields.get("Date"), "Release must carry a Date")
 
+    def test_valid_until_leaves_room_for_the_weekly_refresh(self):
+        """apt refuses the whole repository once Valid-Until has passed.
+
+        The metadata used to expire after 7 days while the repository was
+        only regenerated on a release tag, so any release gap longer than a
+        week broke `apt update` with "Release file is expired". A scheduled
+        workflow now re-signs weekly, and this guards the window against
+        being shortened below what that schedule can keep fresh.
+        """
+        fields, _ = parse_release(self._release_text())
+        valid_until = fields.get("Valid-Until")
+        self.assertTrue(valid_until, "Release must bound its own lifetime")
+
+        remaining = parsedate_to_datetime(valid_until) - datetime.now(timezone.utc)
+        self.assertGreaterEqual(remaining, timedelta(days=29))
+        self.assertLessEqual(remaining, timedelta(days=31))
+
     def test_release_checksums_match_files_on_disk(self):
         """apt aborts the whole update if any checksum does not match."""
         _, checksums = parse_release(self._release_text())
@@ -245,6 +265,79 @@ class AptRepositoryLayoutTests(unittest.TestCase):
             "no signing key was supplied, so no Release.gpg may be produced",
         )
         self.assertIn("UNSIGNED", self.stderr)
+
+
+@unittest.skipUnless(
+    HAVE_SCANPACKAGES and HAVE_DPKG_DEB,
+    "dpkg-dev and dpkg are required to build a test repository",
+)
+class AptRepositoryRetentionTests(unittest.TestCase):
+    """The pool keeps the newest three releases, carried forward from the
+    previously published repository rather than rebuilt from scratch."""
+
+    def setUp(self):
+        self._scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self._scratch.cleanup)
+        self.root = Path(self._scratch.name)
+
+    def test_newest_three_are_kept_and_older_ones_are_trimmed(self):
+        previous_pool = (
+            self.root / "previous-repo" / "pool" / "main" / "a" / "appector"
+        )
+        previous_pool.mkdir(parents=True)
+        for version in ("0.1.0", "0.2.0", "0.3.0"):
+            shutil.copy2(
+                build_test_package(self.root / f"previous-{version}", version),
+                previous_pool / f"appector_{version}_all.deb",
+            )
+
+        dist = build_test_package(self.root / "current", "0.3.1").parent
+        output = self.root / "apt-repo"
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "APPECTOR_GPG_KEY"
+        }
+        env["APPECTOR_PREVIOUS_REPO"] = str(self.root / "previous-repo")
+
+        result = subprocess.run(
+            ["sh", str(BUILD_SCRIPT), str(dist), str(output)],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        pooled = sorted(
+            path.name
+            for path in (output / "pool" / MAIN_DIR).iterdir()
+        )
+        self.assertEqual(
+            pooled,
+            [
+                "appector_0.2.0_all.deb",
+                "appector_0.3.0_all.deb",
+                "appector_0.3.1_all.deb",
+            ],
+            "the newest three releases must survive retention",
+        )
+
+        # dpkg-scanpackages publishes only the newest version of each package
+        # by default; the older retained files exist so an apt index fetched
+        # before the release can still resolve its Filename entries.
+        packages = (
+            output
+            / "dists"
+            / SUITE
+            / COMPONENT
+            / f"binary-{ARCHITECTURE}"
+            / "Packages"
+        ).read_text()
+        self.assertIn("Version: 0.3.1", packages)
+        self.assertNotIn("Version: 0.1.0", packages)
+        self.assertIn(
+            "pool/main/a/appector/appector_0.3.1_all.deb", packages
+        )
 
 
 class AptRepositoryBuildFailureTests(unittest.TestCase):

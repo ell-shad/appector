@@ -70,8 +70,11 @@ and the signing secret.
 
 ### Repository metadata hygiene
 
-Release metadata carries `Valid-Until` (7 days) so a stale mirror cannot be
+Release metadata carries `Valid-Until` (30 days) so a stale mirror cannot be
 served indefinitely, and `Acquire-By-Hash: yes` indexes so mirror updates
-are atomic for clients. The pool retains the newest three releases; older
-packages are removed only after the retention window, so in-flight updates
-from the previous release still resolve.
+are atomic for clients. The window is wider than the release cadence and a
+scheduled workflow re-signs and republishes the metadata weekly, so the
+archive only expires if that automation has been broken for a month. The
+pool retains the newest three releases; older packages are removed only
+after the retention window, so in-flight updates from the previous release
+still resolve.
