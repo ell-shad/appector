@@ -272,26 +272,27 @@ class AptRepositoryLayoutTests(unittest.TestCase):
     "dpkg-dev and dpkg are required to build a test repository",
 )
 class AptRepositoryRetentionTests(unittest.TestCase):
-    """The pool keeps the newest three releases, carried forward from the
-    previously published repository rather than rebuilt from scratch."""
+    """The pool keeps the newest five releases, carried forward from the
+    previously published repository rather than rebuilt from scratch, and the
+    index lists every retained version so an older one stays installable."""
 
     def setUp(self):
         self._scratch = tempfile.TemporaryDirectory()
         self.addCleanup(self._scratch.cleanup)
         self.root = Path(self._scratch.name)
 
-    def test_newest_three_are_kept_and_older_ones_are_trimmed(self):
+    def test_newest_five_are_kept_and_the_oldest_is_trimmed(self):
         previous_pool = (
             self.root / "previous-repo" / "pool" / "main" / "a" / "appector"
         )
         previous_pool.mkdir(parents=True)
-        for version in ("0.1.0", "0.2.0", "0.3.0"):
+        for version in ("0.1.0", "0.2.0", "0.2.1", "0.3.0", "0.3.1"):
             shutil.copy2(
                 build_test_package(self.root / f"previous-{version}", version),
                 previous_pool / f"appector_{version}_all.deb",
             )
 
-        dist = build_test_package(self.root / "current", "0.3.1").parent
+        dist = build_test_package(self.root / "current", "0.4.0").parent
         output = self.root / "apt-repo"
         env = {
             key: value
@@ -316,15 +317,17 @@ class AptRepositoryRetentionTests(unittest.TestCase):
             pooled,
             [
                 "appector_0.2.0_all.deb",
+                "appector_0.2.1_all.deb",
                 "appector_0.3.0_all.deb",
                 "appector_0.3.1_all.deb",
+                "appector_0.4.0_all.deb",
             ],
-            "the newest three releases must survive retention",
+            "the newest five releases must survive retention",
         )
 
-        # dpkg-scanpackages publishes only the newest version of each package
-        # by default; the older retained files exist so an apt index fetched
-        # before the release can still resolve its Filename entries.
+        # Every retained version is listed (dpkg-scanpackages --multiversion),
+        # so an apt index fetched before the release, or an explicit
+        # `apt install appector=0.3.0` pin, still resolves.
         packages = (
             output
             / "dists"
@@ -333,11 +336,96 @@ class AptRepositoryRetentionTests(unittest.TestCase):
             / f"binary-{ARCHITECTURE}"
             / "Packages"
         ).read_text()
-        self.assertIn("Version: 0.3.1", packages)
+        for version in ("0.2.0", "0.2.1", "0.3.0", "0.3.1", "0.4.0"):
+            self.assertIn(f"Version: {version}", packages)
         self.assertNotIn("Version: 0.1.0", packages)
         self.assertIn(
-            "pool/main/a/appector/appector_0.3.1_all.deb", packages
+            "pool/main/a/appector/appector_0.3.0_all.deb", packages
         )
+
+
+@unittest.skipUnless(
+    HAVE_DPKG_DEB, "dpkg-deb is required to build a test package"
+)
+class ReleaseBackfillTests(unittest.TestCase):
+    """scripts/fetch-release-debs.sh reads versions that were only ever
+    published as GitHub Release assets back into the pool, and refuses any
+    asset that does not match its release's SHA256SUMS."""
+
+    def setUp(self):
+        self._scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self._scratch.cleanup)
+        self.root = Path(self._scratch.name)
+
+        package = build_test_package(self.root / "pkg", "0.3.0")
+        self.assets = self.root / "assets"
+        self.assets.mkdir()
+        shutil.copy2(package, self.assets / "appector_0.3.0_all.deb")
+        (self.assets / "SHA256SUMS").write_text(
+            f"{hashlib.sha256(package.read_bytes()).hexdigest()}  "
+            "appector_0.3.0_all.deb\n"
+        )
+
+        # The real gh CLI needs network and a token; the script only uses
+        # these three subcommands, so a stub keeps the test hermetic.
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        gh = self.bin / "gh"
+        gh.write_text(
+            "#!/bin/sh\n"
+            'case "$1 $2" in\n'
+            '  "release list") printf \'%s\\n\' v0.3.1 v0.3.0 ;;\n'
+            '  "release view") ( cd "$STUB_ASSETS" && ls ) ;;\n'
+            '  "release download")\n'
+            '    dir=; prev=\n'
+            '    for arg in "$@"; do\n'
+            '      [ "$prev" = "--dir" ] && dir=$arg\n'
+            '      prev=$arg\n'
+            '    done\n'
+            '    cp "$STUB_ASSETS"/* "$dir"/\n'
+            '    ;;\n'
+            '  *) echo "unexpected gh call: $*" >&2; exit 1 ;;\n'
+            "esac\n"
+        )
+        gh.chmod(0o755)
+
+        self.output = self.root / "dist"
+        self.script = REPO_ROOT / "scripts" / "fetch-release-debs.sh"
+
+    def _run(self):
+        env = dict(os.environ)
+        env["GITHUB_REPOSITORY"] = "ell-shad/appector"
+        env["STUB_ASSETS"] = str(self.assets)
+        env["PATH"] = f"{self.bin}{os.pathsep}{env['PATH']}"
+        return subprocess.run(
+            ["sh", str(self.script), str(self.output)],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    def test_release_assets_are_backfilled_into_the_pool(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(
+            (self.output / "appector_0.3.0_all.deb").is_file(),
+            "the released package must reach the pool",
+        )
+
+    def test_asset_that_does_not_match_its_checksum_is_rejected(self):
+        (self.assets / "SHA256SUMS").write_text(
+            "0" * 64 + "  appector_0.3.0_all.deb\n"
+        )
+        result = self._run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SHA256SUMS", result.stderr)
+        self.assertFalse((self.output / "appector_0.3.0_all.deb").exists())
+
+    def test_release_without_a_checksum_manifest_is_rejected(self):
+        (self.assets / "SHA256SUMS").unlink()
+        result = self._run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SHA256SUMS", result.stderr)
 
 
 class AptRepositoryBuildFailureTests(unittest.TestCase):

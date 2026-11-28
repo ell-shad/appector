@@ -223,6 +223,19 @@ jobs:
           sh ./scripts/fetch-published-pool.sh dist "${{ steps.published.outputs.base }}"
           ls -l dist
 
+      - name: Backfill releases that never reached the pool
+        # Releases published while the pool was not carried forward exist
+        # only as GitHub Release assets, so anyone pinned to one of them got
+        # a 404 from this repository. Read those assets into the pool; they
+        # are verified against each release's SHA256SUMS before being served.
+        if: steps.published.outputs.exists == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          sh ./scripts/fetch-release-debs.sh dist
+          ls -l dist
+
       - name: Re-sign the repository metadata
         if: steps.published.outputs.exists == '1'
         env:

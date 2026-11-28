@@ -75,6 +75,9 @@ served indefinitely, and `Acquire-By-Hash: yes` indexes so mirror updates
 are atomic for clients. The window is wider than the release cadence and a
 scheduled workflow re-signs and republishes the metadata weekly, so the
 archive only expires if that automation has been broken for a month. The
-pool retains the newest three releases; older packages are removed only
-after the retention window, so in-flight updates from the previous release
-still resolve.
+pool retains the newest five releases and the index lists every retained
+version, so in-flight updates from a previous release and explicit version
+pins still resolve; older packages are removed only after the retention
+window. Releases that were only ever attached to GitHub Releases are
+backfilled into the pool from their assets, and each asset is checked
+against that release's `SHA256SUMS` before it is served.
