@@ -871,5 +871,112 @@ class ArchiveKeyGenerationTests(unittest.TestCase):
         self.assertIn("unknown argument", result.stderr)
 
 
+class RefreshFailureAlertTests(unittest.TestCase):
+    """scripts/report-refresh-failure.sh is the only thing that tells a person
+    the scheduled refresh failed, so it must open an issue, reuse the one it
+    already opened, and never exit 0 without having reported the failure."""
+
+    RUN_URL = (
+        "https://github.com/ell-shad/appector/actions/runs/123456789"
+    )
+
+    def setUp(self):
+        self._scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self._scratch.cleanup)
+        self.root = Path(self._scratch.name)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.calls = self.root / "calls"
+        self.calls.write_text("")
+        self.script = REPO_ROOT / "scripts" / "report-refresh-failure.sh"
+
+    def _stub_gh(self, open_issues="[]", create="ok", assign="ok"):
+        gh = self.bin / "gh"
+        gh.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' "$*" >> {self.calls}\n'
+            'case "$1 $2" in\n'
+            # The script asks gh for `--json number,title --jq <filter>`; the
+            # stub applies the same "open issue with this exact title" rule so
+            # the test exercises the script's decision, not gh's output shape.
+            '  "issue list")\n'
+            "    python3 -c 'import json,sys;d=json.loads(sys.argv[2]);"
+            "print(next((i[\"number\"] for i in d "
+            "if i[\"title\"]==sys.argv[1]),\"\"))' "
+            f'"APT repository refresh failed" \'{open_issues}\'\n'
+            '    ;;\n'
+            '  "issue create")\n'
+            f'    [ "{create}" = ok ] || exit 1\n'
+            "    printf '%s\\n' 'https://github.com/ell-shad/appector/issues/9'\n"
+            "    ;;\n"
+            '  "issue edit")\n'
+            f'    [ "{assign}" = ok ] || exit 1\n'
+            "    ;;\n"
+            '  "issue comment") exit 0 ;;\n'
+            '  *) echo "unexpected gh call: $*" >&2; exit 1 ;;\n'
+            "esac\n"
+        )
+        gh.chmod(0o755)
+
+    def _run(self, url=None):
+        env = dict(os.environ)
+        env["GITHUB_REPOSITORY"] = "ell-shad/appector"
+        env["GITHUB_REPOSITORY_OWNER"] = "ell-shad"
+        env["PATH"] = f"{self.bin}{os.pathsep}{env['PATH']}"
+        args = ["sh", str(self.script)]
+        if url is not False:
+            args.append(self.RUN_URL if url is None else url)
+        return subprocess.run(
+            args, capture_output=True, text=True, env=env
+        )
+
+    def test_a_failure_opens_an_issue_and_assigns_the_owner(self):
+        self._stub_gh()
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls.read_text()
+        self.assertIn("issue create", calls)
+        self.assertIn("APT repository refresh failed", calls)
+        self.assertIn("--add-assignee ell-shad", calls)
+        self.assertIn("opened issue #9", result.stderr)
+        self.assertIn(self.RUN_URL, calls, "the run must be linked in the issue")
+
+    def test_an_open_alert_issue_is_commented_on_instead_of_duplicated(self):
+        self._stub_gh(
+            open_issues='[{"number":3,"title":"Unrelated issue"},'
+            '{"number":7,"title":"APT repository refresh failed"}]'
+        )
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls.read_text()
+        self.assertIn("issue comment 7", calls)
+        self.assertNotIn("issue create", calls)
+
+    def test_an_unrelated_open_issue_does_not_absorb_the_alert(self):
+        self._stub_gh(open_issues='[{"number":3,"title":"Unrelated issue"}]')
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls.read_text()
+        self.assertIn("issue create", calls)
+        self.assertNotIn("issue comment", calls)
+
+    def test_an_alert_that_cannot_be_opened_fails_the_step(self):
+        self._stub_gh(create="broken")
+        result = self._run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not open the alert issue", result.stderr)
+
+    def test_a_failed_assignment_does_not_lose_the_alert(self):
+        self._stub_gh(assign="broken")
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not assign issue #9", result.stderr)
+
+    def test_the_run_url_is_required(self):
+        self._stub_gh()
+        result = self._run(url=False)
+        self.assertNotEqual(result.returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

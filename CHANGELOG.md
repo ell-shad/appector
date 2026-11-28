@@ -19,6 +19,10 @@ therefore cannot see pre-releases.
 - The primary menu has a Quit item backed by an application action.
 - A spinner in the header runs for the whole scan, from the refresh request
   until results are shown or the scan fails.
+- A failed scheduled APT repository refresh now opens a GitHub issue assigned
+  to the repository owner, and adds to that issue while it remains open, so
+  the failure that would let the archive expire reaches a person instead of
+  staying a red run nobody looks at.
 
 ### Changed
 

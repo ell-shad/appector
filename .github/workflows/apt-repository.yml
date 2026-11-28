@@ -198,6 +198,8 @@ jobs:
       contents: read
       pages: write
       id-token: write
+      # The failure alert below opens or comments on an issue.
+      issues: write
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -289,3 +291,17 @@ jobs:
       - name: Publish to GitHub Pages
         if: steps.published.outputs.exists == '1'
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346
+
+      - name: Report a failed refresh
+        # Nothing else would tell anyone: a red run in the Actions tab is not
+        # a notification, and the cost of missing it is every user's
+        # `apt update` failing once Valid-Until passes. The script opens one
+        # issue (assigned to the owner, which is what notifies them) and adds
+        # to it while it is open, so a repeating failure is one thread rather
+        # than a new issue every week.
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          sh ./scripts/report-refresh-failure.sh
+          "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
