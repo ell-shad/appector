@@ -63,11 +63,13 @@ POOL_DIR="$OUTPUT_ROOT/pool/$COMPONENT/a/appector"
 DISTS_DIR="$OUTPUT_ROOT/dists/$SUITE"
 BINARY_DIR="$DISTS_DIR/$COMPONENT/binary-$ARCHITECTURE"
 
-# Pool retention (S12): publish the newest releases and keep the previous
-# two in the pool so users on the last release still receive the files
-# their apt lists reference. The pool is rebuilt from this retention set,
-# not from the whole history.
-POOL_RETENTION=3
+# Pool retention (S12): publish the newest releases and keep the older ones
+# in the pool so users on a previous release still receive the files their apt
+# lists (or a version pin) reference. The pool is rebuilt from this retention
+# set, not from the whole history, so it cannot grow without bound. Five
+# covers the full published history at the time the pool was first carried
+# forward (0.1.0-0.3.1) plus one release of headroom.
+POOL_RETENTION=5
 
 rm -rf "$OUTPUT_ROOT"
 mkdir -p "$POOL_DIR" "$BINARY_DIR"
@@ -114,7 +116,12 @@ find "$POOL_DIR" -maxdepth 1 -name 'appector_*.deb' -type f -print \
     # Scan pool/main, not "main": the scan path determines the Filename
     # entries, which apt resolves against the repository base URL, so they
     # have to be pool-root relative.
-    dpkg-scanpackages --arch "$ARCHITECTURE" "pool/$COMPONENT" \
+    #
+    # --multiversion lists every retained version, not only the newest. The
+    # older files are in the pool either way (retention), but listing them is
+    # what lets `apt install appector=<older version>` and an existing
+    # version pin resolve instead of failing with "Unable to locate package".
+    dpkg-scanpackages --multiversion --arch "$ARCHITECTURE" "pool/$COMPONENT" \
         > "$BINARY_DIR/Packages"
 )
 

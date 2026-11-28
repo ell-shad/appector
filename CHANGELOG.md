@@ -34,8 +34,11 @@ therefore cannot see pre-releases.
   is expired" (and the "Unable to locate package appector" that follows it)
   whenever releases are more than a week apart.
 - The APT pool now really carries the previous releases forward, keeping the
-  newest three `.deb`s published, instead of being rebuilt from an empty pool
+  newest five `.deb`s published, instead of being rebuilt from an empty pool
   because the workflow could not read the previously published archive.
+- Versions that were only ever published as GitHub Release assets (0.1.0,
+  0.2.0, 0.2.1 and 0.3.0) are backfilled into the APT pool and listed in the
+  index, so a version pin or an old package list no longer 404s.
 
 ## [0.3.1] - 2026-11-15
 
