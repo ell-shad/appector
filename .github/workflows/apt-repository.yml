@@ -148,8 +148,8 @@ jobs:
         # verified against its release's SHA256SUMS before it is served.
         # BACKFILL_LENIENT: an old release with a broken or missing manifest
         # must not block this new release, so it is skipped with a warning.
-        # The refresh job runs the same script strictly, which surfaces the
-        # defect in the weekly run instead of shipping the broken package.
+        # The newest release is never skipped; if it cannot be produced the
+        # run fails rather than publishing a pool without the current version.
         env:
           GH_TOKEN: ${{ github.token }}
           BACKFILL_LENIENT: "1"
@@ -245,9 +245,15 @@ jobs:
         # only as GitHub Release assets, so anyone pinned to one of them got
         # a 404 from this repository. Read those assets into the pool; they
         # are verified against each release's SHA256SUMS before being served.
+        # BACKFILL_LENIENT: one defective old release must not fail the weekly
+        # refresh every week until the metadata expires, so it is skipped with
+        # a warning. The newest release is still required, so a refresh that
+        # cannot produce the current version fails instead of quietly
+        # re-signing a stale pool.
         if: steps.published.outputs.exists == '1'
         env:
           GH_TOKEN: ${{ github.token }}
+          BACKFILL_LENIENT: "1"
         run: |
           set -eu
           sh ./scripts/fetch-release-debs.sh dist
