@@ -72,8 +72,21 @@ gh release list --repo "$REPO" --limit 200 \
 }
 
 # `gh release list` is ordered newest first, so the first tag is the release
-# the repository must serve right now.
+# the repository must serve right now: exactly the one GitHub reports as
+# "latest" (drafts and pre-releases are already filtered out above).
 newest_tag=$(head -n 1 "$tags")
+[ -n "$newest_tag" ] ||
+    fail "could not determine the newest release of $REPO"
+
+# listed NAME: is NAME named in SHA256SUMS? `sha256sum --check` only proves
+# the files its manifest names, so a package the manifest does not mention
+# would otherwise be served with no provenance at all.
+listed() {
+    awk -v want="$1" '
+        { file = $2; sub(/^\*/, "", file); if (file == want) found = 1 }
+        END { exit(found ? 0 : 1) }
+    ' "${download_dir:?}/SHA256SUMS"
+}
 
 fetched=0
 while IFS= read -r tag; do
@@ -119,6 +132,20 @@ while IFS= read -r tag; do
 
     if ! ( cd "$download_dir" && sha256sum --check --strict SHA256SUMS >/dev/null ); then
         skip_release "$tag" "its assets do not match its SHA256SUMS"
+        continue
+    fi
+
+    unlisted=
+    for package in "$download_dir"/*.deb; do
+        [ -f "$package" ] || continue
+        if ! listed "$(basename "$package")"; then
+            unlisted=$(basename "$package")
+            break
+        fi
+    done
+    if [ -n "$unlisted" ]; then
+        skip_release "$tag" \
+            "its SHA256SUMS does not list $unlisted, so it cannot be verified"
         continue
     fi
 
