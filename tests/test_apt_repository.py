@@ -483,6 +483,107 @@ class ReleaseBackfillTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("v0.3.0", result.stderr)
 
+    def _give_the_newest_release_its_own_assets(self, package=True, manifest=True):
+        """v0.3.1 is the newest release (the stub lists it first)."""
+        newest = self.assets / "v0.3.1"
+        newest.mkdir()
+        if not package:
+            return newest
+        built = build_test_package(self.root / "pkg-newest", "0.3.1")
+        deb = newest / "appector_0.3.1_all.deb"
+        shutil.copy2(built, deb)
+        if manifest:
+            (newest / "SHA256SUMS").write_text(
+                f"{hashlib.sha256(deb.read_bytes()).hexdigest()}  "
+                "appector_0.3.1_all.deb\n"
+            )
+        return newest
+
+    def test_lenient_backfill_still_fails_when_the_newest_release_is_broken(self):
+        newest = self._give_the_newest_release_its_own_assets()
+        (newest / "SHA256SUMS").write_text(
+            "0" * 64 + "  appector_0.3.1_all.deb\n"
+        )
+        result = self._run(lenient=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("v0.3.1", result.stderr)
+        self.assertIn("newest release", result.stderr)
+
+    def test_lenient_backfill_still_fails_when_the_newest_release_lacks_a_manifest(
+        self,
+    ):
+        self._give_the_newest_release_its_own_assets(manifest=False)
+        result = self._run(lenient=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("newest release", result.stderr)
+        self.assertIn("SHA256SUMS", result.stderr)
+
+    def test_lenient_backfill_still_fails_when_the_newest_release_has_no_package(
+        self,
+    ):
+        self._give_the_newest_release_its_own_assets(package=False)
+        (self.assets / "v0.3.1" / "SHA256SUMS").write_text(
+            "0" * 64 + "  appector_0.3.1_all.deb\n"
+        )
+        result = self._run(lenient=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("newest release", result.stderr)
+        self.assertIn("no .deb asset", result.stderr)
+
+    def _give_the_newest_release_an_unlisted_package(self):
+        """The release ships two .debs but its manifest names only one, so the
+        other has no provenance and must never be served."""
+        newest = self._give_the_newest_release_its_own_assets()
+        extra = build_test_package(self.root / "pkg-unlisted", "0.3.2")
+        shutil.copy2(extra, newest / "appector_0.3.2_all.deb")
+        return newest
+
+    def test_lenient_backfill_fails_when_the_newest_package_is_not_in_the_manifest(
+        self,
+    ):
+        self._give_the_newest_release_an_unlisted_package()
+        result = self._run(lenient=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("newest release", result.stderr)
+        self.assertIn("appector_0.3.2_all.deb", result.stderr)
+        self.assertFalse(
+            (self.output / "appector_0.3.2_all.deb").exists(),
+            "an unverified package must never reach the pool",
+        )
+
+    def test_lenient_backfill_skips_an_older_release_with_an_unlisted_package(self):
+        self._give_the_newest_release_its_own_assets()
+        older = self.assets / "v0.3.0"
+        older.mkdir()
+        package = build_test_package(self.root / "pkg-older", "0.3.0")
+        shutil.copy2(package, older / "appector_0.3.0_all.deb")
+        shutil.copy2(package, older / "appector_0.2.9_all.deb")
+        (older / "SHA256SUMS").write_text(
+            f"{hashlib.sha256(package.read_bytes()).hexdigest()}  "
+            "appector_0.3.0_all.deb\n"
+        )
+        result = self._run(lenient=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("warning: skipping release v0.3.0", result.stderr)
+        self.assertIn("appector_0.2.9_all.deb", result.stderr)
+        self.assertFalse((self.output / "appector_0.2.9_all.deb").exists())
+        self.assertFalse((self.output / "appector_0.3.0_all.deb").exists())
+        self.assertTrue((self.output / "appector_0.3.1_all.deb").is_file())
+
+    def test_lenient_backfill_keeps_the_newest_release_and_skips_a_broken_older_one(
+        self,
+    ):
+        self._give_the_newest_release_its_own_assets()
+        self._give_v0_3_0_a_broken_manifest()
+        result = self._run(lenient=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("warning: skipping release v0.3.0", result.stderr)
+        self.assertTrue(
+            (self.output / "appector_0.3.1_all.deb").is_file(),
+            "the newest release must always reach the pool",
+        )
+        self.assertFalse((self.output / "appector_0.3.0_all.deb").exists())
+
 
 class AptRepositoryBuildFailureTests(unittest.TestCase):
     def test_missing_package_directory_is_rejected(self):

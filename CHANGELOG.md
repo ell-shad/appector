@@ -40,9 +40,10 @@ therefore cannot see pre-releases.
   0.2.1 and 0.3.0; 0.1.0 is a pre-release and stays out of the stable
   channel) are backfilled into the APT pool and listed in the
   index, so a version pin or an old package list no longer 404s. The backfill
-  runs both when a release is published and on the weekly refresh; when a
-  release is being published, an old release whose assets fail verification
-  is skipped with a warning instead of blocking the new one.
+  runs both when a release is published and on the weekly refresh. An older
+  release whose assets fail verification is skipped with a warning instead of
+  blocking a new release or failing the same refresh every week, while the
+  newest release is still required: if it cannot be produced the run fails.
 
 ## [0.3.1] - 2026-11-15
 
