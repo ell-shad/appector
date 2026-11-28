@@ -38,7 +38,8 @@ therefore cannot see pre-releases.
   because the workflow could not read the previously published archive.
 - Versions that were only ever published as GitHub Release assets (0.1.0,
   0.2.0, 0.2.1 and 0.3.0) are backfilled into the APT pool and listed in the
-  index, so a version pin or an old package list no longer 404s.
+  index, so a version pin or an old package list no longer 404s. The backfill
+  runs both when a release is published and on the weekly refresh.
 
 ## [0.3.1] - 2026-11-15
 
