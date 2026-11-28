@@ -81,4 +81,13 @@ pins still resolve; older packages are removed only after the retention
 window. Releases that were only ever attached to GitHub Releases are
 backfilled into the pool from their assets — on every publish and on the
 weekly refresh — and each asset is checked against that release's
-`SHA256SUMS` before it is served.
+`SHA256SUMS` before it is served; a package its manifest does not name is
+never served.
+
+A failed refresh opens an issue on this repository, assigned to its owner,
+and adds to that same issue while it stays open. That is the signal that the
+automation has stopped keeping the archive alive: without it, a broken weekly
+run would only surface weeks later as expired metadata on users' machines.
+If no refresh has run for a while — for example because GitHub disabled the
+schedule on a quiet repository — no failure is reported, so a healthy
+archive is also worth a periodic `apt update` against it.
