@@ -138,7 +138,7 @@ jobs:
           set -eu
           rm -rf previous-repo
           mkdir -p previous-repo
-          ./scripts/fetch-published-pool.sh previous-repo \
+          sh ./scripts/fetch-published-pool.sh previous-repo \
             "https://${GITHUB_REPOSITORY_OWNER}.github.io/$(basename "$GITHUB_REPOSITORY")"
 
       - name: Build and sign the APT repository
@@ -147,14 +147,14 @@ jobs:
           APPECTOR_GPG_KEY_ID: ${{ secrets.APPECTOR_GPG_KEY_ID }}
           APPECTOR_GPG_PASSPHRASE: ${{ secrets.APPECTOR_GPG_PASSPHRASE }}
           APPECTOR_PREVIOUS_REPO: ${{ github.workspace }}/previous-repo
-        run: ./scripts/build-apt-repo.sh
+        run: sh ./scripts/build-apt-repo.sh
 
       - name: Verify the repository before publishing
         env:
           APPECTOR_GPG_KEY: ${{ secrets.APPECTOR_GPG_KEY }}
           APPECTOR_GPG_PASSPHRASE: ${{ secrets.APPECTOR_GPG_PASSPHRASE }}
         run: >-
-          ./scripts/verify-apt-repo.sh apt-repo
+          sh ./scripts/verify-apt-repo.sh apt-repo
           apt/keys/appector-archive-keyring.asc
 
       - name: Configure GitHub Pages
@@ -220,7 +220,7 @@ jobs:
         run: |
           set -eu
           mkdir -p dist
-          ./scripts/fetch-published-pool.sh dist "${{ steps.published.outputs.base }}"
+          sh ./scripts/fetch-published-pool.sh dist "${{ steps.published.outputs.base }}"
           ls -l dist
 
       - name: Re-sign the repository metadata
@@ -229,7 +229,7 @@ jobs:
           APPECTOR_GPG_KEY: ${{ secrets.APPECTOR_GPG_KEY }}
           APPECTOR_GPG_KEY_ID: ${{ secrets.APPECTOR_GPG_KEY_ID }}
           APPECTOR_GPG_PASSPHRASE: ${{ secrets.APPECTOR_GPG_PASSPHRASE }}
-        run: ./scripts/build-apt-repo.sh
+        run: sh ./scripts/build-apt-repo.sh
 
       - name: Verify the repository before publishing
         if: steps.published.outputs.exists == '1'
@@ -237,7 +237,7 @@ jobs:
           APPECTOR_GPG_KEY: ${{ secrets.APPECTOR_GPG_KEY }}
           APPECTOR_GPG_PASSPHRASE: ${{ secrets.APPECTOR_GPG_PASSPHRASE }}
         run: >-
-          ./scripts/verify-apt-repo.sh apt-repo
+          sh ./scripts/verify-apt-repo.sh apt-repo
           apt/keys/appector-archive-keyring.asc
 
       - name: Configure GitHub Pages
