@@ -371,19 +371,37 @@ class ReleaseBackfillTests(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
         gh = self.bin / "gh"
+        # A tag may have its own asset directory ($STUB_ASSETS/<tag>); tags
+        # without one share the default assets, so a test can give one
+        # release a defective manifest without disturbing the others.
         gh.write_text(
             "#!/bin/sh\n"
+            "# The asset directory of a tag: $STUB_ASSETS/<tag> when it exists,\n"
+            "# otherwise the shared default assets.\n"
+            "assets_dir() {\n"
+            '    if [ -d "$STUB_ASSETS/$1" ]; then\n'
+            '        printf \'%s\' "$STUB_ASSETS/$1"\n'
+            "    else\n"
+            '        printf \'%s\' "$STUB_ASSETS"\n'
+            "    fi\n"
+            "}\n"
             'case "$1 $2" in\n'
             '  "release list") printf \'%s\\n\' v0.3.1 v0.3.0 ;;\n'
-            '  "release view") ( cd "$STUB_ASSETS" && ls ) ;;\n'
+            '  "release view") ( cd "$(assets_dir "$3")" && ls ) ;;\n'
             '  "release download")\n'
-            '    dir=; prev=\n'
+            "    dir=; prev=\n"
             '    for arg in "$@"; do\n'
             '      [ "$prev" = "--dir" ] && dir=$arg\n'
-            '      prev=$arg\n'
-            '    done\n'
-            '    cp "$STUB_ASSETS"/* "$dir"/\n'
-            '    ;;\n'
+            "      prev=$arg\n"
+            "    done\n"
+            '    src=$(assets_dir "$3")\n'
+            "    # Only the assets the caller asked for; the per-tag directories\n"
+            "    # themselves are not assets.\n"
+            '    for file in "$src"/*.deb "$src"/SHA256SUMS; do\n'
+            '      [ -f "$file" ] && cp "$file" "$dir"/\n'
+            "    done\n"
+            "    exit 0\n"
+            "    ;;\n"
             '  *) echo "unexpected gh call: $*" >&2; exit 1 ;;\n'
             "esac\n"
         )
@@ -392,11 +410,13 @@ class ReleaseBackfillTests(unittest.TestCase):
         self.output = self.root / "dist"
         self.script = REPO_ROOT / "scripts" / "fetch-release-debs.sh"
 
-    def _run(self):
+    def _run(self, lenient=False):
         env = dict(os.environ)
         env["GITHUB_REPOSITORY"] = "ell-shad/appector"
         env["STUB_ASSETS"] = str(self.assets)
         env["PATH"] = f"{self.bin}{os.pathsep}{env['PATH']}"
+        if lenient:
+            env["BACKFILL_LENIENT"] = "1"
         return subprocess.run(
             ["sh", str(self.script), str(self.output)],
             capture_output=True,
@@ -426,6 +446,42 @@ class ReleaseBackfillTests(unittest.TestCase):
         result = self._run()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("SHA256SUMS", result.stderr)
+
+    def _give_v0_3_0_a_broken_manifest(self):
+        """v0.3.0 gets its own assets with a wrong checksum; v0.3.1 keeps the
+        good ones, so a skip of the first must not stop the second."""
+        broken = self.assets / "v0.3.0"
+        broken.mkdir()
+        shutil.copy2(self.assets / "appector_0.3.0_all.deb", broken)
+        (broken / "SHA256SUMS").write_text(
+            "0" * 64 + "  appector_0.3.0_all.deb\n"
+        )
+
+    def test_lenient_backfill_skips_a_broken_release_and_continues(self):
+        self._give_v0_3_0_a_broken_manifest()
+        result = self._run(lenient=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("warning: skipping release v0.3.0", result.stderr)
+        self.assertIn("skipped 1 release", result.stderr)
+        self.assertTrue(
+            (self.output / "appector_0.3.0_all.deb").is_file(),
+            "the healthy release must still be backfilled",
+        )
+
+    def test_lenient_backfill_skips_a_release_without_a_manifest(self):
+        broken = self.assets / "v0.3.0"
+        broken.mkdir()
+        shutil.copy2(self.assets / "appector_0.3.0_all.deb", broken)
+        result = self._run(lenient=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("warning: skipping release v0.3.0", result.stderr)
+        self.assertTrue((self.output / "appector_0.3.0_all.deb").is_file())
+
+    def test_strict_backfill_still_fails_on_a_broken_release(self):
+        self._give_v0_3_0_a_broken_manifest()
+        result = self._run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("v0.3.0", result.stderr)
 
 
 class AptRepositoryBuildFailureTests(unittest.TestCase):

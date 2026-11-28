@@ -146,8 +146,13 @@ jobs:
         # as GitHub Release assets, so a tag release has to recover them too;
         # otherwise they reappear only after a manual refresh. Each asset is
         # verified against its release's SHA256SUMS before it is served.
+        # BACKFILL_LENIENT: an old release with a broken or missing manifest
+        # must not block this new release, so it is skipped with a warning.
+        # The refresh job runs the same script strictly, which surfaces the
+        # defect in the weekly run instead of shipping the broken package.
         env:
           GH_TOKEN: ${{ github.token }}
+          BACKFILL_LENIENT: "1"
         run: |
           set -eu
           sh ./scripts/fetch-release-debs.sh dist
