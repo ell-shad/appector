@@ -14,6 +14,12 @@
 # GITHUB_REPOSITORY must be set to owner/repo and the gh CLI must be
 # authenticated (GH_TOKEN or GITHUB_TOKEN). Pre-releases and drafts are
 # skipped: they never belong on the stable channel.
+#
+# BACKFILL_LENIENT=1 turns a release that cannot be backfilled (no manifest,
+# unreadable assets, checksum mismatch) into a warning that skips that release.
+# The refresh job stays strict, so a broken release is surfaced there; the
+# publish job sets it, because a defective *old* release must never block a
+# new one from being published.
 
 set -eu
 
@@ -22,6 +28,20 @@ REPO=${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set to owner/repo}
 
 log() { printf '%s\n' "$*" >&2; }
 fail() { log "error: $*"; exit 1; }
+
+LENIENT=${BACKFILL_LENIENT:-0}
+skipped=0
+
+# skip_release TAG REASON: refuse one release. Strict (the default) fails the
+# run; lenient warns, counts it, and lets the caller move on to the next one.
+skip_release() {
+    if [ "$LENIENT" = "1" ]; then
+        log "warning: skipping release $1: $2"
+        skipped=$((skipped + 1))
+        return 0
+    fi
+    fail "release $1: $2"
+}
 
 command -v gh >/dev/null 2>&1 || fail "the gh CLI is required"
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
@@ -49,7 +69,10 @@ while IFS= read -r tag; do
 
     assets=$(gh release view "$tag" --repo "$REPO" --json assets \
         --jq '.assets[].name') \
-        || fail "could not read the assets of $tag"
+        || {
+            skip_release "$tag" "its assets could not be read"
+            continue
+        }
 
     case "$assets" in
         *.deb*)
@@ -64,19 +87,25 @@ while IFS= read -r tag; do
     # without a manifest cannot be proven to be the artifact that was
     # released, so it is not published.
     if ! printf '%s\n' "$assets" | grep -qx 'SHA256SUMS'; then
-        fail "release $tag has no SHA256SUMS asset, so its packages cannot be verified"
+        skip_release "$tag" \
+            "it has no SHA256SUMS asset, so its packages cannot be verified"
+        continue
     fi
 
     download_dir="$work/assets"
     rm -rf "${download_dir:?}"
     mkdir -p "$download_dir"
-    gh release download "$tag" --repo "$REPO" \
+    if ! gh release download "$tag" --repo "$REPO" \
         --pattern '*.deb' --pattern 'SHA256SUMS' --dir "$download_dir" \
-        >/dev/null 2>&1 \
-        || fail "could not download the assets of $tag"
+        >/dev/null 2>&1; then
+        skip_release "$tag" "its assets could not be downloaded"
+        continue
+    fi
 
-    ( cd "$download_dir" && sha256sum --check --strict SHA256SUMS >/dev/null ) \
-        || fail "the assets of $tag do not match its SHA256SUMS"
+    if ! ( cd "$download_dir" && sha256sum --check --strict SHA256SUMS >/dev/null ); then
+        skip_release "$tag" "its assets do not match its SHA256SUMS"
+        continue
+    fi
 
     for package in "$download_dir"/appector_*.deb; do
         [ -f "$package" ] || continue
@@ -87,3 +116,6 @@ while IFS= read -r tag; do
 done < "$tags"
 
 log "backfilled $fetched release package(s) into $OUTPUT_DIR"
+if [ "$skipped" -gt 0 ]; then
+    log "warning: skipped $skipped release(s) that could not be backfilled"
+fi
