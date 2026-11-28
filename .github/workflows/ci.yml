@@ -63,6 +63,10 @@ jobs:
         run: |
           sh -n scripts/build-apt-repo.sh
           shellcheck scripts/build-apt-repo.sh
+          sh -n scripts/fetch-published-pool.sh
+          shellcheck scripts/fetch-published-pool.sh
+          sh -n scripts/verify-apt-repo.sh
+          shellcheck scripts/verify-apt-repo.sh
           sh -n scripts/generate-apt-signing-key.sh
           shellcheck scripts/generate-apt-signing-key.sh
 

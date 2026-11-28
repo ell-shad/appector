@@ -72,10 +72,12 @@ POOL_RETENTION=3
 rm -rf "$OUTPUT_ROOT"
 mkdir -p "$POOL_DIR" "$BINARY_DIR"
 
-# Retention seeding (S12): when a previous repository snapshot is provided
-# (checked out by CI next to this tree), carry its pool forward so the new
-# index keeps listing the previous releases users may still reference; the
-# retention trim below then keeps only the newest $POOL_RETENTION files.
+# Retention seeding (S12): when a previous repository snapshot is provided,
+# carry its pool forward so the new index keeps listing the previous releases
+# users may still reference; the retention trim below then keeps only the
+# newest $POOL_RETENTION files. CI fetches that snapshot over HTTP with
+# scripts/fetch-published-pool.sh, because the Pages deployment is not a git
+# ref and cannot simply be checked out.
 if [ -n "${APPECTOR_PREVIOUS_REPO:-}" ] && [ -d "$APPECTOR_PREVIOUS_REPO/pool" ]; then
     find "$APPECTOR_PREVIOUS_REPO/pool" -name 'appector_*.deb' -type f -print \
         | while IFS= read -r previous; do
@@ -129,7 +131,7 @@ python3 - "$OUTPUT_ROOT" "$SUITE" "$COMPONENT" "$ARCHITECTURE" "$SECTION" \
 import hashlib
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 root = Path(sys.argv[1])
@@ -155,15 +157,15 @@ for relative in sorted([
 
 date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
 
-# Valid-Until (S12): bound the metadata's lifetime (7 days) so a
-# man-in-the-middle cannot serve stale Release files forever; apt refreshes
-# and refuses metadata past this date.
-valid_until = (
-    datetime.now(timezone.utc).timetuple()
-)
-from datetime import timedelta  # noqa: E402
-
-valid_until = datetime.now(timezone.utc) + timedelta(days=7)
+# Valid-Until (S12): bound the metadata's lifetime so a man-in-the-middle
+# cannot serve stale Release files forever; apt refreshes and refuses
+# metadata past this date. The window is deliberately wider than the gap
+# between releases: the APT workflow re-signs and republishes this metadata
+# weekly, so it only expires if that automation has been broken for a month.
+# A 7-day window with release-only publishing expired the archive whenever a
+# release was more than a week apart.
+VALID_UNTIL_DAYS = 30
+valid_until = datetime.now(timezone.utc) + timedelta(days=VALID_UNTIL_DAYS)
 valid_until_text = valid_until.strftime("%a, %d %b %Y %H:%M:%S +0000")
 
 lines = [

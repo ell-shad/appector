@@ -26,6 +26,17 @@ therefore cannot see pre-releases.
   so `1.10` follows `1.9` and epochs, revisions, and `~` pre-releases order
   correctly.
 
+### Fixed
+
+- The APT repository no longer expires between releases. Its metadata now
+  carries a 30-day `Valid-Until` and a scheduled workflow re-signs and
+  republishes it weekly, so `apt update` stops failing with "Release file …
+  is expired" (and the "Unable to locate package appector" that follows it)
+  whenever releases are more than a week apart.
+- The APT pool now really carries the previous releases forward, keeping the
+  newest three `.deb`s published, instead of being rebuilt from an empty pool
+  because the workflow could not read the previously published archive.
+
 ## [0.3.1] - 2026-11-15
 
 ### Fixed

@@ -7,10 +7,30 @@ on:
   push:
     tags:
       - "v*"
-  # Prints the archive public key without publishing anything. Public keys are
-  # not secret, so this exists to recover or confirm the committed key without
-  # having to keep a local copy of the private key.
+  schedule:
+    # The published metadata carries a 30-day Valid-Until, so it has to be
+    # re-signed even when no release is cut. A weekly run leaves four attempts
+    # before anything expires, and a failing refresh is visible in the Actions
+    # tab long before users see "Release file is expired".
+    - cron: "17 3 * * 1"
+  # Manual runs default to printing the archive public key without publishing
+  # anything. Public keys are not secret, so this exists to recover or confirm
+  # the committed key without having to keep a local copy of the private key.
+  # With `refresh` checked it re-signs and republishes the metadata instead,
+  # which also repairs an archive that has already expired.
   workflow_dispatch:
+    inputs:
+      refresh:
+        description: "Re-sign and republish the currently published repository metadata"
+        type: boolean
+        default: false
+
+# A scheduled refresh and a release publish both rewrite the Pages site. Run
+# them one at a time, so a refresh can never deploy metadata built from the
+# pool it read before a release replaced it.
+concurrency:
+  group: apt-repository
+  cancel-in-progress: false
 
 # Least privilege. The signing key is read from repository secrets, which are
 # available to the workflow regardless of these token permissions.
@@ -19,7 +39,7 @@ permissions:
 
 jobs:
   show-archive-key:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && !inputs.refresh
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -109,27 +129,17 @@ jobs:
           ( cd dist && sha256sum --check SHA256SUMS )
           ls -l dist
 
-      - name: Fetch the previously published repository
-        # Retention (S12): the new pool carries the previous releases
-        # forward, then trims to the newest three, so users updating from
-        # an older list still find their files.
+      - name: Fetch the previously published pool
+        # Retention (S12): the new pool carries the previous releases forward,
+        # then trims to the newest three, so users updating from an older list
+        # still find their files. The Pages deployment is not a git ref, so the
+        # previous pool is read back from the served repository.
         run: |
           set -eu
           rm -rf previous-repo
           mkdir -p previous-repo
-          status=$(curl -sS -o /dev/null -w '%{http_code}' \
-            "https://${GITHUB_REPOSITORY_OWNER}.github.io/$(basename "$GITHUB_REPOSITORY")/dists/stable/Release" \
-            || true)
-          if [ "$status" = "200" ]; then
-            git clone --depth 1 \
-              "https://github.com/$GITHUB_REPOSITORY.git" previous-src \
-              || true
-            echo "A previous repository appears published; seeding pool retention."
-            # The Pages site is not a git ref; the pool is seeded from the
-            # workflow artifact store instead when available (below).
-          else
-            echo "No previously published repository found; starting fresh."
-          fi
+          ./scripts/fetch-published-pool.sh previous-repo \
+            "https://${GITHUB_REPOSITORY_OWNER}.github.io/$(basename "$GITHUB_REPOSITORY")"
 
       - name: Build and sign the APT repository
         env:
@@ -139,69 +149,13 @@ jobs:
           APPECTOR_PREVIOUS_REPO: ${{ github.workspace }}/previous-repo
         run: ./scripts/build-apt-repo.sh
 
-      - name: Confirm the published keyring can verify the published metadata
+      - name: Verify the repository before publishing
         env:
           APPECTOR_GPG_KEY: ${{ secrets.APPECTOR_GPG_KEY }}
           APPECTOR_GPG_PASSPHRASE: ${{ secrets.APPECTOR_GPG_PASSPHRASE }}
-        run: |
-          set -euo pipefail
-          dists=apt-repo/dists/stable
-
-          # Never deploy unsigned metadata. apt rejects such a repository, so a
-          # silent unsigned deployment would look successful while breaking
-          # every user's apt update.
-          test -f "$dists/InRelease"  || { echo "::error::InRelease was not produced"; exit 1; }
-          test -f "$dists/Release.gpg" || { echo "::error::Release.gpg was not produced"; exit 1; }
-
-          # Recompute the public half from the signing secret in an isolated
-          # keyring. This is the property that must hold: the keyring users
-          # import has to verify the metadata we serve.
-          export GNUPGHOME=$(mktemp -d)
-          chmod 700 "$GNUPGHOME"
-          trap 'rm -rf "$GNUPGHOME"' EXIT
-          printf '%s\n' "$APPECTOR_GPG_KEY" | gpg --batch --quiet --import
-          gpg --batch --yes --pinentry-mode loopback \
-            --passphrase "${APPECTOR_GPG_PASSPHRASE-}" --armor --export \
-            > /tmp/derived-key.asc
-
-          committed=apt/keys/appector-archive-keyring.asc
-          if [ -f "$committed" ]; then
-            # A committed key is reviewable in a pull request, which is
-            # preferable. It must nevertheless be the same key.
-            if ! diff -q /tmp/derived-key.asc "$committed" > /dev/null; then
-              echo "::error::The committed $committed does not match the key in APPECTOR_GPG_KEY. Users who trusted the committed key would fail to verify this repository."
-              exit 1
-            fi
-            echo "Committed public key matches the signing key."
-            cp "$committed" apt-repo/appector-archive-keyring.asc
-          else
-            # Not fatal. The archive is still correct, it simply was not
-            # reviewed before publication. Commit the key to make the next
-            # release reviewable.
-            echo "::warning::$committed is missing. Publishing the public key derived from the signing secret. Commit it so the next release publishes a reviewed key."
-            cp /tmp/derived-key.asc apt-repo/appector-archive-keyring.asc
-          fi
-
-          # Verify with only the key that is about to be published.
-          keyring=$(mktemp -d)
-          chmod 700 "$keyring"
-          GNUPGHOME=$keyring gpg --batch --quiet \
-            --import apt-repo/appector-archive-keyring.asc
-          GNUPGHOME=$keyring gpg --batch --verify "$dists/InRelease" > /dev/null
-          GNUPGHOME=$keyring gpg --batch --verify "$dists/Release.gpg" \
-            "$dists/Release" > /dev/null
-          rm -rf "$keyring"
-          echo "Release metadata verifies against the published keyring."
-
-          # Confirm the checksums in Release match the indexes actually shipped.
-          cd "$dists"
-          awk '/^SHA256:$/ {inblock=1; next}
-               inblock && /^[[:space:]]/ {print $1"  "$3}' Release \
-            > /tmp/expected-sha256
-          test -s /tmp/expected-sha256 || {
-            echo "::error::Release lists no SHA-256 checksums"; exit 1;
-          }
-          sha256sum --check /tmp/expected-sha256
+        run: >-
+          ./scripts/verify-apt-repo.sh apt-repo
+          apt/keys/appector-archive-keyring.asc
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d
@@ -212,4 +166,90 @@ jobs:
           path: apt-repo
 
       - name: Publish to GitHub Pages
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346
+
+  refresh:
+    # Re-signs the metadata of the already published repository, so the
+    # archive never expires between releases. Tag pushes go through `publish`
+    # above; this runs weekly, and on demand to repair an expired archive.
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.refresh)
+    runs-on: ubuntu-24.04
+    # Deliberately no `environment:`. This job republishes metadata for
+    # packages a reviewer already approved for publication; requiring a
+    # reviewer every week would simply let the archive expire unattended.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install repository tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes dpkg-dev gnupg
+
+      - name: Require the signing key
+        env:
+          APPECTOR_GPG_KEY: ${{ secrets.APPECTOR_GPG_KEY }}
+        run: |
+          if [ -z "${APPECTOR_GPG_KEY:-}" ]; then
+            echo "::error::The APPECTOR_GPG_KEY secret is not set, so the repository metadata cannot be re-signed and will expire. Store the exported secret key with: gh secret set APPECTOR_GPG_KEY --repo $GITHUB_REPOSITORY < appector-archive-secret-key.asc"
+            exit 1
+          fi
+
+      - name: Locate the published repository
+        id: published
+        run: |
+          set -eu
+          base="https://${GITHUB_REPOSITORY_OWNER}.github.io/$(basename "$GITHUB_REPOSITORY")"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            "$base/dists/stable/main/binary-all/Packages" || true)
+          if [ "$status" = "200" ]; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "Published repository found at $base."
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+            echo "Nothing is published yet (HTTP $status); there is no metadata to refresh."
+          fi
+
+      - name: Download the published pool
+        if: steps.published.outputs.exists == '1'
+        run: |
+          set -eu
+          mkdir -p dist
+          ./scripts/fetch-published-pool.sh dist "${{ steps.published.outputs.base }}"
+          ls -l dist
+
+      - name: Re-sign the repository metadata
+        if: steps.published.outputs.exists == '1'
+        env:
+          APPECTOR_GPG_KEY: ${{ secrets.APPECTOR_GPG_KEY }}
+          APPECTOR_GPG_KEY_ID: ${{ secrets.APPECTOR_GPG_KEY_ID }}
+          APPECTOR_GPG_PASSPHRASE: ${{ secrets.APPECTOR_GPG_PASSPHRASE }}
+        run: ./scripts/build-apt-repo.sh
+
+      - name: Verify the repository before publishing
+        if: steps.published.outputs.exists == '1'
+        env:
+          APPECTOR_GPG_KEY: ${{ secrets.APPECTOR_GPG_KEY }}
+          APPECTOR_GPG_PASSPHRASE: ${{ secrets.APPECTOR_GPG_PASSPHRASE }}
+        run: >-
+          ./scripts/verify-apt-repo.sh apt-repo
+          apt/keys/appector-archive-keyring.asc
+
+      - name: Configure GitHub Pages
+        if: steps.published.outputs.exists == '1'
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d
+
+      - name: Upload the repository as a Pages artifact
+        if: steps.published.outputs.exists == '1'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
+        with:
+          path: apt-repo
+
+      - name: Publish to GitHub Pages
+        if: steps.published.outputs.exists == '1'
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346
