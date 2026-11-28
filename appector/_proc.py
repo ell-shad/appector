@@ -299,6 +299,11 @@ def run(
                 if not chunk:
                     break
                 pending += chunk
+                if len(pending) > keep_bytes:
+                    # A child that writes megabytes without a newline must
+                    # not grow the buffer unboundedly; keep the newest tail
+                    # (the already-collected lines stay bounded separately).
+                    pending = pending[-keep_bytes:]
                 while b"\n" in pending:
                     raw_line, pending = pending.split(b"\n", 1)
                     line = _strip_ansi(

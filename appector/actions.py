@@ -16,7 +16,7 @@ from ._proc import (
 )
 from . import helper_client
 from .helper_client import HelperUnavailable
-from .paths import appimage_dir, legacy_appimage_dir
+from .paths import appimage_dir, cache_dir, legacy_appimage_dir
 from .plans import (
     Plan,
     check_apt_removal_plan,
@@ -473,10 +473,22 @@ def install_appimage(path, delete_source=False):
         # left behind (or launched) if the copy fails midway.
         temp_image = app_dir / f".{installed_image.name}.part"
         try:
+            copy_digest = hashlib.sha256()
             with source.open("rb") as source_file, temp_image.open("wb") as target:
-                shutil.copyfileobj(source_file, target, 1024 * 1024)
+                for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+                    copy_digest.update(chunk)
+                    target.write(chunk)
                 target.flush()
                 os.fsync(target.fileno())
+            if copy_digest.hexdigest() != content_hash:
+                # F9: hash while copying, so the installed bytes always
+                # match the digest embedded in the file and launcher names
+                # (the source could change between the two passes).
+                temp_image.unlink(missing_ok=True)
+                return False, (
+                    f"The AppImage changed while it was being installed: "
+                    f"{source.name}. Install it again."
+                )
             os.replace(temp_image, installed_image)
         except OSError:
             temp_image.unlink(missing_ok=True)
@@ -594,12 +606,24 @@ def check_available_updates():
         # F12: refresh the package lists first, so the result is not the
         # stale cache (the old flow told the user to run apt update).
         if apt_get_command:
-            _run_command_raw(
+            refresh_rc, refresh_output = _run_command_raw(
                 [apt_get_command, "update"],
                 timeout=300,
                 env_overrides={"LC_ALL": "C"},
                 uses_apt=True,
             )
+            if refresh_rc != 0:
+                # The listing below then reflects the previous cache state;
+                # say so instead of silently showing stale data as fresh.
+                _log_action(
+                    "UPDATE_LIST_REFRESH_FAILED rc="
+                    f"{refresh_rc} output={refresh_output[:400]}"
+                )
+                notes.append(
+                    "The package lists could not be refreshed (no root "
+                    "rights or a repository is unreachable); the APT "
+                    "listing may be from the previous refresh."
+                )
             # Needrestart (if installed) reports which services need a
             # restart after the coming upgrades; surfaced as a note.
             try:
@@ -1126,8 +1150,11 @@ def _deb_review_scratch_dir():
     directory between the review dialog and the install, which turned a valid
     review into a spurious "no such file" failure. The per-user cache is only
     ever touched by this user.
+
+    Uses :func:`appector.paths.cache_dir` so XDG_CACHE_HOME is honoured and
+    the legacy cache directory is only reused while it still exists.
     """
-    root = Path.home() / ".cache" / "app-manager" / "deb-review"
+    root = cache_dir() / "deb-review"
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     home = Path.home().resolve()
     if root.is_symlink() or not root.resolve().is_relative_to(home):
@@ -1785,11 +1812,9 @@ def execute_removal(app):
                 removal_paths = raw_removal_paths.splitlines()
             else:
                 removal_paths = list(raw_removal_paths)
-            allowed_roots = [
-                appimage_dir(),
-                legacy_appimage_dir(),
-                Path.home() / ".local/share/applications",
-            ]
+            managed_image_roots = [appimage_dir(), legacy_appimage_dir()]
+            applications_root = Path.home() / ".local/share/applications"
+            allowed_roots = [*managed_image_roots, applications_root]
             resolved_roots = _resolve_allowed_roots(allowed_roots)
             validated_paths = []
             for raw_path in removal_paths:
@@ -1802,7 +1827,7 @@ def execute_removal(app):
                     _log_action(f"REMOVE_BLOCKED {key} manager=AppImage reason=invalid-managed-path")
                     return False, message
                 path = Path(lexical_str)
-                if path.parent == allowed_roots[1] and (
+                if path.parent == applications_root and (
                     not path.name.startswith("app-manager-appimage-")
                     or path.suffix != ".desktop"
                 ):
@@ -1813,7 +1838,7 @@ def execute_removal(app):
 
             desktop_files = [
                 path for path in validated_paths
-                if path.parent == allowed_roots[1]
+                if path.parent == applications_root
             ]
             if len(desktop_files) != 1:
                 message = "The integrated AppImage launcher is missing or ambiguous."
@@ -1833,7 +1858,7 @@ def execute_removal(app):
                 return False, message
 
             if not any(
-                path.parent == allowed_roots[0] and path == Path(package_id)
+                path.parent in managed_image_roots and path == Path(package_id)
                 for path in validated_paths
             ):
                 message = "The installed AppImage copy was not included in its removal record."
@@ -2176,12 +2201,6 @@ def prepare_apt_removal(app, purge=False):
         return False, "This APT package is blocked by safety policy.", None, ""
     if not package_id:
         return False, "APT package ID is missing.", None, ""
-
-    if not can_remove_single(app):
-        return False, "This APT package is blocked by safety policy.", [], ""
-
-    if not package_id:
-        return False, "APT package ID is missing.", [], ""
 
     success, output, removed_packages = simulate_apt_remove_multiple([package_id], purge=purge)
 
@@ -2830,7 +2849,6 @@ def execute_batch_removal(apps, progress_callback=None, purge=False, apt_plan=No
     if snap_ids or system_flatpak_ids or apt_ids:
         report("Removing apps with administrator privileges…", reserve=True)
 
-        backup_note = ""
         # S9: the conffile backup for a batch purge is made inside the
         # helper (as root), together with the removal, so a root-only
         # conffile can no longer block the purge or split the transaction.
@@ -2860,29 +2878,37 @@ def execute_batch_removal(apps, progress_callback=None, purge=False, apt_plan=No
                 )
 
         if system_flatpak_ids:
-            installations = {
-                str(getattr(app, "installation", "") or "").strip()
-                for app in system_flatpaks
-            }
-            installation = next(iter(installations)) if len(installations) == 1 else None
-            try:
-                result = helper_client.remove_flatpak_system(
-                    system_flatpak_ids,
-                    installation=installation,
-                    output_callback=None,
-                )
-                flatpak_message = result.message or (
-                    "Removed." if result.ok else "Flatpak removal failed."
-                )
-                for app in system_flatpaks:
-                    if app_key(app) not in results_by_key:
-                        results_by_key[app_key(app)] = (result.ok, flatpak_message)
-            except (HelperUnavailable, OSError) as error:
-                fail_group(
-                    [app for app in system_flatpaks
-                     if app_key(app) not in results_by_key],
-                    str(error),
-                )
+            # Group by installation: refs live in specific system
+            # installations, and collapsing mixed selections onto the
+            # default one would uninstall from the wrong place (or fail).
+            flatpak_groups = {}
+            for app in system_flatpaks:
+                if app_key(app) in results_by_key:
+                    continue  # already blocked or failed individually
+                installation = str(
+                    getattr(app, "installation", "") or ""
+                ).strip()
+                flatpak_groups.setdefault(installation, []).append(app)
+            for installation, group_apps in flatpak_groups.items():
+                group_ids = [
+                    getattr(app, "package_id", "") or "" for app in group_apps
+                ]
+                try:
+                    result = helper_client.remove_flatpak_system(
+                        group_ids,
+                        installation=installation or None,
+                        output_callback=None,
+                    )
+                    flatpak_message = result.message or (
+                        "Removed." if result.ok else "Flatpak removal failed."
+                    )
+                    for app in group_apps:
+                        results_by_key[app_key(app)] = (
+                            result.ok,
+                            flatpak_message,
+                        )
+                except (HelperUnavailable, OSError) as error:
+                    fail_group(group_apps, str(error))
 
         if apt_ids and apt_plan is None:
             # Never fabricate a plan from the live simulation: consent must
@@ -2908,8 +2934,6 @@ def execute_batch_removal(apps, progress_callback=None, purge=False, apt_plan=No
                         )
                 if events_note:
                     apt_message = f"{apt_message}\n\n{events_note}"
-                if backup_note:
-                    apt_message = f"{apt_message}\n\n{backup_note}"
                 for app in apt_valid_apps:
                     if app_key(app) not in results_by_key:
                         results_by_key[app_key(app)] = (result.ok, apt_message)
@@ -2946,27 +2970,9 @@ def execute_batch_removal(apps, progress_callback=None, purge=False, apt_plan=No
 
 
 # ------------------------------------------------------------
-# Flatpak user batch
-# ------------------------------------------------------------
-
-# ------------------------------------------------------------
-# Flatpak remote / Flathub helpers
-# ------------------------------------------------------------
-
-FLATHUB_REMOTE_URL = "https://dl.flathub.org/repo/flathub.flatpakrepo"
-
-
-# ------------------------------------------------------------
-# Flatpak installation helpers
-# ------------------------------------------------------------
-
-# ------------------------------------------------------------
-# Privileged operations now run through appector-helper (ADR-0003).
-# ------------------------------------------------------------
-
-# ------------------------------------------------------------
 # APT Autoremove
 # ------------------------------------------------------------
+
 
 def get_apt_autoremove_preview():
     """

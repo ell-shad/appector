@@ -77,9 +77,18 @@ def is_acceptable_private_dir(path: Path) -> bool:
     A private directory must not be a symlink, and must sit inside the home
     directory — unless the user explicitly redirected it through an XDG
     variable, in which case the configured directory itself is accepted.
+
+    When running as root (the privileged purge flow), the directory must
+    additionally be reachable without passing through any symlinked path
+    component below the invoking user's home: everything inside the home
+    directory is user-controlled, and a redirection such as
+    ``~/.local`` → ``/var/lib`` must not make root create, write into, or
+    chown directories outside the real home tree.
     """
     try:
         if path.is_symlink():
+            return False
+        if os.geteuid() == 0 and not _symlink_free_path(_home(), path):
             return False
         if path.resolve().is_relative_to(_home().resolve()):
             return True
@@ -88,9 +97,37 @@ def is_acceptable_private_dir(path: Path) -> bool:
     return path.resolve() == _preferred_state_dir().resolve()
 
 
+def _symlink_free_path(home: Path, path: Path) -> bool:
+    """True when no component between *home* and *path* is a symlink.
+
+    Walks the lexical path upwards from *path*; the first symlink below the
+    home directory fails the check, while the home directory itself (root-
+    controlled, e.g. an admin-configured symlink) is accepted. Paths that
+    are not located under *home* at all are rejected for privileged use.
+    """
+    try:
+        for ancestor in (path, *path.parents):
+            if ancestor == home:
+                return True
+            if ancestor.is_symlink():
+                return False
+    except OSError:
+        return False
+    return False
+
+
 def _ensure_private(path: Path, mode: int = 0o700) -> Path:
     """Create *path* (and parents) with user-only permissions."""
     try:
+        if os.geteuid() == 0 and not _symlink_free_path(_home(), path):
+            # Privileged callers must not create directories through
+            # symlinked components the invoking user controls (the mkdir
+            # would materialise root-owned directories at the redirected
+            # location). Downstream validation rejects such paths too.
+            raise OSError(
+                f"Refusing to create {path}: it is reached through a "
+                "symlinked path component inside the home directory."
+            )
         path.mkdir(parents=True, exist_ok=True, mode=mode)
         if path.is_symlink():
             raise OSError(f"Refusing to use a symlinked state directory: {path}")
@@ -106,11 +143,19 @@ def _migrate_legacy_state(legacy: Path, preferred: Path) -> None:
     The legacy directory is kept (never deleted) so a downgrade keeps
     working; failures are logged and non-fatal. `preferred` may point
     outside the home via XDG_STATE_HOME, which the copy honours.
+
+    Skipped entirely when running as root: the legacy path is controlled by
+    the invoking user and may contain symlinks, and copying through them
+    would follow the user's redirection anywhere on the filesystem.
+    Migration is a user-session concern.
     """
     marker = (str(legacy), str(preferred))
     if marker in _LEGACY_MIGRATED:
         return
     _LEGACY_MIGRATED.add(marker)
+
+    if os.geteuid() == 0:
+        return
 
     try:
         if legacy == preferred or not legacy.is_dir() or legacy.is_symlink():

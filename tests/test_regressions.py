@@ -24,7 +24,7 @@ class S7bNonUtf8OutputTests(unittest.TestCase):
 
     def test_exit_zero_with_non_utf8_output_succeeds(self):
         returncode, output = _proc._run_command_raw(
-            ["sh", "-c", "printf 'ok \\377\\376'; exit 0"],
+            ["sh", "-c", "printf 'ok \\\\377\\\\376'; exit 0"],
             timeout=30,
         )
         self.assertEqual(returncode, 0)
@@ -474,7 +474,7 @@ class F9AppImageInstallTests(unittest.TestCase):
             with (
                 patch.object(Path, "home", return_value=root),
                 patch(
-                    "appector.actions.shutil.copyfileobj",
+                    "appector.actions.os.fsync",
                     side_effect=OSError("disk full mid-copy"),
                 ),
             ):
@@ -518,7 +518,7 @@ class ScannerOwnershipParserTests(unittest.TestCase):
         self.assertEqual(owners.get("/usr/bin/dpkg"), "dpkg")
         # Multi-owner lines map to the first package.
         self.assertEqual(owners.get("/usr/bin/vim.tiny"), "vim-tiny:vim")
-        # Diversions and local-modification markers are skipped.
+        # Diversions and local-modification markers are skipped。
         self.assertNotIn("/usr/bin/vim", owners)
         self.assertNotIn("/usr/local/bin/tool", owners)
 
@@ -574,7 +574,7 @@ class F10ManualScanDirsTests(unittest.TestCase):
                     extra_dirs=[str(home / "bin")],
                 )
         # home/bin appears exactly once in the effective scan set: the
-        # call must not crash and must not double-scan.
+        # call must not crash and must not double-scan。
         self.assertIsInstance(apps, list)
 
 

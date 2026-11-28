@@ -1,0 +1,4 @@
+P1: printf 'ok \u005c\u005c377\u005c\u005c376'
+P2: printf 'ok \\u005c\\u005c377'
+Q1: a\u0035b
+Q2: \\n

@@ -62,6 +62,7 @@ def check_apt_removal_plan(
     plan: Plan | None,
     package_ids: list[str],
     actual_removed: list[str],
+    residual: bool = False,
 ) -> tuple[bool, str]:
     """Shared policy gate for APT removal executions (S4).
 
@@ -69,6 +70,13 @@ def check_apt_removal_plan(
     * the executed package set must match the confirmed one;
     * the re-simulation must not have grown beyond the preview;
     * critical packages and the >``APT_MAX_REMOVALS`` cascade still apply.
+
+    ``residual=True`` is used only by the residual-configuration purge flow,
+    where every identity has already been verified (twice, on the root side)
+    to be in ``rc`` state: the package is long uninstalled and only leftover
+    configuration remains, so purging a "critical" name such as an old
+    ``linux-image`` cannot remove a running system component. Plan binding,
+    drift/growth checks and the removal cap still apply in that mode.
     """
     if plan is None:
         return False, (
@@ -100,14 +108,15 @@ def check_apt_removal_plan(
             + "\n".join(f"• {name}" for name in missing)
         )
 
-    critical = [p for p in actual_removed if is_critical_apt_package_name(p)]
-    if critical:
-        return False, (
-            "Blocked by safety policy.\n\n"
-            "APT simulation says the following critical packages would be "
-            "removed:\n\n"
-            + "\n".join(f"• {name}" for name in critical)
-        )
+    if not residual:
+        critical = [p for p in actual_removed if is_critical_apt_package_name(p)]
+        if critical:
+            return False, (
+                "Blocked by safety policy.\n\n"
+                "APT simulation says the following critical packages would be "
+                "removed:\n\n"
+                + "\n".join(f"• {name}" for name in critical)
+            )
 
     if len(actual_removed) > APT_MAX_REMOVALS:
         return False, (

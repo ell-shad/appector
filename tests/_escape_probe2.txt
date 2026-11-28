@@ -1,0 +1,6 @@
+A1: printf 'ok \377\376'
+A2: printf 'ok \\377\\376'
+B1: FAKE event\nFORGED
+B2: FAKE event\\nFORGED
+C1:             ["sh", "-c", "printf 'ok \\377\\376'; exit 0"],
+C2:             ["sh", "-c", "printf 'ok \\377\\376'; exit 0"],

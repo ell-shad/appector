@@ -52,15 +52,6 @@ def get_removal_size_estimate(*args, **kwargs):
 
     return _impl(*args, **kwargs)
 
-FLATPAKREF_REVIEW_FIELDS = (
-    ("Name", "App name"),
-    ("Branch", "Branch"),
-    ("Url", "Repository URL"),
-    ("SuggestRemoteName", "Suggested remote name"),
-    ("RuntimeRepo", "Runtime repository"),
-    ("IsRuntime", "Is a runtime"),
-)
-
 
 
 def get_flatpak_remotes(user_install: bool = True):
@@ -87,7 +78,10 @@ def get_flatpak_remotes(user_install: bool = True):
             cmd,
             capture_output=True,
             text=True,
+            errors="replace",
+            stdin=subprocess.DEVNULL,
             timeout=10,
+            env={**os.environ, "LC_ALL": "C"},
         )
 
         if result.returncode != 0:
@@ -98,7 +92,7 @@ def get_flatpak_remotes(user_install: bool = True):
             for line in result.stdout.splitlines()
             if line.strip()
         ]
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return []
 
 

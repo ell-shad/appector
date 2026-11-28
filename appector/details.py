@@ -206,11 +206,13 @@ class DetailsWindow(_DetailsCard):
         GLib.idle_add(self._show_result_idle, success, message)
         return False
 
-    @staticmethod
-    def _show_result_idle(success, message):
+    def _show_result_idle(self, success, message):
         try:
+            # Parent the result dialog to the main window: a parentless
+            # dialog can appear behind it or on the wrong monitor.
+            parent = getattr(self, "_parent_window", None)
             dialog = Gtk.MessageDialog(
-                transient_for=None,
+                transient_for=parent,
                 modal=True,
             )
             dialog.set_property(
